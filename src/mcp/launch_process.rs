@@ -223,7 +223,7 @@ pub(crate) fn report_background_error(
     pid: u32,
     error: String,
 ) {
-    eprintln!("Background process monitoring failed for PID {pid}: {error}");
+    eprintln!("Background process handling failed for PID {pid}: {error}");
     let _ = tx.send(UiEvent {
         elapsed: start_time.elapsed(),
         kind: UiEventKind::LaunchProcessBackgroundError { pid, error },
@@ -262,7 +262,9 @@ pub(crate) fn handle_background_wait_result_with_notifier<F>(
             tx,
             start_time,
             pid,
-            format!("{context} for PID {pid}: {error}"),
+            format!(
+                "{context}: {error}. Successful reaping could not be confirmed; the process may remain running or unreaped"
+            ),
         ),
     }
 }
@@ -976,7 +978,7 @@ fn execute_launch_process_blocking(
                     tx.clone(),
                     start_time,
                     format!("mcp-reaper-{pid}"),
-                    "Timeout-detached reaper failed",
+                    "Timeout-detach reaper failed",
                 );
 
                 match reaper_spawn {

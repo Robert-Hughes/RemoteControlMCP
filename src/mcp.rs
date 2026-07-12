@@ -36,8 +36,14 @@ pub struct LaunchProcessResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EnvironmentConfig {
+    #[serde(default = "default_inherit_environment")]
+    #[schemars(default = "default_inherit_environment")]
     pub inherit: bool,
     pub variables: std::collections::HashMap<String, Option<String>>,
+}
+
+fn default_inherit_environment() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

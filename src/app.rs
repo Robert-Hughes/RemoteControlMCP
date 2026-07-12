@@ -33,7 +33,7 @@ fn event_description(kind: &UiEventKind) -> String {
             format!("Tool 'launch_process' rejected: {error}")
         }
         UiEventKind::LaunchProcessBackgroundError { pid, error } => {
-            format!("Background process monitoring failed for PID {pid}: {error}")
+            format!("Background process handling failed for PID {pid}: {error}")
         }
         UiEventKind::ServerStopped => "MCP service stopped".to_string(),
         UiEventKind::ServerError { error } => format!("Fatal MCP error: {error}"),
@@ -125,13 +125,16 @@ mod tests {
     fn background_error_event_is_formatted_for_the_gui() {
         let description = event_description(&UiEventKind::LaunchProcessBackgroundError {
             pid: 52,
-            error: "detached reaper failed".to_string(),
+            error: "Detached reaper failed: injected wait failure".to_string(),
         });
 
         assert_eq!(
             description,
-            "Background process monitoring failed for PID 52: detached reaper failed"
+            "Background process handling failed for PID 52: Detached reaper failed: injected wait failure"
         );
+        assert_eq!(description.matches("PID 52").count(), 1);
+        assert!(description.contains("Detached reaper failed"));
+        assert!(description.contains("injected wait failure"));
     }
 
     #[test]

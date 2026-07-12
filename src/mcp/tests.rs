@@ -53,7 +53,7 @@ fn test_failed_background_wait_reports_error_without_success_notification() {
         44,
         &event_tx,
         Instant::now(),
-        "Timeout-detached reaper failed",
+        "Timeout-detach reaper failed",
         move |pid| completion_tx.send(pid).unwrap(),
     );
 
@@ -63,9 +63,11 @@ fn test_failed_background_wait_reports_error_without_success_notification() {
         panic!("expected background error event");
     };
     assert_eq!(pid, 44);
-    assert!(error.contains("Timeout-detached reaper failed"));
-    assert!(error.contains("PID 44"));
+    assert!(error.contains("Timeout-detach reaper failed"));
+    assert!(!error.contains("PID 44"));
     assert!(error.contains("injected wait failure"));
+    assert!(error.contains("Successful reaping could not be confirmed"));
+    assert!(error.contains("may remain running or unreaped"));
     for sensitive_input in [
         "secret argument",
         "SECRET_ENV",
@@ -74,6 +76,65 @@ fn test_failed_background_wait_reports_error_without_success_notification() {
     ] {
         assert!(!error.contains(sensitive_input));
     }
+}
+
+#[test]
+fn environment_inherit_deserialisation_defaults_and_validation() {
+    let omitted: EnvironmentConfig = rmcp::serde_json::from_value(rmcp::serde_json::json!({
+        "variables": {}
+    }))
+    .unwrap();
+    assert!(omitted.inherit);
+
+    let explicit_true: EnvironmentConfig = rmcp::serde_json::from_value(rmcp::serde_json::json!({
+        "inherit": true,
+        "variables": {}
+    }))
+    .unwrap();
+    assert!(explicit_true.inherit);
+
+    let explicit_false: EnvironmentConfig = rmcp::serde_json::from_value(rmcp::serde_json::json!({
+        "inherit": false,
+        "variables": {}
+    }))
+    .unwrap();
+    assert!(!explicit_false.inherit);
+
+    assert!(
+        rmcp::serde_json::from_value::<EnvironmentConfig>(rmcp::serde_json::json!({
+            "inherit": null,
+            "variables": {}
+        }))
+        .is_err()
+    );
+    assert!(
+        rmcp::serde_json::from_value::<EnvironmentConfig>(rmcp::serde_json::json!({
+            "inherit": true
+        }))
+        .is_err()
+    );
+    assert!(
+        rmcp::serde_json::from_value::<LaunchProcessRequest>(rmcp::serde_json::json!({
+            "process_name": "test",
+            "detached": false
+        }))
+        .is_err()
+    );
+}
+
+fn resolve_local_schema_ref<'a>(
+    root: &'a rmcp::serde_json::Value,
+    mut schema: &'a rmcp::serde_json::Value,
+) -> &'a rmcp::serde_json::Value {
+    while let Some(reference) = schema.get("$ref").and_then(|value| value.as_str()) {
+        let pointer = reference
+            .strip_prefix('#')
+            .expect("schema reference should be local");
+        schema = root
+            .pointer(pointer)
+            .expect("schema reference should resolve within the input schema");
+    }
+    schema
 }
 
 #[cfg(target_os = "windows")]
@@ -479,6 +540,56 @@ fn test_schema_required_fields() {
     assert!(required_fields.contains(&"process_name"));
     assert!(required_fields.contains(&"environment"));
     assert!(required_fields.contains(&"detached"));
+}
+
+#[test]
+fn test_environment_schema_default_and_required_fields() {
+    let attr = McpServer::launch_process_tool_attr();
+    let root = rmcp::serde_json::Value::Object((*attr.input_schema).clone());
+    let properties = root
+        .get("properties")
+        .and_then(|value| value.as_object())
+        .unwrap();
+    let environment_schema = resolve_local_schema_ref(&root, &properties["environment"]);
+    let environment_properties = environment_schema["properties"].as_object().unwrap();
+    let inherit_schema = resolve_local_schema_ref(&root, &environment_properties["inherit"]);
+
+    assert_eq!(
+        inherit_schema.get("type").and_then(|value| value.as_str()),
+        Some("boolean")
+    );
+    assert_eq!(
+        inherit_schema.get("default"),
+        Some(&rmcp::serde_json::Value::Bool(true))
+    );
+
+    let top_level_required = root["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        top_level_required,
+        ["detached", "environment", "process_name"]
+            .into_iter()
+            .collect()
+    );
+
+    let environment_required = environment_schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(environment_required, ["variables"].into_iter().collect());
+    assert!(!environment_required.contains("inherit"));
+    assert!(
+        !properties["arguments"]
+            .as_object()
+            .unwrap()
+            .contains_key("default")
+    );
 }
 
 #[test]
@@ -1359,6 +1470,11 @@ fn launch_process_integration_test_over_duplex() {
         .build()
         .unwrap();
 
+    let inherited_name = "RMCP_TEST_MCP_INHERITED";
+    unsafe {
+        std::env::set_var(inherited_name, "inherited through MCP");
+    }
+
     rt.block_on(async {
         let tx_clone = tx.clone();
         let server_task = tokio::spawn(async move {
@@ -1429,6 +1545,16 @@ fn launch_process_integration_test_over_duplex() {
         assert!(required_fields.contains(&"process_name"));
         assert!(required_fields.contains(&"environment"));
         assert!(required_fields.contains(&"detached"));
+
+        let schema_root = rmcp::serde_json::Value::Object((*launch_tool.input_schema).clone());
+        let environment_schema =
+            resolve_local_schema_ref(&schema_root, &schema_root["properties"]["environment"]);
+        let inherit_schema =
+            resolve_local_schema_ref(&schema_root, &environment_schema["properties"]["inherit"]);
+        assert_eq!(
+            inherit_schema.get("default"),
+            Some(&rmcp::serde_json::Value::Bool(true))
+        );
 
         let mut variables: std::collections::HashMap<String, Option<String>> =
             std::collections::HashMap::new();
@@ -1517,7 +1643,74 @@ fn launch_process_integration_test_over_duplex() {
         ));
         assert_eq!(no_arguments_result.exit_code, Some(0));
 
-        // 3. Validation-error integration test
+        // 3. Omitted inherit defaults to true through tools/call.
+        let mut omitted_inherit_params = rmcp::model::CallToolRequestParams::new("launch_process");
+        omitted_inherit_params.arguments = Some(
+            rmcp::serde_json::json!({
+                "process_name": make_helper_request().process_name,
+                "environment": {
+                    "variables": {
+                        "RMCP_TEST_HELPER_ACTION": "env",
+                        "RMCP_TEST_HELPER_ENV_NAME": inherited_name
+                    }
+                },
+                "detached": false
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let omitted_inherit_result = client
+            .call_tool(omitted_inherit_params)
+            .await
+            .expect("launch_process should default omitted inherit to true");
+        let omitted_inherit_result: LaunchProcessResult = rmcp::serde_json::from_value(
+            omitted_inherit_result
+                .structured_content
+                .expect("Expected structured omitted-inherit result"),
+        )
+        .unwrap();
+        assert_eq!(
+            omitted_inherit_result.stdout.as_deref(),
+            Some("inherited through MCP")
+        );
+
+        // 4. Explicit false clears inherited values after applying the supplied
+        // helper action and queried-variable name.
+        let mut no_inherit_params = rmcp::model::CallToolRequestParams::new("launch_process");
+        no_inherit_params.arguments = Some(
+            rmcp::serde_json::json!({
+                "process_name": make_helper_request().process_name,
+                "environment": {
+                    "inherit": false,
+                    "variables": {
+                        "RMCP_TEST_HELPER_ACTION": "env",
+                        "RMCP_TEST_HELPER_ENV_NAME": inherited_name
+                    }
+                },
+                "detached": false
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let no_inherit_result = client
+            .call_tool(no_inherit_params)
+            .await
+            .expect("launch_process should accept explicit false inherit");
+        let no_inherit_result: LaunchProcessResult = rmcp::serde_json::from_value(
+            no_inherit_result
+                .structured_content
+                .expect("Expected structured no-inherit result"),
+        )
+        .unwrap();
+        assert!(matches!(
+            no_inherit_result.status,
+            LaunchProcessStatus::Completed
+        ));
+        assert_eq!(no_inherit_result.stdout.as_deref(), Some(""));
+
+        // 5. Validation-error integration test
         let mut invalid_call_params = rmcp::model::CallToolRequestParams::new("launch_process");
         invalid_call_params.arguments = Some(
             rmcp::serde_json::json!({
@@ -1550,12 +1743,16 @@ fn launch_process_integration_test_over_duplex() {
             .expect("Failed to call ping after validation error");
         assert_eq!(ping_result.content.len(), 1);
 
-        // 4. Graceful client/server shutdown
+        // 6. Graceful client/server shutdown
         client.close().await.expect("Failed to close client");
         server_task.await.expect("Server task panicked");
     });
 
-    // 5. Verify GUI event subsequence
+    unsafe {
+        std::env::remove_var(inherited_name);
+    }
+
+    // 7. Verify GUI event subsequence
     let events: Vec<UiEventKind> = rx.try_iter().map(|e| e.kind).collect();
     let expected_subsequence = &[
         UiEventKind::ServerStarting,
