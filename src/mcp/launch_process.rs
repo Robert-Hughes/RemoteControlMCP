@@ -173,79 +173,479 @@ impl McpServer {
     }
 
     pub async fn execute_launch_process(&self, req: LaunchProcessRequest) -> LaunchProcessResult {
-        let (stdout_file, stderr_file, stdout_path, stderr_path) = match generate_output_files() {
-            Ok(files) => files,
+        let join_handle = tokio::task::spawn_blocking(move || execute_launch_process_blocking(req));
+        match join_handle.await {
+            Ok(res) => res,
+            Err(e) => LaunchProcessResult {
+                status: LaunchProcessStatus::WaitFailed,
+                error: Some(format!("Spawn blocking task failed: {}", e)),
+                pid: None,
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                stdout_file: None,
+                stderr_file: None,
+            },
+        }
+    }
+}
+
+pub(crate) fn classify_cleanup(
+    kill_ok: bool,
+    wait_ok: bool,
+    original_error: &str,
+    is_timeout_stop: bool,
+) -> (LaunchProcessStatus, String, bool) {
+    let status = if is_timeout_stop {
+        if kill_ok && wait_ok {
+            LaunchProcessStatus::TimedOutStopped
+        } else {
+            LaunchProcessStatus::StopFailed
+        }
+    } else {
+        LaunchProcessStatus::WaitFailed
+    };
+
+    let cleanup_attempt = format!(
+        "Attempted cleanup: termination ({}), waiting ({}).",
+        if kill_ok { "succeeded" } else { "failed" },
+        if wait_ok { "succeeded" } else { "failed" }
+    );
+
+    let running_status = if kill_ok && wait_ok {
+        "The process was successfully terminated and reaped; it is not running."
+    } else if !kill_ok && wait_ok {
+        "Termination failed, but waiting succeeded; the process is not running but may have exited on its own."
+    } else if kill_ok && !wait_ok {
+        "Termination succeeded, but waiting failed; the process is terminated but may remain unreaped."
+    } else {
+        "Both termination and waiting failed; the process may still be running and may remain unreaped."
+    };
+
+    let err_msg = format!(
+        "{}. {}. {}",
+        original_error, cleanup_attempt, running_status
+    );
+
+    let spawn_reaper = !wait_ok;
+
+    (status, err_msg, spawn_reaper)
+}
+
+fn cleanup_child(
+    mut child: std::process::Child,
+    pid: u32,
+    original_error: &str,
+    is_timeout_stop: bool,
+    stdout_path: &str,
+    stderr_path: &str,
+) -> (
+    LaunchProcessStatus,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+    Option<String>,
+) {
+    let kill_res = child.kill();
+    let wait_res = child.wait();
+
+    let kill_ok = kill_res.is_ok();
+    let wait_ok = wait_res.is_ok();
+
+    let (status, err_msg, spawn_reaper) =
+        classify_cleanup(kill_ok, wait_ok, original_error, is_timeout_stop);
+
+    if spawn_reaper {
+        let reaper_spawn = std::thread::Builder::new()
+            .name(format!("mcp-reaper-cleanup-{}", pid))
+            .spawn(move || {
+                let _ = child.wait();
+                #[cfg(test)]
+                test_hooks::notify_completion(pid);
+            });
+        if let Err(e) = reaper_spawn {
+            eprintln!(
+                "Failed to spawn background reaper during cleanup of PID {}: {}",
+                pid, e
+            );
+        }
+    } else {
+        #[cfg(test)]
+        test_hooks::notify_completion(pid);
+    }
+
+    if status == LaunchProcessStatus::TimedOutStopped {
+        let mut read_error = None;
+        let stdout_val = match read_and_truncate_file(stdout_path) {
+            Ok(s) => Some(s),
             Err(e) => {
-                return LaunchProcessResult {
-                    status: LaunchProcessStatus::SetupFailed,
-                    error: Some(format!("Failed to create output files: {}", e)),
-                    pid: None,
+                read_error = Some(format!("Failed to read stdout: {}", e));
+                None
+            }
+        };
+        let stderr_val = match read_and_truncate_file(stderr_path) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                if read_error.is_none() {
+                    read_error = Some(format!("Failed to read stderr: {}", e));
+                } else {
+                    read_error = Some(format!("Failed to read stdout and stderr: {}", e));
+                }
+                None
+            }
+        };
+        (
+            status,
+            read_error,
+            wait_res.ok().and_then(|s| s.code()),
+            stdout_val,
+            stderr_val,
+        )
+    } else {
+        (status, Some(err_msg), None, None, None)
+    }
+}
+
+fn execute_launch_process_blocking(req: LaunchProcessRequest) -> LaunchProcessResult {
+    let (stdout_file, stderr_file, stdout_path, stderr_path) = match generate_output_files() {
+        Ok(files) => files,
+        Err(e) => {
+            return LaunchProcessResult {
+                status: LaunchProcessStatus::SetupFailed,
+                error: Some(format!("Failed to create output files: {}", e)),
+                pid: None,
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                stdout_file: None,
+                stderr_file: None,
+            };
+        }
+    };
+
+    let working_dir = match req.working_directory {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::env::temp_dir(),
+    };
+
+    let mut cmd = std::process::Command::new(&req.process_name);
+    cmd.current_dir(working_dir);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(stdout_file);
+    cmd.stderr(stderr_file);
+
+    if !req.environment.inherit {
+        cmd.env_clear();
+    }
+    for (k, v) in &req.environment.variables {
+        if let Some(val) = v {
+            cmd.env(k, val);
+        } else {
+            cmd.env_remove(k);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        cmd.raw_arg(&req.arguments);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        cmd.args(&req.arguments);
+    }
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return LaunchProcessResult {
+                status: LaunchProcessStatus::LaunchProcessFailed,
+                error: Some(format!("Failed to launch process: {}", e)),
+                pid: None,
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                stdout_file: Some(stdout_path.clone()),
+                stderr_file: Some(stderr_path.clone()),
+            };
+        }
+    };
+
+    let pid = child.id();
+    let child_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+
+    match (req.detached, req.timeout_ms, req.timeout_action) {
+        (true, None, None) => {
+            let child_arc_clone = child_arc.clone();
+            let reaper_spawn = std::thread::Builder::new()
+                .name(format!("mcp-reaper-{}", pid))
+                .spawn(move || {
+                    let child_opt = child_arc_clone
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take();
+                    if let Some(mut child) = child_opt {
+                        let _ = child.wait();
+                        #[cfg(test)]
+                        test_hooks::notify_completion(pid);
+                    }
+                });
+
+            match reaper_spawn {
+                Ok(_) => LaunchProcessResult {
+                    status: LaunchProcessStatus::Detached,
+                    error: None,
+                    pid: Some(pid),
                     exit_code: None,
                     stdout: None,
                     stderr: None,
-                    stdout_file: None,
-                    stderr_file: None,
-                };
+                    stdout_file: Some(stdout_path),
+                    stderr_file: Some(stderr_path),
+                },
+                Err(e) => {
+                    let child_opt = child_arc.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    let (status, error_msg, _, _, _) = if let Some(child) = child_opt {
+                        let original_error =
+                            format!("Failed to spawn background reaper thread: {}", e);
+                        cleanup_child(
+                            child,
+                            pid,
+                            &original_error,
+                            false,
+                            &stdout_path,
+                            &stderr_path,
+                        )
+                    } else {
+                        (
+                            LaunchProcessStatus::WaitFailed,
+                            Some(format!(
+                                "Failed to spawn background reaper thread: {}. Process could not be accessed.",
+                                e
+                            )),
+                            None,
+                            None,
+                            None,
+                        )
+                    };
+                    LaunchProcessResult {
+                        status,
+                        error: error_msg,
+                        pid: Some(pid),
+                        exit_code: None,
+                        stdout: None,
+                        stderr: None,
+                        stdout_file: Some(stdout_path),
+                        stderr_file: Some(stderr_path),
+                    }
+                }
             }
-        };
-
-        let working_dir = match req.working_directory {
-            Some(dir) => std::path::PathBuf::from(dir),
-            None => std::env::temp_dir(),
-        };
-
-        let mut cmd = std::process::Command::new(&req.process_name);
-        cmd.current_dir(working_dir);
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(stdout_file);
-        cmd.stderr(stderr_file);
-
-        if !req.environment.inherit {
-            cmd.env_clear();
         }
-        for (k, v) in &req.environment.variables {
-            if let Some(val) = v {
-                cmd.env(k, val);
+
+        (true, Some(timeout_ms), Some(TimeoutAction::Stop)) => {
+            let child_arc_clone = child_arc.clone();
+            let monitor_stdout = stdout_path.clone();
+            let monitor_stderr = stderr_path.clone();
+            let monitor_spawn = std::thread::Builder::new()
+                .name(format!("mcp-monitor-{}", pid))
+                .spawn(move || {
+                    let start = std::time::Instant::now();
+                    let timeout_duration = std::time::Duration::from_millis(timeout_ms);
+                    let mut exited = false;
+
+                    while start.elapsed() < timeout_duration {
+                        let mut lock = child_arc_clone.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(ref mut child) = *lock {
+                            match child.try_wait() {
+                                Ok(Some(_status)) => {
+                                    exited = true;
+                                    break;
+                                }
+                                Ok(None) => {}
+                                Err(_) => {
+                                    break;
+                                }
+                            }
+                        }
+                        drop(lock);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+
+                    let child_opt = child_arc_clone
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take();
+                    if let Some(child) = child_opt {
+                        if !exited {
+                            let _ = cleanup_child(
+                                child,
+                                pid,
+                                "Process timed out",
+                                true,
+                                &monitor_stdout,
+                                &monitor_stderr,
+                            );
+                        } else {
+                            let _ = cleanup_child(
+                                child,
+                                pid,
+                                "Process exited",
+                                false,
+                                &monitor_stdout,
+                                &monitor_stderr,
+                            );
+                        }
+                    }
+                });
+
+            match monitor_spawn {
+                Ok(_) => LaunchProcessResult {
+                    status: LaunchProcessStatus::DetachedWithStopTimeout,
+                    error: None,
+                    pid: Some(pid),
+                    exit_code: None,
+                    stdout: None,
+                    stderr: None,
+                    stdout_file: Some(stdout_path),
+                    stderr_file: Some(stderr_path),
+                },
+                Err(e) => {
+                    let child_opt = child_arc.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    let (status, error_msg, _, _, _) = if let Some(child) = child_opt {
+                        let original_error =
+                            format!("Failed to spawn background monitor thread: {}", e);
+                        cleanup_child(
+                            child,
+                            pid,
+                            &original_error,
+                            false,
+                            &stdout_path,
+                            &stderr_path,
+                        )
+                    } else {
+                        (
+                            LaunchProcessStatus::WaitFailed,
+                            Some(format!(
+                                "Failed to spawn background monitor thread: {}. Process could not be accessed.",
+                                e
+                            )),
+                            None,
+                            None,
+                            None,
+                        )
+                    };
+                    LaunchProcessResult {
+                        status,
+                        error: error_msg,
+                        pid: Some(pid),
+                        exit_code: None,
+                        stdout: None,
+                        stderr: None,
+                        stdout_file: Some(stdout_path),
+                        stderr_file: Some(stderr_path),
+                    }
+                }
+            }
+        }
+
+        (false, Some(timeout_ms), Some(TimeoutAction::Detach)) => {
+            let start = std::time::Instant::now();
+            let timeout_duration = std::time::Duration::from_millis(timeout_ms);
+            let mut exited = false;
+            let mut exit_status = None;
+
+            while start.elapsed() < timeout_duration {
+                let mut lock = child_arc.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(ref mut child) = *lock {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            exited = true;
+                            exit_status = Some(status);
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            drop(lock);
+                            let original_error = format!("Failed to check process status: {}", e);
+                            let child_opt =
+                                child_arc.lock().unwrap_or_else(|e| e.into_inner()).take();
+                            let (status, err_msg, exit_code, stdout, stderr) =
+                                if let Some(child) = child_opt {
+                                    cleanup_child(
+                                        child,
+                                        pid,
+                                        &original_error,
+                                        false,
+                                        &stdout_path,
+                                        &stderr_path,
+                                    )
+                                } else {
+                                    (
+                                        LaunchProcessStatus::WaitFailed,
+                                        Some(format!(
+                                            "{}. Process could not be accessed.",
+                                            original_error
+                                        )),
+                                        None,
+                                        None,
+                                        None,
+                                    )
+                                };
+                            return LaunchProcessResult {
+                                status,
+                                error: err_msg,
+                                pid: Some(pid),
+                                exit_code,
+                                stdout,
+                                stderr,
+                                stdout_file: Some(stdout_path),
+                                stderr_file: Some(stderr_path),
+                            };
+                        }
+                    }
+                }
+                drop(lock);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+
+            if exited {
+                let mut read_error = None;
+                let stdout_val = match read_and_truncate_file(&stdout_path) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        read_error = Some(format!("Failed to read stdout file: {}", e));
+                        None
+                    }
+                };
+                let stderr_val = match read_and_truncate_file(&stderr_path) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        if read_error.is_none() {
+                            read_error = Some(format!("Failed to read stderr file: {}", e));
+                        } else {
+                            read_error = Some(format!("Failed to read stdout and stderr: {}", e));
+                        }
+                        None
+                    }
+                };
+
+                LaunchProcessResult {
+                    status: LaunchProcessStatus::Completed,
+                    error: read_error,
+                    pid: Some(pid),
+                    exit_code: exit_status.and_then(|s| s.code()),
+                    stdout: stdout_val,
+                    stderr: stderr_val,
+                    stdout_file: Some(stdout_path),
+                    stderr_file: Some(stderr_path),
+                }
             } else {
-                cmd.env_remove(k);
-            }
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            cmd.raw_arg(&req.arguments);
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            cmd.args(&req.arguments);
-        }
-
-        let child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                return LaunchProcessResult {
-                    status: LaunchProcessStatus::LaunchProcessFailed,
-                    error: Some(format!("Failed to launch process: {}", e)),
-                    pid: None,
-                    exit_code: None,
-                    stdout: None,
-                    stderr: None,
-                    stdout_file: Some(stdout_path.clone()),
-                    stderr_file: Some(stderr_path.clone()),
-                };
-            }
-        };
-
-        let pid = child.id();
-        let child_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
-
-        match (req.detached, req.timeout_ms, req.timeout_action) {
-            (true, None, None) => {
                 let child_arc_clone = child_arc.clone();
                 let reaper_spawn = std::thread::Builder::new()
                     .name(format!("mcp-reaper-{}", pid))
                     .spawn(move || {
-                        let child_opt = child_arc_clone.lock().unwrap().take();
+                        let child_opt = child_arc_clone
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take();
                         if let Some(mut child) = child_opt {
                             let _ = child.wait();
                             #[cfg(test)]
@@ -255,7 +655,7 @@ impl McpServer {
 
                 match reaper_spawn {
                     Ok(_) => LaunchProcessResult {
-                        status: LaunchProcessStatus::Detached,
+                        status: LaunchProcessStatus::TimedOutDetached,
                         error: None,
                         pid: Some(pid),
                         exit_code: None,
@@ -265,470 +665,258 @@ impl McpServer {
                         stderr_file: Some(stderr_path),
                     },
                     Err(e) => {
-                        let child_opt = child_arc.lock().unwrap().take();
-                        let error_msg = if let Some(mut child) = child_opt {
-                            let kill_res = child.kill();
-                            let wait_res = child.wait();
-                            if kill_res.is_err() || wait_res.is_err() {
-                                format!(
-                                    "Failed to spawn background reaper thread: {}. Attempted to terminate the child, but termination/waiting failed; the process may still be running.",
-                                    e
-                                )
-                            } else {
-                                format!(
-                                    "Failed to spawn background reaper thread: {}. Process was successfully terminated.",
-                                    e
-                                )
-                            }
-                        } else {
-                            format!(
-                                "Failed to spawn background reaper thread: {}. Process could not be accessed.",
-                                e
+                        let child_opt = child_arc.lock().unwrap_or_else(|e| e.into_inner()).take();
+                        let (status, err_msg, exit_code, stdout, stderr) = if let Some(child) =
+                            child_opt
+                        {
+                            let original_error =
+                                format!("Failed to spawn background reaper thread: {}", e);
+                            cleanup_child(
+                                child,
+                                pid,
+                                &original_error,
+                                false,
+                                &stdout_path,
+                                &stderr_path,
                             )
-                        };
-                        LaunchProcessResult {
-                            status: LaunchProcessStatus::WaitFailed,
-                            error: Some(error_msg),
-                            pid: Some(pid),
-                            exit_code: None,
-                            stdout: None,
-                            stderr: None,
-                            stdout_file: Some(stdout_path),
-                            stderr_file: Some(stderr_path),
-                        }
-                    }
-                }
-            }
-
-            (true, Some(timeout_ms), Some(TimeoutAction::Stop)) => {
-                let child_arc_clone = child_arc.clone();
-                let monitor_spawn = std::thread::Builder::new()
-                    .name(format!("mcp-monitor-{}", pid))
-                    .spawn(move || {
-                        let start = std::time::Instant::now();
-                        let timeout_duration = std::time::Duration::from_millis(timeout_ms);
-                        let mut exited = false;
-
-                        while start.elapsed() < timeout_duration {
-                            let mut lock = child_arc_clone.lock().unwrap();
-                            if let Some(ref mut child) = *lock {
-                                match child.try_wait() {
-                                    Ok(Some(_status)) => {
-                                        exited = true;
-                                        break;
-                                    }
-                                    Ok(None) => {}
-                                    Err(_) => {
-                                        break;
-                                    }
-                                }
-                            }
-                            drop(lock);
-                            std::thread::sleep(std::time::Duration::from_millis(5));
-                        }
-
-                        let child_opt = child_arc_clone.lock().unwrap().take();
-                        if let Some(mut child) = child_opt {
-                            if !exited {
-                                let _ = child.kill();
-                            }
-                            let _ = child.wait();
-
-                            #[cfg(test)]
-                            test_hooks::notify_completion(pid);
-                        }
-                    });
-
-                match monitor_spawn {
-                    Ok(_) => LaunchProcessResult {
-                        status: LaunchProcessStatus::DetachedWithStopTimeout,
-                        error: None,
-                        pid: Some(pid),
-                        exit_code: None,
-                        stdout: None,
-                        stderr: None,
-                        stdout_file: Some(stdout_path),
-                        stderr_file: Some(stderr_path),
-                    },
-                    Err(e) => {
-                        let child_opt = child_arc.lock().unwrap().take();
-                        let error_msg = if let Some(mut child) = child_opt {
-                            let kill_res = child.kill();
-                            let wait_res = child.wait();
-                            if kill_res.is_err() || wait_res.is_err() {
-                                format!(
-                                    "Failed to spawn background monitor thread: {}. Attempted to terminate the child, but termination/waiting failed; the process may still be running.",
-                                    e
-                                )
-                            } else {
-                                format!(
-                                    "Failed to spawn background monitor thread: {}. Process was successfully terminated.",
-                                    e
-                                )
-                            }
                         } else {
-                            format!(
-                                "Failed to spawn background monitor thread: {}. Process could not be accessed.",
-                                e
-                            )
-                        };
-                        LaunchProcessResult {
-                            status: LaunchProcessStatus::WaitFailed,
-                            error: Some(error_msg),
-                            pid: Some(pid),
-                            exit_code: None,
-                            stdout: None,
-                            stderr: None,
-                            stdout_file: Some(stdout_path),
-                            stderr_file: Some(stderr_path),
-                        }
-                    }
-                }
-            }
-
-            (false, Some(timeout_ms), Some(TimeoutAction::Detach)) => {
-                let start = std::time::Instant::now();
-                let timeout_duration = std::time::Duration::from_millis(timeout_ms);
-                let mut exited = false;
-                let mut exit_status = None;
-
-                while start.elapsed() < timeout_duration {
-                    let mut lock = child_arc.lock().unwrap();
-                    if let Some(ref mut child) = *lock {
-                        match child.try_wait() {
-                            Ok(Some(status)) => {
-                                exited = true;
-                                exit_status = Some(status);
-                                break;
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                return LaunchProcessResult {
-                                    status: LaunchProcessStatus::WaitFailed,
-                                    error: Some(format!("Failed to check process status: {}", e)),
-                                    pid: Some(pid),
-                                    exit_code: None,
-                                    stdout: None,
-                                    stderr: None,
-                                    stdout_file: Some(stdout_path),
-                                    stderr_file: Some(stderr_path),
-                                };
-                            }
-                        }
-                    }
-                    drop(lock);
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-
-                if exited {
-                    let mut read_error = None;
-                    let stdout_val = match read_and_truncate_file(&stdout_path) {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            read_error = Some(format!("Failed to read stdout file: {}", e));
-                            None
-                        }
-                    };
-                    let stderr_val = match read_and_truncate_file(&stderr_path) {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            if read_error.is_none() {
-                                read_error = Some(format!("Failed to read stderr file: {}", e));
-                            } else {
-                                read_error =
-                                    Some(format!("Failed to read stdout and stderr: {}", e));
-                            }
-                            None
-                        }
-                    };
-
-                    LaunchProcessResult {
-                        status: LaunchProcessStatus::Completed,
-                        error: read_error,
-                        pid: Some(pid),
-                        exit_code: exit_status.and_then(|s| s.code()),
-                        stdout: stdout_val,
-                        stderr: stderr_val,
-                        stdout_file: Some(stdout_path),
-                        stderr_file: Some(stderr_path),
-                    }
-                } else {
-                    let child_arc_clone = child_arc.clone();
-                    let reaper_spawn = std::thread::Builder::new()
-                        .name(format!("mcp-reaper-{}", pid))
-                        .spawn(move || {
-                            let child_opt = child_arc_clone.lock().unwrap().take();
-                            if let Some(mut child) = child_opt {
-                                let _ = child.wait();
-                                #[cfg(test)]
-                                test_hooks::notify_completion(pid);
-                            }
-                        });
-
-                    match reaper_spawn {
-                        Ok(_) => LaunchProcessResult {
-                            status: LaunchProcessStatus::TimedOutDetached,
-                            error: None,
-                            pid: Some(pid),
-                            exit_code: None,
-                            stdout: None,
-                            stderr: None,
-                            stdout_file: Some(stdout_path),
-                            stderr_file: Some(stderr_path),
-                        },
-                        Err(e) => {
-                            let child_opt = child_arc.lock().unwrap().take();
-                            let error_msg = if let Some(mut child) = child_opt {
-                                let kill_res = child.kill();
-                                let wait_res = child.wait();
-                                if kill_res.is_err() || wait_res.is_err() {
-                                    format!(
-                                        "Failed to spawn background reaper thread: {}. Attempted to terminate the child, but termination/waiting failed; the process may still be running.",
-                                        e
-                                    )
-                                } else {
-                                    format!(
-                                        "Failed to spawn background reaper thread: {}. Process was successfully terminated.",
-                                        e
-                                    )
-                                }
-                            } else {
-                                format!(
+                            (
+                                LaunchProcessStatus::WaitFailed,
+                                Some(format!(
                                     "Failed to spawn background reaper thread: {}. Process could not be accessed.",
                                     e
-                                )
-                            };
-                            LaunchProcessResult {
-                                status: LaunchProcessStatus::WaitFailed,
-                                error: Some(error_msg),
-                                pid: Some(pid),
-                                exit_code: None,
-                                stdout: None,
-                                stderr: None,
-                                stdout_file: Some(stdout_path),
-                                stderr_file: Some(stderr_path),
-                            }
-                        }
-                    }
-                }
-            }
-
-            (false, Some(timeout_ms), Some(TimeoutAction::Stop)) => {
-                let start = std::time::Instant::now();
-                let timeout_duration = std::time::Duration::from_millis(timeout_ms);
-                let mut exited = false;
-                let mut exit_status = None;
-
-                while start.elapsed() < timeout_duration {
-                    let mut lock = child_arc.lock().unwrap();
-                    if let Some(ref mut child) = *lock {
-                        match child.try_wait() {
-                            Ok(Some(status)) => {
-                                exited = true;
-                                exit_status = Some(status);
-                                break;
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                return LaunchProcessResult {
-                                    status: LaunchProcessStatus::WaitFailed,
-                                    error: Some(format!("Failed to check process status: {}", e)),
-                                    pid: Some(pid),
-                                    exit_code: None,
-                                    stdout: None,
-                                    stderr: None,
-                                    stdout_file: Some(stdout_path),
-                                    stderr_file: Some(stderr_path),
-                                };
-                            }
-                        }
-                    }
-                    drop(lock);
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-
-                if exited {
-                    let mut read_error = None;
-                    let stdout_val = match read_and_truncate_file(&stdout_path) {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            read_error = Some(format!("Failed to read stdout: {}", e));
-                            None
-                        }
-                    };
-                    let stderr_val = match read_and_truncate_file(&stderr_path) {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            if read_error.is_none() {
-                                read_error = Some(format!("Failed to read stderr: {}", e));
-                            } else {
-                                read_error =
-                                    Some(format!("Failed to read stdout and stderr: {}", e));
-                            }
-                            None
-                        }
-                    };
-
-                    LaunchProcessResult {
-                        status: LaunchProcessStatus::Completed,
-                        error: read_error,
-                        pid: Some(pid),
-                        exit_code: exit_status.and_then(|s| s.code()),
-                        stdout: stdout_val,
-                        stderr: stderr_val,
-                        stdout_file: Some(stdout_path),
-                        stderr_file: Some(stderr_path),
-                    }
-                } else {
-                    let child_opt = child_arc.lock().unwrap().take();
-                    if let Some(mut child) = child_opt {
-                        let kill_res = child.kill();
-                        let wait_res = child.wait();
-
-                        if kill_res.is_err() || wait_res.is_err() {
-                            let error_msg = match (kill_res, wait_res) {
-                                (Err(e), _) => format!("Failed to terminate child: {}", e),
-                                (_, Err(e)) => {
-                                    format!("Failed to wait for terminated child: {}", e)
-                                }
-                                _ => unreachable!(),
-                            };
-                            LaunchProcessResult {
-                                status: LaunchProcessStatus::StopFailed,
-                                error: Some(format!("{}, process may still be running", error_msg)),
-                                pid: Some(pid),
-                                exit_code: None,
-                                stdout: None,
-                                stderr: None,
-                                stdout_file: Some(stdout_path),
-                                stderr_file: Some(stderr_path),
-                            }
-                        } else {
-                            let mut read_error = None;
-                            let stdout_val = match read_and_truncate_file(&stdout_path) {
-                                Ok(s) => Some(s),
-                                Err(e) => {
-                                    read_error = Some(format!("Failed to read stdout: {}", e));
-                                    None
-                                }
-                            };
-                            let stderr_val = match read_and_truncate_file(&stderr_path) {
-                                Ok(s) => Some(s),
-                                Err(e) => {
-                                    if read_error.is_none() {
-                                        read_error = Some(format!("Failed to read stderr: {}", e));
-                                    } else {
-                                        read_error = Some(format!(
-                                            "Failed to read stdout and stderr: {}",
-                                            e
-                                        ));
-                                    }
-                                    None
-                                }
-                            };
-
-                            LaunchProcessResult {
-                                status: LaunchProcessStatus::TimedOutStopped,
-                                error: read_error,
-                                pid: Some(pid),
-                                exit_code: wait_res.ok().and_then(|s| s.code()),
-                                stdout: stdout_val,
-                                stderr: stderr_val,
-                                stdout_file: Some(stdout_path),
-                                stderr_file: Some(stderr_path),
-                            }
-                        }
-                    } else {
+                                )),
+                                None,
+                                None,
+                                None,
+                            )
+                        };
                         LaunchProcessResult {
-                            status: LaunchProcessStatus::StopFailed,
-                            error: Some(
-                                "Process could not be accessed to terminate it.".to_string(),
-                            ),
+                            status,
+                            error: err_msg,
                             pid: Some(pid),
-                            exit_code: None,
-                            stdout: None,
-                            stderr: None,
+                            exit_code,
+                            stdout,
+                            stderr,
                             stdout_file: Some(stdout_path),
                             stderr_file: Some(stderr_path),
                         }
                     }
                 }
             }
+        }
 
-            (false, None, None) => {
-                let child_opt = child_arc.lock().unwrap().take();
-                if let Some(mut child) = child_opt {
-                    let wait_res = child.wait();
-                    match wait_res {
-                        Ok(status) => {
-                            let mut read_error = None;
-                            let stdout_val = match read_and_truncate_file(&stdout_path) {
-                                Ok(s) => Some(s),
-                                Err(e) => {
-                                    read_error = Some(format!("Failed to read stdout: {}", e));
-                                    None
-                                }
-                            };
-                            let stderr_val = match read_and_truncate_file(&stderr_path) {
-                                Ok(s) => Some(s),
-                                Err(e) => {
-                                    if read_error.is_none() {
-                                        read_error = Some(format!("Failed to read stderr: {}", e));
-                                    } else {
-                                        read_error = Some(format!(
-                                            "Failed to read stdout and stderr: {}",
-                                            e
-                                        ));
-                                    }
-                                    None
-                                }
-                            };
+        (false, Some(timeout_ms), Some(TimeoutAction::Stop)) => {
+            let start = std::time::Instant::now();
+            let timeout_duration = std::time::Duration::from_millis(timeout_ms);
+            let mut exited = false;
+            let mut exit_status = None;
 
-                            LaunchProcessResult {
-                                status: LaunchProcessStatus::Completed,
-                                error: read_error,
+            while start.elapsed() < timeout_duration {
+                let mut lock = child_arc.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(ref mut child) = *lock {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            exited = true;
+                            exit_status = Some(status);
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            drop(lock);
+                            let original_error = format!("Failed to check process status: {}", e);
+                            let child_opt =
+                                child_arc.lock().unwrap_or_else(|e| e.into_inner()).take();
+                            let (status, err_msg, exit_code, stdout, stderr) =
+                                if let Some(child) = child_opt {
+                                    cleanup_child(
+                                        child,
+                                        pid,
+                                        &original_error,
+                                        false,
+                                        &stdout_path,
+                                        &stderr_path,
+                                    )
+                                } else {
+                                    (
+                                        LaunchProcessStatus::WaitFailed,
+                                        Some(format!(
+                                            "{}. Process could not be accessed.",
+                                            original_error
+                                        )),
+                                        None,
+                                        None,
+                                        None,
+                                    )
+                                };
+                            return LaunchProcessResult {
+                                status,
+                                error: err_msg,
                                 pid: Some(pid),
-                                exit_code: status.code(),
-                                stdout: stdout_val,
-                                stderr: stderr_val,
+                                exit_code,
+                                stdout,
+                                stderr,
                                 stdout_file: Some(stdout_path),
                                 stderr_file: Some(stderr_path),
-                            }
+                            };
                         }
-                        Err(e) => LaunchProcessResult {
-                            status: LaunchProcessStatus::WaitFailed,
-                            error: Some(format!("Failed to wait for process: {}", e)),
-                            pid: Some(pid),
-                            exit_code: None,
-                            stdout: None,
-                            stderr: None,
-                            stdout_file: Some(stdout_path),
-                            stderr_file: Some(stderr_path),
-                        },
-                    }
-                } else {
-                    LaunchProcessResult {
-                        status: LaunchProcessStatus::WaitFailed,
-                        error: Some("Process could not be accessed to wait for it.".to_string()),
-                        pid: Some(pid),
-                        exit_code: None,
-                        stdout: None,
-                        stderr: None,
-                        stdout_file: Some(stdout_path),
-                        stderr_file: Some(stderr_path),
                     }
                 }
+                drop(lock);
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            _ => LaunchProcessResult {
-                status: LaunchProcessStatus::SetupFailed,
-                error: Some("Invalid request parameters combination".to_string()),
-                pid: None,
-                exit_code: None,
-                stdout: None,
-                stderr: None,
-                stdout_file: Some(stdout_path),
-                stderr_file: Some(stderr_path),
-            },
+
+            if exited {
+                let mut read_error = None;
+                let stdout_val = match read_and_truncate_file(&stdout_path) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        read_error = Some(format!("Failed to read stdout: {}", e));
+                        None
+                    }
+                };
+                let stderr_val = match read_and_truncate_file(&stderr_path) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        if read_error.is_none() {
+                            read_error = Some(format!("Failed to read stderr: {}", e));
+                        } else {
+                            read_error = Some(format!("Failed to read stdout and stderr: {}", e));
+                        }
+                        None
+                    }
+                };
+
+                LaunchProcessResult {
+                    status: LaunchProcessStatus::Completed,
+                    error: read_error,
+                    pid: Some(pid),
+                    exit_code: exit_status.and_then(|s| s.code()),
+                    stdout: stdout_val,
+                    stderr: stderr_val,
+                    stdout_file: Some(stdout_path),
+                    stderr_file: Some(stderr_path),
+                }
+            } else {
+                let child_opt = child_arc.lock().unwrap_or_else(|e| e.into_inner()).take();
+                let (status, err_msg, exit_code, stdout, stderr) = if let Some(child) = child_opt {
+                    let original_error = "Process timed out".to_string();
+                    cleanup_child(
+                        child,
+                        pid,
+                        &original_error,
+                        true,
+                        &stdout_path,
+                        &stderr_path,
+                    )
+                } else {
+                    (
+                        LaunchProcessStatus::StopFailed,
+                        Some(
+                            "Process timed out and could not be accessed to terminate it."
+                                .to_string(),
+                        ),
+                        None,
+                        None,
+                        None,
+                    )
+                };
+
+                LaunchProcessResult {
+                    status,
+                    error: err_msg,
+                    pid: Some(pid),
+                    exit_code,
+                    stdout,
+                    stderr,
+                    stdout_file: Some(stdout_path),
+                    stderr_file: Some(stderr_path),
+                }
+            }
         }
+
+        (false, None, None) => {
+            let child_opt = child_arc.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(mut child) = child_opt {
+                let wait_res = child.wait();
+                match wait_res {
+                    Ok(status) => {
+                        let mut read_error = None;
+                        let stdout_val = match read_and_truncate_file(&stdout_path) {
+                            Ok(s) => Some(s),
+                            Err(e) => {
+                                read_error = Some(format!("Failed to read stdout: {}", e));
+                                None
+                            }
+                        };
+                        let stderr_val = match read_and_truncate_file(&stderr_path) {
+                            Ok(s) => Some(s),
+                            Err(e) => {
+                                if read_error.is_none() {
+                                    read_error = Some(format!("Failed to read stderr: {}", e));
+                                } else {
+                                    read_error =
+                                        Some(format!("Failed to read stdout and stderr: {}", e));
+                                }
+                                None
+                            }
+                        };
+
+                        LaunchProcessResult {
+                            status: LaunchProcessStatus::Completed,
+                            error: read_error,
+                            pid: Some(pid),
+                            exit_code: status.code(),
+                            stdout: stdout_val,
+                            stderr: stderr_val,
+                            stdout_file: Some(stdout_path),
+                            stderr_file: Some(stderr_path),
+                        }
+                    }
+                    Err(e) => {
+                        let original_error = format!("Failed to wait for process: {}", e);
+                        let (status, err_msg, exit_code, stdout, stderr) = cleanup_child(
+                            child,
+                            pid,
+                            &original_error,
+                            false,
+                            &stdout_path,
+                            &stderr_path,
+                        );
+                        LaunchProcessResult {
+                            status,
+                            error: err_msg,
+                            pid: Some(pid),
+                            exit_code,
+                            stdout,
+                            stderr,
+                            stdout_file: Some(stdout_path),
+                            stderr_file: Some(stderr_path),
+                        }
+                    }
+                }
+            } else {
+                LaunchProcessResult {
+                    status: LaunchProcessStatus::WaitFailed,
+                    error: Some("Process could not be accessed to wait for it.".to_string()),
+                    pid: Some(pid),
+                    exit_code: None,
+                    stdout: None,
+                    stderr: None,
+                    stdout_file: Some(stdout_path),
+                    stderr_file: Some(stderr_path),
+                }
+            }
+        }
+        _ => LaunchProcessResult {
+            status: LaunchProcessStatus::SetupFailed,
+            error: Some("Invalid request parameters combination".to_string()),
+            pid: None,
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            stdout_file: Some(stdout_path),
+            stderr_file: Some(stderr_path),
+        },
     }
 }
