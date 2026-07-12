@@ -42,7 +42,9 @@ The application exposes two tools:
 
 Check whether the local Remote Control MCP server is running and responding.
 * **Input schema:** Empty object (`{}`)
-* **Output:** Returns `"pong"` on success.
+* **Text content:** Returns `pong` on success.
+* **Structured content:** Returns `{ "message": "pong" }`.
+* **Output schema:** Advertises a matching MCP object schema with the required string property `message`.
 
 ---
 

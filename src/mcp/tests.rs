@@ -2,6 +2,7 @@ use crate::mcp::launch_process::{
     ChildOps, CleanupOutcome, handle_background_wait_result_with_notifier, perform_cleanup,
     read_and_truncate_file, report_background_error, validate_request,
 };
+use crate::mcp::ping::PingResult;
 use crate::mcp::{
     EnvironmentConfig, LaunchProcessRequest, LaunchProcessResult, LaunchProcessStatus, McpServer,
     TimeoutAction, UiEventKind, run_mcp_server_loop, test_hooks,
@@ -132,7 +133,7 @@ fn resolve_local_schema_ref<'a>(
             .expect("schema reference should be local");
         schema = root
             .pointer(pointer)
-            .expect("schema reference should resolve within the input schema");
+            .expect("schema reference should resolve within the schema");
     }
     schema
 }
@@ -229,8 +230,29 @@ fn ping_returns_pong() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    let result = rt.block_on(async { server.ping().await });
+    let result = rt.block_on(async { server.ping_impl().await });
     assert_eq!(result, "pong");
+}
+
+#[test]
+fn ping_returns_text_and_structured_content() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+
+    let result = rt.block_on(async { server.ping().await }).unwrap();
+    assert_eq!(result.content.len(), 1);
+    let rmcp::model::ContentBlock::Text(text) = &result.content[0] else {
+        panic!("expected ping to return one text content block");
+    };
+    assert_eq!(text.text, "pong");
+    assert_eq!(
+        result.structured_content,
+        Some(rmcp::serde_json::json!({ "message": "pong" }))
+    );
+    assert_eq!(result.is_error, Some(false));
 }
 
 #[test]
@@ -242,7 +264,7 @@ fn ping_emits_request_and_response_events() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    let _result = rt.block_on(async { server.ping().await });
+    let _result = rt.block_on(async { server.ping().await }).unwrap();
 
     let events: Vec<UiEventKind> = rx.try_iter().map(|e| e.kind).collect();
     assert_eq!(
@@ -273,6 +295,33 @@ fn ping_metadata_is_read_only_and_idempotent() {
     if let Some(properties) = attr.input_schema.get("properties") {
         assert!(properties.as_object().is_none_or(|p| p.is_empty()));
     }
+
+    let output_schema = attr
+        .output_schema
+        .as_ref()
+        .expect("ping output schema should be present");
+    let output_schema = rmcp::serde_json::Value::Object((**output_schema).clone());
+    let output_schema = resolve_local_schema_ref(&output_schema, &output_schema);
+    assert_eq!(
+        output_schema.get("type").and_then(|value| value.as_str()),
+        Some("object")
+    );
+
+    let message_schema = output_schema
+        .get("properties")
+        .and_then(|value| value.get("message"))
+        .expect("ping output schema should contain message");
+    let message_schema = resolve_local_schema_ref(output_schema, message_schema);
+    assert_eq!(
+        message_schema.get("type").and_then(|value| value.as_str()),
+        Some("string")
+    );
+    assert!(
+        output_schema
+            .get("required")
+            .and_then(|value| value.as_array())
+            .is_some_and(|required| required.iter().any(|value| value == "message"))
+    );
 }
 
 #[test]
@@ -316,6 +365,17 @@ fn ping_works_over_mcp_duplex_transport() {
         assert_eq!(ann.idempotent_hint, Some(true));
         assert_eq!(ann.open_world_hint, Some(false));
 
+        let output_schema = tool
+            .output_schema
+            .as_ref()
+            .expect("ping output schema should be present");
+        let output_schema = rmcp::serde_json::Value::Object((**output_schema).clone());
+        let output_schema = resolve_local_schema_ref(&output_schema, &output_schema);
+        assert_eq!(
+            output_schema.get("type").and_then(|value| value.as_str()),
+            Some("object")
+        );
+
         // 3. Tool execution through tools/call
         let call_params = rmcp::model::CallToolRequestParams::new("ping");
         let call_result = client
@@ -331,6 +391,18 @@ fn ping_works_over_mcp_duplex_transport() {
             }
             _ => panic!("Expected Text content block"),
         }
+        assert_eq!(call_result.is_error, Some(false));
+        let structured_content = call_result
+            .structured_content
+            .clone()
+            .expect("ping should return structured content");
+        assert_eq!(
+            structured_content,
+            rmcp::serde_json::json!({ "message": "pong" })
+        );
+        let typed_result: PingResult = rmcp::serde_json::from_value(structured_content)
+            .expect("ping structured content should match PingResult");
+        assert_eq!(typed_result.message, "pong");
 
         // 5. Graceful client/server shutdown
         client.close().await.expect("Failed to close client");

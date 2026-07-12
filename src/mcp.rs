@@ -156,6 +156,8 @@ impl McpServer {
 
     #[tool(
         description = "Check whether the local Remote Control MCP server is running and responding.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ping::PingResult>()
+            .expect("PingResult should generate a valid output schema"),
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -163,8 +165,22 @@ impl McpServer {
             open_world_hint = false
         )
     )]
-    async fn ping(&self) -> String {
-        self.ping_impl().await
+    async fn ping(&self) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let message = self.ping_impl().await;
+        let structured_content = rmcp::serde_json::to_value(ping::PingResult {
+            message: message.clone(),
+        })
+        .map_err(|error| {
+            rmcp::ErrorData::internal_error(
+                format!("Failed to serialise ping structured content: {error}"),
+                None,
+            )
+        })?;
+
+        let mut result =
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(message)]);
+        result.structured_content = Some(structured_content);
+        Ok(result)
     }
 
     #[tool(
