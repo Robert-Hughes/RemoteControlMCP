@@ -1999,6 +1999,8 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "rmcp",
+ "schemars",
+ "serde",
  "tokio",
 ]
 

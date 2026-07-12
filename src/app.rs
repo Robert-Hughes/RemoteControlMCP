@@ -88,6 +88,22 @@ impl eframe::App for RemoteControlApp {
                             UiEventKind::PingResponded => {
                                 "Tool 'ping' responded with 'pong'".to_string()
                             }
+                            UiEventKind::LaunchProcessRequested { process_name } => {
+                                format!("Tool 'launch_process' requested for '{}'", process_name)
+                            }
+                            UiEventKind::LaunchProcessResponded { status, pid } => {
+                                if let Some(pid) = pid {
+                                    format!(
+                                        "Tool 'launch_process' responded: {:?} (PID {})",
+                                        status, pid
+                                    )
+                                } else {
+                                    format!("Tool 'launch_process' responded: {:?}", status)
+                                }
+                            }
+                            UiEventKind::LaunchProcessRejected { error } => {
+                                format!("Tool 'launch_process' rejected: {}", error)
+                            }
                             UiEventKind::ServerStopped => "MCP service stopped".to_string(),
                             UiEventKind::ServerError { error } => {
                                 format!("Fatal MCP error: {}", error)
