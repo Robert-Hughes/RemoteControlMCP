@@ -1,6 +1,6 @@
 use crate::mcp::launch_process::{
-    ChildOps, CleanupOutcome, perform_cleanup, read_and_truncate_file, report_background_error,
-    validate_request,
+    ChildOps, CleanupOutcome, handle_background_wait_result_with_notifier, perform_cleanup,
+    read_and_truncate_file, report_background_error, validate_request,
 };
 use crate::mcp::{
     EnvironmentConfig, LaunchProcessRequest, LaunchProcessResult, LaunchProcessStatus, McpServer,
@@ -20,6 +20,60 @@ fn test_background_monitor_error_event() {
         UiEventKind::LaunchProcessBackgroundError { pid: 42, ref error }
             if error == "status check failed"
     ));
+}
+
+#[test]
+fn test_successful_background_wait_notifies_without_error_event() {
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+
+    handle_background_wait_result_with_notifier(
+        Ok(successful_exit_status()),
+        43,
+        &event_tx,
+        Instant::now(),
+        "Detached reaper failed",
+        move |pid| completion_tx.send(pid).unwrap(),
+    );
+
+    assert_eq!(completion_rx.try_recv(), Ok(43));
+    assert!(matches!(
+        event_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn test_failed_background_wait_reports_error_without_success_notification() {
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+
+    handle_background_wait_result_with_notifier(
+        Err(std::io::Error::other("injected wait failure")),
+        44,
+        &event_tx,
+        Instant::now(),
+        "Timeout-detached reaper failed",
+        move |pid| completion_tx.send(pid).unwrap(),
+    );
+
+    assert!(completion_rx.try_recv().is_err());
+    let event = event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let UiEventKind::LaunchProcessBackgroundError { pid, error } = event.kind else {
+        panic!("expected background error event");
+    };
+    assert_eq!(pid, 44);
+    assert!(error.contains("Timeout-detached reaper failed"));
+    assert!(error.contains("PID 44"));
+    assert!(error.contains("injected wait failure"));
+    for sensitive_input in [
+        "secret argument",
+        "SECRET_ENV",
+        "private stdout",
+        "private stderr",
+    ] {
+        assert!(!error.contains(sensitive_input));
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -381,6 +435,8 @@ fn test_schema_arguments() {
         .unwrap();
     let args_schema = properties.get("arguments").unwrap().as_object().unwrap();
 
+    assert!(!args_schema.contains_key("default"));
+
     #[cfg(target_os = "windows")]
     {
         assert_eq!(
@@ -393,6 +449,13 @@ fn test_schema_arguments() {
         assert_eq!(
             args_schema.get("type").and_then(|value| value.as_str()),
             Some("array")
+        );
+        assert_eq!(
+            args_schema
+                .get("items")
+                .and_then(|value| value.get("type"))
+                .and_then(|value| value.as_str()),
+            Some("string")
         );
     }
 }
@@ -1332,6 +1395,7 @@ fn launch_process_integration_test_over_duplex() {
             .as_object()
             .unwrap();
         let args_schema = properties.get("arguments").unwrap().as_object().unwrap();
+        assert!(!args_schema.contains_key("default"));
         #[cfg(target_os = "windows")]
         {
             assert_eq!(
@@ -1344,6 +1408,13 @@ fn launch_process_integration_test_over_duplex() {
             assert_eq!(
                 args_schema.get("type").and_then(|value| value.as_str()),
                 Some("array")
+            );
+            assert_eq!(
+                args_schema
+                    .get("items")
+                    .and_then(|value| value.get("type"))
+                    .and_then(|value| value.as_str()),
+                Some("string")
             );
         }
         let required = launch_tool
@@ -1795,24 +1866,61 @@ fn test_cleanup_uses_non_blocking_reaper_after_kill_failure() {
 
 #[test]
 fn test_cleanup_kill_failure_with_exited_child_is_reaped() {
+    let stdout_path = generate_temp_test_path("cleanup_exited_stdout");
+    let stderr_path = generate_temp_test_path("cleanup_exited_stderr");
+    std::fs::write(&stdout_path, "recovered stdout").unwrap();
+    std::fs::write(&stderr_path, "recovered stderr").unwrap();
     let (child, calls) = fake_child(false, true, FakeTryWait::Exited);
-    let (status, error, exit_code, _, _, outcome) = perform_cleanup(
+    let (status, error, exit_code, stdout, stderr, outcome) = perform_cleanup(
         child,
         1,
         "Status check failed",
         false,
-        "unused-stdout",
-        "unused-stderr",
+        stdout_path.to_str().unwrap(),
+        stderr_path.to_str().unwrap(),
         |_child| panic!("reaper should not start for an exited child"),
     );
 
-    assert_eq!(status, LaunchProcessStatus::WaitFailed);
+    assert_eq!(status, LaunchProcessStatus::Completed);
     assert_eq!(outcome, CleanupOutcome::KillFailedChildExited);
-    assert_eq!(exit_code, None);
+    assert_eq!(exit_code, Some(0));
+    assert_eq!(stdout.as_deref(), Some("recovered stdout"));
+    assert_eq!(stderr.as_deref(), Some("recovered stderr"));
     assert_eq!(*calls.lock().unwrap(), ["kill", "try_wait"]);
     let error = error.unwrap();
     assert!(error.contains("successfully reaped"));
     assert!(!error.contains("may still be running"));
+    let _ = std::fs::remove_file(stdout_path);
+    let _ = std::fs::remove_file(stderr_path);
+}
+
+#[test]
+fn test_timeout_cleanup_kill_failure_with_exited_child_is_completed() {
+    let stdout_path = generate_temp_test_path("timeout_cleanup_exited_stdout");
+    let stderr_path = generate_temp_test_path("timeout_cleanup_exited_stderr");
+    std::fs::write(&stdout_path, "timeout stdout").unwrap();
+    std::fs::write(&stderr_path, "timeout stderr").unwrap();
+    let (child, calls) = fake_child(false, true, FakeTryWait::Exited);
+
+    let (status, error, exit_code, stdout, stderr, outcome) = perform_cleanup(
+        child,
+        2,
+        "Process timed out",
+        true,
+        stdout_path.to_str().unwrap(),
+        stderr_path.to_str().unwrap(),
+        |_child| panic!("reaper should not start for an exited child"),
+    );
+
+    assert_eq!(status, LaunchProcessStatus::Completed);
+    assert_eq!(outcome, CleanupOutcome::KillFailedChildExited);
+    assert_eq!(exit_code, Some(0));
+    assert_eq!(stdout.as_deref(), Some("timeout stdout"));
+    assert_eq!(stderr.as_deref(), Some("timeout stderr"));
+    assert_eq!(*calls.lock().unwrap(), ["kill", "try_wait"]);
+    assert!(!error.unwrap().contains("may still be running"));
+    let _ = std::fs::remove_file(stdout_path);
+    let _ = std::fs::remove_file(stderr_path);
 }
 
 #[test]

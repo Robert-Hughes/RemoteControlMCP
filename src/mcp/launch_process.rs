@@ -75,6 +75,36 @@ pub fn read_and_truncate_file(path: &str) -> Result<String, std::io::Error> {
     }
 }
 
+struct FinalOutput {
+    error: Option<String>,
+    stdout: Option<String>,
+    stderr: Option<String>,
+}
+
+fn read_final_output(stdout_path: &str, stderr_path: &str) -> FinalOutput {
+    let mut errors = Vec::new();
+    let stdout = match read_and_truncate_file(stdout_path) {
+        Ok(output) => Some(output),
+        Err(error) => {
+            errors.push(format!("Failed to read stdout: {error}"));
+            None
+        }
+    };
+    let stderr = match read_and_truncate_file(stderr_path) {
+        Ok(output) => Some(output),
+        Err(error) => {
+            errors.push(format!("Failed to read stderr: {error}"));
+            None
+        }
+    };
+
+    FinalOutput {
+        error: (!errors.is_empty()).then(|| errors.join(". ")),
+        stdout,
+        stderr,
+    }
+}
+
 pub(crate) fn validate_request(req: &LaunchProcessRequest) -> Result<(), String> {
     if req.process_name.is_empty() {
         return Err("process_name cannot be empty".to_string());
@@ -200,6 +230,72 @@ pub(crate) fn report_background_error(
     });
 }
 
+fn handle_background_wait_result(
+    wait_result: std::io::Result<std::process::ExitStatus>,
+    pid: u32,
+    tx: &Sender<UiEvent>,
+    start_time: Instant,
+    context: &str,
+) {
+    handle_background_wait_result_with_notifier(wait_result, pid, tx, start_time, context, |pid| {
+        #[cfg(test)]
+        test_hooks::notify_completion(pid);
+        #[cfg(not(test))]
+        let _ = pid;
+    });
+}
+
+pub(crate) fn handle_background_wait_result_with_notifier<F>(
+    wait_result: std::io::Result<std::process::ExitStatus>,
+    pid: u32,
+    tx: &Sender<UiEvent>,
+    start_time: Instant,
+    context: &str,
+    notify_success: F,
+) where
+    F: FnOnce(u32),
+{
+    match wait_result {
+        // Completion means the child was successfully waited on and reaped.
+        Ok(_) => notify_success(pid),
+        Err(error) => report_background_error(
+            tx,
+            start_time,
+            pid,
+            format!("{context} for PID {pid}: {error}"),
+        ),
+    }
+}
+
+fn spawn_background_reaper(
+    child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
+    pid: u32,
+    tx: Sender<UiEvent>,
+    start_time: Instant,
+    thread_name: String,
+    context: &'static str,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let child = child
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            if let Some(mut child) = child {
+                let wait_result = child.wait();
+                handle_background_wait_result(wait_result, pid, &tx, start_time, context);
+            }
+        })
+        .map(|_| ())
+}
+
+#[derive(Clone, Copy)]
+struct BackgroundContext<'a> {
+    tx: &'a Sender<UiEvent>,
+    start_time: Instant,
+}
+
 pub(crate) fn perform_cleanup<C, F>(
     mut child: C,
     pid: u32,
@@ -314,14 +410,12 @@ where
         }
     };
 
-    let status = if is_timeout_stop {
-        if outcome == CleanupOutcome::KillSucceeded {
-            LaunchProcessStatus::TimedOutStopped
-        } else {
-            LaunchProcessStatus::StopFailed
-        }
-    } else {
-        LaunchProcessStatus::WaitFailed
+    let status = match outcome {
+        CleanupOutcome::KillFailedChildExited => LaunchProcessStatus::Completed,
+        CleanupOutcome::KillSucceeded if is_timeout_stop => LaunchProcessStatus::TimedOutStopped,
+        CleanupOutcome::KillSucceeded => LaunchProcessStatus::WaitFailed,
+        _ if is_timeout_stop => LaunchProcessStatus::StopFailed,
+        _ => LaunchProcessStatus::WaitFailed,
     };
 
     let operation_error = operation_error
@@ -386,32 +480,24 @@ where
         }
     };
 
-    if status == LaunchProcessStatus::TimedOutStopped {
-        let mut read_error = None;
-        let stdout_val = match read_and_truncate_file(stdout_path) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                read_error = Some(format!("Failed to read stdout: {}", e));
-                None
+    if matches!(
+        status,
+        LaunchProcessStatus::TimedOutStopped | LaunchProcessStatus::Completed
+    ) {
+        let final_output = read_final_output(stdout_path, stderr_path);
+        let error = match (outcome, final_output.error) {
+            (CleanupOutcome::KillFailedChildExited, Some(read_error)) => {
+                Some(format!("{err_msg} {read_error}"))
             }
-        };
-        let stderr_val = match read_and_truncate_file(stderr_path) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                if read_error.is_none() {
-                    read_error = Some(format!("Failed to read stderr: {}", e));
-                } else {
-                    read_error = Some(format!("Failed to read stdout and stderr: {}", e));
-                }
-                None
-            }
+            (CleanupOutcome::KillFailedChildExited, None) => Some(err_msg),
+            (_, read_error) => read_error,
         };
         (
             status,
-            read_error,
+            error,
             exit_res.ok().and_then(|s| s.code()),
-            stdout_val,
-            stderr_val,
+            final_output.stdout,
+            final_output.stderr,
             outcome,
         )
     } else {
@@ -426,6 +512,7 @@ fn cleanup_child(
     is_timeout_stop: bool,
     stdout_path: &str,
     stderr_path: &str,
+    background: BackgroundContext<'_>,
 ) -> (
     LaunchProcessStatus,
     Option<String>,
@@ -433,6 +520,8 @@ fn cleanup_child(
     Option<String>,
     Option<String>,
 ) {
+    let tx = background.tx.clone();
+    let start_time = background.start_time;
     let (status, err, exit_code, stdout, stderr, _outcome) = perform_cleanup(
         child,
         pid,
@@ -440,15 +529,15 @@ fn cleanup_child(
         is_timeout_stop,
         stdout_path,
         stderr_path,
-        move |mut c| {
-            std::thread::Builder::new()
-                .name(format!("mcp-reaper-cleanup-{}", pid))
-                .spawn(move || {
-                    let _ = c.wait();
-                    #[cfg(test)]
-                    test_hooks::notify_completion(pid);
-                })
-                .map(|_| ())
+        move |child| {
+            spawn_background_reaper(
+                std::sync::Arc::new(std::sync::Mutex::new(Some(child))),
+                pid,
+                tx,
+                start_time,
+                format!("mcp-reaper-cleanup-{pid}"),
+                "Cleanup reaper failed",
+            )
         },
     );
     #[cfg(test)]
@@ -596,20 +685,14 @@ fn execute_launch_process_blocking(
 
     match (req.detached, req.timeout_ms, req.timeout_action) {
         (true, None, None) => {
-            let child_arc_clone = child_arc.clone();
-            let reaper_spawn = std::thread::Builder::new()
-                .name(format!("mcp-reaper-{}", pid))
-                .spawn(move || {
-                    let child_opt = child_arc_clone
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .take();
-                    if let Some(mut child) = child_opt {
-                        let _ = child.wait();
-                        #[cfg(test)]
-                        test_hooks::notify_completion(pid);
-                    }
-                });
+            let reaper_spawn = spawn_background_reaper(
+                child_arc.clone(),
+                pid,
+                tx.clone(),
+                start_time,
+                format!("mcp-reaper-{pid}"),
+                "Detached reaper failed",
+            );
 
             match reaper_spawn {
                 Ok(_) => LaunchProcessResult {
@@ -634,6 +717,10 @@ fn execute_launch_process_blocking(
                             false,
                             &stdout_path,
                             &stderr_path,
+                            BackgroundContext {
+                                tx: &tx,
+                                start_time,
+                            },
                         )
                     } else {
                         (
@@ -710,8 +797,16 @@ fn execute_launch_process_blocking(
                                     true,
                                     &monitor_stdout,
                                     &monitor_stderr,
+                                    BackgroundContext {
+                                        tx: &tx_clone,
+                                        start_time,
+                                    },
                                 );
-                                if status != LaunchProcessStatus::TimedOutStopped {
+                                if !matches!(
+                                    status,
+                                    LaunchProcessStatus::TimedOutStopped
+                                        | LaunchProcessStatus::Completed
+                                ) {
                                     let error = error.unwrap_or_else(|| {
                                         "Detached timeout cleanup failed without further details"
                                             .to_string()
@@ -731,6 +826,10 @@ fn execute_launch_process_blocking(
                                     false,
                                     &monitor_stdout,
                                     &monitor_stderr,
+                                    BackgroundContext {
+                                        tx: &tx_clone,
+                                        start_time,
+                                    },
                                 );
                                 let error = cleanup_error.unwrap_or(original_error);
                                 report_background_error(&tx_clone, start_time, pid, error);
@@ -762,6 +861,10 @@ fn execute_launch_process_blocking(
                             false,
                             &stdout_path,
                             &stderr_path,
+                            BackgroundContext {
+                                tx: &tx,
+                                start_time,
+                            },
                         )
                     } else {
                         (
@@ -819,6 +922,10 @@ fn execute_launch_process_blocking(
                                         false,
                                         &stdout_path,
                                         &stderr_path,
+                                        BackgroundContext {
+                                            tx: &tx,
+                                            start_time,
+                                        },
                                     )
                                 } else {
                                     (
@@ -850,51 +957,27 @@ fn execute_launch_process_blocking(
             }
 
             if exited {
-                let mut read_error = None;
-                let stdout_val = match read_and_truncate_file(&stdout_path) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        read_error = Some(format!("Failed to read stdout file: {}", e));
-                        None
-                    }
-                };
-                let stderr_val = match read_and_truncate_file(&stderr_path) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        if read_error.is_none() {
-                            read_error = Some(format!("Failed to read stderr file: {}", e));
-                        } else {
-                            read_error = Some(format!("Failed to read stdout and stderr: {}", e));
-                        }
-                        None
-                    }
-                };
+                let final_output = read_final_output(&stdout_path, &stderr_path);
 
                 LaunchProcessResult {
                     status: LaunchProcessStatus::Completed,
-                    error: read_error,
+                    error: final_output.error,
                     pid: Some(pid),
                     exit_code: exit_status.and_then(|s| s.code()),
-                    stdout: stdout_val,
-                    stderr: stderr_val,
+                    stdout: final_output.stdout,
+                    stderr: final_output.stderr,
                     stdout_file: Some(stdout_path),
                     stderr_file: Some(stderr_path),
                 }
             } else {
-                let child_arc_clone = child_arc.clone();
-                let reaper_spawn = std::thread::Builder::new()
-                    .name(format!("mcp-reaper-{}", pid))
-                    .spawn(move || {
-                        let child_opt = child_arc_clone
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .take();
-                        if let Some(mut child) = child_opt {
-                            let _ = child.wait();
-                            #[cfg(test)]
-                            test_hooks::notify_completion(pid);
-                        }
-                    });
+                let reaper_spawn = spawn_background_reaper(
+                    child_arc.clone(),
+                    pid,
+                    tx.clone(),
+                    start_time,
+                    format!("mcp-reaper-{pid}"),
+                    "Timeout-detached reaper failed",
+                );
 
                 match reaper_spawn {
                     Ok(_) => LaunchProcessResult {
@@ -921,6 +1004,10 @@ fn execute_launch_process_blocking(
                                 false,
                                 &stdout_path,
                                 &stderr_path,
+                                BackgroundContext {
+                                    tx: &tx,
+                                    start_time,
+                                },
                             )
                         } else {
                             (
@@ -979,6 +1066,10 @@ fn execute_launch_process_blocking(
                                         false,
                                         &stdout_path,
                                         &stderr_path,
+                                        BackgroundContext {
+                                            tx: &tx,
+                                            start_time,
+                                        },
                                     )
                                 } else {
                                     (
@@ -1010,33 +1101,15 @@ fn execute_launch_process_blocking(
             }
 
             if exited {
-                let mut read_error = None;
-                let stdout_val = match read_and_truncate_file(&stdout_path) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        read_error = Some(format!("Failed to read stdout: {}", e));
-                        None
-                    }
-                };
-                let stderr_val = match read_and_truncate_file(&stderr_path) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        if read_error.is_none() {
-                            read_error = Some(format!("Failed to read stderr: {}", e));
-                        } else {
-                            read_error = Some(format!("Failed to read stdout and stderr: {}", e));
-                        }
-                        None
-                    }
-                };
+                let final_output = read_final_output(&stdout_path, &stderr_path);
 
                 LaunchProcessResult {
                     status: LaunchProcessStatus::Completed,
-                    error: read_error,
+                    error: final_output.error,
                     pid: Some(pid),
                     exit_code: exit_status.and_then(|s| s.code()),
-                    stdout: stdout_val,
-                    stderr: stderr_val,
+                    stdout: final_output.stdout,
+                    stderr: final_output.stderr,
                     stdout_file: Some(stdout_path),
                     stderr_file: Some(stderr_path),
                 }
@@ -1051,6 +1124,10 @@ fn execute_launch_process_blocking(
                         true,
                         &stdout_path,
                         &stderr_path,
+                        BackgroundContext {
+                            tx: &tx,
+                            start_time,
+                        },
                     )
                 } else {
                     (
@@ -1084,34 +1161,15 @@ fn execute_launch_process_blocking(
                 let wait_res = child.wait();
                 match wait_res {
                     Ok(status) => {
-                        let mut read_error = None;
-                        let stdout_val = match read_and_truncate_file(&stdout_path) {
-                            Ok(s) => Some(s),
-                            Err(e) => {
-                                read_error = Some(format!("Failed to read stdout: {}", e));
-                                None
-                            }
-                        };
-                        let stderr_val = match read_and_truncate_file(&stderr_path) {
-                            Ok(s) => Some(s),
-                            Err(e) => {
-                                if read_error.is_none() {
-                                    read_error = Some(format!("Failed to read stderr: {}", e));
-                                } else {
-                                    read_error =
-                                        Some(format!("Failed to read stdout and stderr: {}", e));
-                                }
-                                None
-                            }
-                        };
+                        let final_output = read_final_output(&stdout_path, &stderr_path);
 
                         LaunchProcessResult {
                             status: LaunchProcessStatus::Completed,
-                            error: read_error,
+                            error: final_output.error,
                             pid: Some(pid),
                             exit_code: status.code(),
-                            stdout: stdout_val,
-                            stderr: stderr_val,
+                            stdout: final_output.stdout,
+                            stderr: final_output.stderr,
                             stdout_file: Some(stdout_path),
                             stderr_file: Some(stderr_path),
                         }
@@ -1125,6 +1183,10 @@ fn execute_launch_process_blocking(
                             false,
                             &stdout_path,
                             &stderr_path,
+                            BackgroundContext {
+                                tx: &tx,
+                                start_time,
+                            },
                         );
                         LaunchProcessResult {
                             status,

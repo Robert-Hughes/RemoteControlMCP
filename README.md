@@ -55,6 +55,7 @@ Launch a local process on the host machine. There is no implicit shell execution
 * **`process_name`** (string, required): The name or absolute path of the executable to launch (e.g., `"notepad.exe"`, `"git"`).
 * **`arguments`** (optional):
   * Omit this field to launch the executable with no arguments.
+  * The generated schema intentionally has no default, so clients should omit the property for no arguments and MCP Inspector initially displays it as blank.
   * **Windows:** A single raw command-line string when present (e.g., `"/c echo hello"`). An empty string is equivalent to no arguments.
   * **Non-Windows:** An array of discrete argument strings when present (e.g., `["--version"]`). An empty array is equivalent to no arguments.
   * A shell is used only when the caller explicitly selects a shell executable, such as `cmd.exe`; the server never adds an implicit shell.
