@@ -279,5 +279,18 @@ mod tests {
                 }
             }
         }
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, UiEventKind::ServerError { .. })),
+            "unexpected server error during shutdown: {events:?}"
+        );
+
+        assert_eq!(
+            events.last(),
+            Some(&UiEventKind::ServerStopped),
+            "expected graceful shutdown to end with ServerStopped; events: {events:?}"
+        );
     }
 }
