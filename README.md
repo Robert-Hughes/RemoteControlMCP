@@ -41,19 +41,57 @@ cd D:\Programming\Internet\RemoteControlMCP
 cargo build
 ```
 
+## Running directly
+
+```powershell
+.\target\debug\remote-control-mcp.exe
+```
+
+When run directly from a normal terminal, there is no MCP client feeding `stdin`, so the GUI will remain waiting for a client.
+
+## Automated tests
+
+To run the automated test suite:
+
+```powershell
+cargo test
+```
+
+The tests cover:
+* Direct tool behavior of the `ping` method.
+* Correct tool metadata exposure.
+* UI event emission and ordering.
+* A real MCP initialisation and tool-call sequence over an in-memory duplex connection.
+
 ## Testing with MCP Inspector
 
-You can test the application using the Model Context Protocol Inspector:
+### Interactive Mode
+
+You can test the application interactively using the Model Context Protocol Inspector:
 
 ```powershell
 npx -y @modelcontextprotocol/inspector .\target\debug\remote-control-mcp.exe
 ```
 
 When you run this command:
-1. The Inspector launches.
+1. The Inspector web UI launches.
 2. The `Remote Control MCP` GUI window appears.
 3. The Inspector connects to the application over stdio.
 4. The Inspector UI shows the `ping` tool.
 5. You can invoke the `ping` tool.
 6. The tool returns `pong`.
 7. The GUI activity list updates to show the request and response with timestamps.
+
+### CLI Mode
+
+You can also run the Inspector in non-interactive CLI mode for quick testing:
+
+**List available tools:**
+```powershell
+npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.exe --method tools/list
+```
+
+**Call the `ping` tool:**
+```powershell
+npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.exe --method tools/call --tool-name ping
+```

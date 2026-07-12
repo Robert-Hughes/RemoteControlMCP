@@ -46,13 +46,13 @@ All warnings in project code must be fixed rather than suppressed unless there i
 
 ## Tests
 
-There are no automated tests in this initial slice.
-
-If tests are added later, run them with:
+To run the automated tests:
 
 ```powershell
 cargo test
 ```
+
+MCP protocol integration tests run over an in-memory duplex transport (`tokio::io::duplex`) and do not require Node or the MCP Inspector.
 
 Do not add tests merely to satisfy a process requirement. Add them when the architecture and behaviours to test are clear.
 
@@ -63,15 +63,14 @@ Expected validation sequence:
 ```powershell
 cargo fmt --check
 cargo check
+cargo test
 cargo clippy --all-targets -- -D warnings
 cargo build
 ```
 
-If tests exist in the future, include `cargo test` before Clippy.
-
 ## MCP Inspector
 
-Run this command:
+To run an interactive external smoke test:
 
 ```powershell
 npx -y @modelcontextprotocol/inspector .\target\debug\remote-control-mcp.exe
