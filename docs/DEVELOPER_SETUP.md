@@ -13,7 +13,7 @@ This setup allows a ChatGPT client to securely invoke the local `remote-control-
 * **Exclusive Stdout:** Standard output (`stdout`) of the Rust application is strictly reserved for MCP JSON-RPC messages; diagnostic logs are redirected to `stderr` or the GUI.
 * **Continuous Operation:** The tunnel client must remain running continuously for ChatGPT application discovery and for executing all incoming MCP tool calls.
 
-This guide is written specifically for developers using **Windows PowerShell** and targetting the **Debug executable**.
+This guide is written specifically for developers using **Windows PowerShell** and targeting the **Debug executable**.
 
 ### Architecture
 
@@ -51,7 +51,7 @@ Before starting, ensure you have:
 * **Rust Toolchain:** Cargo and `rustc` installed and available in your environment path.
 * **Local Repository:** A local clone of the `RemoteControlMCP` repository.
 * **OpenAI Platform Organisation:** Access to an OpenAI Platform developer organisation.
-* **ChatGPT Workspace:** A ChatGPT account (plus, team, or enterprise) eligible for Developer mode.
+* **ChatGPT Workspace:** A Pro, Plus, Business, Enterprise, or Education account eligible for Developer mode on the web.
 * **Required Tunnel Permissions:**
   * **Tunnels Read + Manage:** Needed to create, edit, or delete a tunnel endpoint in the Platform settings.
   * **Tunnels Read + Use:** Needed to run the `tunnel-client` daemon locally and select the tunnel when creating the ChatGPT application.
@@ -240,7 +240,7 @@ Start the tunnel client daemon in the active PowerShell session (where `$env:CON
 ```
 
 * **Keep Running:** Leave this terminal pane open. The process must remain active to handle connection dispatches.
-* **Structured Logs:** A large volume of structured JSON-RPC and lifecycle logs will stream to the terminal.
+* **Structured Logs:** A large volume of structured tunnel-client startup and lifecycle logs may appear in the terminal.
 * **Automatic UI Launch:** The local Rust GUI application will launch automatically.
 * **Initialisation Handshake:** The status label in the Rust GUI will transition to `Connected` once the MCP handshake completes.
 * **Admin Interface:** The local tunnel client exposes a browser-based admin UI. By default, this is available at:
@@ -348,8 +348,9 @@ When you are finished testing:
   * Do all checks in `doctor --explain` show as passed?
 
 ### App works in a new chat but not an old chat
-* **Cause:** Developer-mode tools are bound strictly to the chat session they are added to. They cannot be activated in a conversation that was started before the app was added to the composer.
-* **Fix:** Start a new conversation and enable the tool.
+
+* **Cause:** Developer-mode app selection is conversation-scoped. Existing conversations may not support an app that was not selected when their tool context was established.
+* **Fix:** Start a new conversation and select the app from the composer’s Developer mode tool list.
 
 ### Doctor shows stdio or OAuth checks as skipped
 * **Explanation:** `mcp_server_reachable` and `oauth_metadata` being marked as `SKIP` is standard behaviour for stdio-based profiles. It does not indicate a configuration error.
