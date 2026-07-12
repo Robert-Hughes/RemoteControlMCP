@@ -95,3 +95,9 @@ npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.e
 ```powershell
 npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.exe --method tools/call --tool-name ping
 ```
+
+## Connect to ChatGPT
+
+The local stdio MCP server can be connected to ChatGPT through an OpenAI Secure MCP Tunnel. This allows ChatGPT to securely call tools on your local machine using an outbound-only connection without exposing public ports.
+
+For a detailed step-by-step walkthrough of the tunnel and ChatGPT application setup on Windows using PowerShell, see [DEVELOPER_SETUP.md](docs/DEVELOPER_SETUP.md).
