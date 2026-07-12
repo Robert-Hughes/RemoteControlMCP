@@ -27,7 +27,7 @@ Standard output (`stdout`) is strictly reserved for MCP protocol messages.
 * **Never** print diagnostic, debug, or application output to `stdout` (e.g. using `println!`). Doing so will corrupt the protocol stream and cause the MCP client to disconnect.
 * Diagnostics must be sent to the GUI event channel or written to standard error (`stderr`) using `eprintln!`.
 
-## Exponent Tools
+## Exposed Tools
 
 The application exposes two tools:
 1. `ping`
@@ -53,9 +53,11 @@ Launch a local process on the host machine. There is no implicit shell execution
 #### Parameters
 
 * **`process_name`** (string, required): The name or absolute path of the executable to launch (e.g., `"notepad.exe"`, `"git"`).
-* **`arguments`** (required):
-  * **Windows:** A single raw command-line string (e.g., `"/c \"dir C:\\\""`).
-  * **Non-Windows:** An array of discrete argument strings (e.g., `["-c", "ls -l /"]`).
+* **`arguments`** (optional):
+  * Omit this field to launch the executable with no arguments.
+  * **Windows:** A single raw command-line string when present (e.g., `"/c echo hello"`). An empty string is equivalent to no arguments.
+  * **Non-Windows:** An array of discrete argument strings when present (e.g., `["--version"]`). An empty array is equivalent to no arguments.
+  * A shell is used only when the caller explicitly selects a shell executable, such as `cmd.exe`; the server never adds an implicit shell.
 * **`working_directory`** (string, optional): The directory where the process is launched. Defaults to `std::env::temp_dir()`.
 * **`environment`** (object, required):
   * **`inherit`** (boolean): If `true`, inherits the parent process's environment variables.
@@ -80,7 +82,7 @@ Launch a local process on the host machine. There is no implicit shell execution
 #### Subprocess Cleanup and Termination
 
 * **Direct Child Only:** Process termination only stops the immediate child process spawned. Any descendant processes spawned by the child are not terminated.
-* **Wait Failures:** If wait or status checking fails, a best-effort attempt is made to terminate the child and reap it synchronously. If synchronous reaping fails, ownership is transferred to a background reaper thread to prevent zombie processes.
+* **Wait Failures:** If wait or status checking fails, a best-effort attempt is made to terminate the child. A failed termination is followed by one non-blocking status check; if the child is still running or its status is unknown, ownership is transferred to a background reaper so the MCP response does not wait indefinitely.
 
 #### Result Schema
 
@@ -174,8 +176,10 @@ npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.e
 
 **Call the `launch_process` tool:**
 ```powershell
-npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.exe --method tools/call --tool-name launch_process --arguments "{\"process_name\":\"whoami\",\"arguments\":\"\",\"environment\":{\"inherit\":true,\"variables\":{}},\"detached\":false}"
+npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.exe --method tools/call --tool-name launch_process --arguments "{\"process_name\":\"whoami.exe\",\"environment\":{\"inherit\":true,\"variables\":{}},\"detached\":false}"
 ```
+
+This no-argument example is suitable for a typical Windows installation; executable availability differs between systems.
 
 ## Connect to ChatGPT
 

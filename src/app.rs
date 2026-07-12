@@ -104,6 +104,12 @@ impl eframe::App for RemoteControlApp {
                             UiEventKind::LaunchProcessRejected { error } => {
                                 format!("Tool 'launch_process' rejected: {}", error)
                             }
+                            UiEventKind::LaunchProcessBackgroundError { pid, error } => {
+                                format!(
+                                    "Background process monitoring failed for PID {}: {}",
+                                    pid, error
+                                )
+                            }
                             UiEventKind::ServerStopped => "MCP service stopped".to_string(),
                             UiEventKind::ServerError { error } => {
                                 format!("Fatal MCP error: {}", error)

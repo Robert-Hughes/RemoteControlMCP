@@ -53,10 +53,14 @@ pub struct LaunchProcessRequest {
     pub process_name: String,
 
     #[cfg(target_os = "windows")]
-    pub arguments: String,
+    #[serde(default)]
+    #[schemars(with = "String")]
+    pub arguments: Option<String>,
 
     #[cfg(not(target_os = "windows"))]
-    pub arguments: Vec<String>,
+    #[serde(default)]
+    #[schemars(with = "Vec<String>")]
+    pub arguments: Option<Vec<String>>,
 
     pub environment: EnvironmentConfig,
     pub detached: bool,
@@ -80,6 +84,10 @@ pub enum UiEventKind {
         pid: Option<u32>,
     },
     LaunchProcessRejected {
+        error: String,
+    },
+    LaunchProcessBackgroundError {
+        pid: u32,
         error: String,
     },
     ServerStopped,

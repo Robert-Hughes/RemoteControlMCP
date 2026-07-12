@@ -1,7 +1,9 @@
 use crate::mcp::{
     LaunchProcessRequest, LaunchProcessResult, LaunchProcessStatus, McpServer, TimeoutAction,
-    UiEventKind,
+    UiEvent, UiEventKind,
 };
+use std::sync::mpsc::Sender;
+use std::time::Instant;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -90,16 +92,22 @@ pub(crate) fn validate_request(req: &LaunchProcessRequest) -> Result<(), String>
 
     #[cfg(target_os = "windows")]
     {
-        if req.arguments.contains('\0') {
+        if req
+            .arguments
+            .as_ref()
+            .is_some_and(|arguments| arguments.contains('\0'))
+        {
             return Err("arguments cannot contain null characters".to_string());
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        for arg in &req.arguments {
-            if arg.contains('\0') {
-                return Err("arguments cannot contain null characters".to_string());
-            }
+        if req
+            .arguments
+            .as_ref()
+            .is_some_and(|arguments| arguments.iter().any(|argument| argument.contains('\0')))
+        {
+            return Err("arguments cannot contain null characters".to_string());
         }
     }
 
@@ -144,6 +152,315 @@ pub(crate) fn validate_request(req: &LaunchProcessRequest) -> Result<(), String>
 #[cfg(test)]
 pub use crate::mcp::test_hooks;
 
+pub(crate) trait ChildOps {
+    fn kill(&mut self) -> std::io::Result<()>;
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus>;
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
+}
+
+impl ChildOps for std::process::Child {
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.kill()
+    }
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.wait()
+    }
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.try_wait()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CleanupOutcome {
+    KillSucceeded,
+    KillFailedChildExited,
+    KillFailedChildRunning { reaper_started: bool },
+    KillFailedStatusUnknown { reaper_started: bool },
+    WaitFailedReaperStarted,
+    WaitFailedReaperStartFailed,
+}
+
+#[derive(Debug)]
+pub(crate) enum MonitorOutcome {
+    Exited(std::process::ExitStatus),
+    TimedOut,
+    WaitFailed(std::io::Error),
+}
+
+pub(crate) fn report_background_error(
+    tx: &Sender<UiEvent>,
+    start_time: Instant,
+    pid: u32,
+    error: String,
+) {
+    eprintln!("Background process monitoring failed for PID {pid}: {error}");
+    let _ = tx.send(UiEvent {
+        elapsed: start_time.elapsed(),
+        kind: UiEventKind::LaunchProcessBackgroundError { pid, error },
+    });
+}
+
+pub(crate) fn perform_cleanup<C, F>(
+    mut child: C,
+    pid: u32,
+    original_error: &str,
+    is_timeout_stop: bool,
+    stdout_path: &str,
+    stderr_path: &str,
+    spawn_reaper_fn: F,
+) -> (
+    LaunchProcessStatus,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+    Option<String>,
+    CleanupOutcome,
+)
+where
+    C: ChildOps + Send + 'static,
+    F: FnOnce(C) -> Result<(), std::io::Error>,
+{
+    let (outcome, exit_res, operation_error) = match child.kill() {
+        Ok(()) => match child.wait() {
+            Ok(status) => (CleanupOutcome::KillSucceeded, Ok(status), None),
+            Err(wait_error) => {
+                let wait_error_text = wait_error.to_string();
+                match spawn_reaper_fn(child) {
+                    Ok(()) => (
+                        CleanupOutcome::WaitFailedReaperStarted,
+                        Err(wait_error),
+                        Some(format!(
+                            "Waiting for the terminated process failed: {wait_error_text}"
+                        )),
+                    ),
+                    Err(spawn_error) => {
+                        eprintln!(
+                            "Failed to spawn background reaper during cleanup of PID {}: {}",
+                            pid, spawn_error
+                        );
+                        (
+                            CleanupOutcome::WaitFailedReaperStartFailed,
+                            Err(wait_error),
+                            Some(format!(
+                                "Waiting for the terminated process failed: {wait_error_text}. Starting the background reaper also failed: {spawn_error}"
+                            )),
+                        )
+                    }
+                }
+            }
+        },
+        Err(kill_error) => {
+            let kill_error_text = kill_error.to_string();
+            match child.try_wait() {
+                Ok(Some(status)) => (
+                    CleanupOutcome::KillFailedChildExited,
+                    Ok(status),
+                    Some(format!("Terminating the process failed: {kill_error_text}")),
+                ),
+                Ok(None) => match spawn_reaper_fn(child) {
+                    Ok(()) => (
+                        CleanupOutcome::KillFailedChildRunning {
+                            reaper_started: true,
+                        },
+                        Err(kill_error),
+                        Some(format!("Terminating the process failed: {kill_error_text}")),
+                    ),
+                    Err(spawn_error) => {
+                        eprintln!(
+                            "Failed to spawn background reaper during cleanup of PID {}: {}",
+                            pid, spawn_error
+                        );
+                        (
+                            CleanupOutcome::KillFailedChildRunning {
+                                reaper_started: false,
+                            },
+                            Err(kill_error),
+                            Some(format!(
+                                "Terminating the process failed: {kill_error_text}. Starting the background reaper also failed: {spawn_error}"
+                            )),
+                        )
+                    }
+                },
+                Err(status_error) => {
+                    let status_error_text = status_error.to_string();
+                    match spawn_reaper_fn(child) {
+                        Ok(()) => (
+                            CleanupOutcome::KillFailedStatusUnknown {
+                                reaper_started: true,
+                            },
+                            Err(status_error),
+                            Some(format!(
+                                "Terminating the process failed: {kill_error_text}. Checking its status also failed: {status_error_text}"
+                            )),
+                        ),
+                        Err(spawn_error) => {
+                            eprintln!(
+                                "Failed to spawn background reaper during cleanup of PID {}: {}",
+                                pid, spawn_error
+                            );
+                            (
+                                CleanupOutcome::KillFailedStatusUnknown {
+                                    reaper_started: false,
+                                },
+                                Err(status_error),
+                                Some(format!(
+                                    "Terminating the process failed: {kill_error_text}. Checking its status also failed: {status_error_text}. Starting the background reaper also failed: {spawn_error}"
+                                )),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let status = if is_timeout_stop {
+        if outcome == CleanupOutcome::KillSucceeded {
+            LaunchProcessStatus::TimedOutStopped
+        } else {
+            LaunchProcessStatus::StopFailed
+        }
+    } else {
+        LaunchProcessStatus::WaitFailed
+    };
+
+    let operation_error = operation_error
+        .map(|error| format!(" {error}."))
+        .unwrap_or_default();
+    let err_msg = match outcome {
+        CleanupOutcome::KillSucceeded => {
+            format!(
+                "{}{} Process successfully terminated and reaped.",
+                original_error, operation_error
+            )
+        }
+        CleanupOutcome::KillFailedChildExited => {
+            format!(
+                "{}{} The child process has exited and was successfully reaped.",
+                original_error, operation_error
+            )
+        }
+        CleanupOutcome::KillFailedChildRunning {
+            reaper_started: true,
+        } => {
+            format!(
+                "{}{} The child process is still running. A background reaper started; the process may still be running and may remain unreaped if the reaper fails.",
+                original_error, operation_error
+            )
+        }
+        CleanupOutcome::KillFailedChildRunning {
+            reaper_started: false,
+        } => {
+            format!(
+                "{}{} The child process is still running. The background reaper failed to start; the process may still be running and may remain unreaped.",
+                original_error, operation_error
+            )
+        }
+        CleanupOutcome::KillFailedStatusUnknown {
+            reaper_started: true,
+        } => {
+            format!(
+                "{}{} A background reaper started. The process status is unknown; it may still be running and may remain unreaped if the reaper fails.",
+                original_error, operation_error
+            )
+        }
+        CleanupOutcome::KillFailedStatusUnknown {
+            reaper_started: false,
+        } => {
+            format!(
+                "{}{} The background reaper failed to start. The process status is unknown; it may still be running and may remain unreaped.",
+                original_error, operation_error
+            )
+        }
+        CleanupOutcome::WaitFailedReaperStarted => {
+            format!(
+                "{}{} A background reaper started. The process is terminated but may remain unreaped if the reaper fails.",
+                original_error, operation_error
+            )
+        }
+        CleanupOutcome::WaitFailedReaperStartFailed => {
+            format!(
+                "{}{} The process is terminated but may remain unreaped.",
+                original_error, operation_error
+            )
+        }
+    };
+
+    if status == LaunchProcessStatus::TimedOutStopped {
+        let mut read_error = None;
+        let stdout_val = match read_and_truncate_file(stdout_path) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                read_error = Some(format!("Failed to read stdout: {}", e));
+                None
+            }
+        };
+        let stderr_val = match read_and_truncate_file(stderr_path) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                if read_error.is_none() {
+                    read_error = Some(format!("Failed to read stderr: {}", e));
+                } else {
+                    read_error = Some(format!("Failed to read stdout and stderr: {}", e));
+                }
+                None
+            }
+        };
+        (
+            status,
+            read_error,
+            exit_res.ok().and_then(|s| s.code()),
+            stdout_val,
+            stderr_val,
+            outcome,
+        )
+    } else {
+        (status, Some(err_msg), None, None, None, outcome)
+    }
+}
+
+fn cleanup_child(
+    child: std::process::Child,
+    pid: u32,
+    original_error: &str,
+    is_timeout_stop: bool,
+    stdout_path: &str,
+    stderr_path: &str,
+) -> (
+    LaunchProcessStatus,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+    Option<String>,
+) {
+    let (status, err, exit_code, stdout, stderr, _outcome) = perform_cleanup(
+        child,
+        pid,
+        original_error,
+        is_timeout_stop,
+        stdout_path,
+        stderr_path,
+        move |mut c| {
+            std::thread::Builder::new()
+                .name(format!("mcp-reaper-cleanup-{}", pid))
+                .spawn(move || {
+                    let _ = c.wait();
+                    #[cfg(test)]
+                    test_hooks::notify_completion(pid);
+                })
+                .map(|_| ())
+        },
+    );
+    #[cfg(test)]
+    if matches!(
+        _outcome,
+        CleanupOutcome::KillSucceeded | CleanupOutcome::KillFailedChildExited
+    ) {
+        test_hooks::notify_completion(pid);
+    }
+    (status, err, exit_code, stdout, stderr)
+}
+
 impl McpServer {
     pub async fn launch_process_impl(
         &self,
@@ -173,7 +490,11 @@ impl McpServer {
     }
 
     pub async fn execute_launch_process(&self, req: LaunchProcessRequest) -> LaunchProcessResult {
-        let join_handle = tokio::task::spawn_blocking(move || execute_launch_process_blocking(req));
+        let tx = self.tx.clone();
+        let start_time = self.start_time;
+        let join_handle = tokio::task::spawn_blocking(move || {
+            execute_launch_process_blocking(req, tx, start_time)
+        });
         match join_handle.await {
             Ok(res) => res,
             Err(e) => LaunchProcessResult {
@@ -190,123 +511,11 @@ impl McpServer {
     }
 }
 
-pub(crate) fn classify_cleanup(
-    kill_ok: bool,
-    wait_ok: bool,
-    original_error: &str,
-    is_timeout_stop: bool,
-) -> (LaunchProcessStatus, String, bool) {
-    let status = if is_timeout_stop {
-        if kill_ok && wait_ok {
-            LaunchProcessStatus::TimedOutStopped
-        } else {
-            LaunchProcessStatus::StopFailed
-        }
-    } else {
-        LaunchProcessStatus::WaitFailed
-    };
-
-    let cleanup_attempt = format!(
-        "Attempted cleanup: termination ({}), waiting ({}).",
-        if kill_ok { "succeeded" } else { "failed" },
-        if wait_ok { "succeeded" } else { "failed" }
-    );
-
-    let running_status = if kill_ok && wait_ok {
-        "The process was successfully terminated and reaped; it is not running."
-    } else if !kill_ok && wait_ok {
-        "Termination failed, but waiting succeeded; the process is not running but may have exited on its own."
-    } else if kill_ok && !wait_ok {
-        "Termination succeeded, but waiting failed; the process is terminated but may remain unreaped."
-    } else {
-        "Both termination and waiting failed; the process may still be running and may remain unreaped."
-    };
-
-    let err_msg = format!(
-        "{}. {}. {}",
-        original_error, cleanup_attempt, running_status
-    );
-
-    let spawn_reaper = !wait_ok;
-
-    (status, err_msg, spawn_reaper)
-}
-
-fn cleanup_child(
-    mut child: std::process::Child,
-    pid: u32,
-    original_error: &str,
-    is_timeout_stop: bool,
-    stdout_path: &str,
-    stderr_path: &str,
-) -> (
-    LaunchProcessStatus,
-    Option<String>,
-    Option<i32>,
-    Option<String>,
-    Option<String>,
-) {
-    let kill_res = child.kill();
-    let wait_res = child.wait();
-
-    let kill_ok = kill_res.is_ok();
-    let wait_ok = wait_res.is_ok();
-
-    let (status, err_msg, spawn_reaper) =
-        classify_cleanup(kill_ok, wait_ok, original_error, is_timeout_stop);
-
-    if spawn_reaper {
-        let reaper_spawn = std::thread::Builder::new()
-            .name(format!("mcp-reaper-cleanup-{}", pid))
-            .spawn(move || {
-                let _ = child.wait();
-                #[cfg(test)]
-                test_hooks::notify_completion(pid);
-            });
-        if let Err(e) = reaper_spawn {
-            eprintln!(
-                "Failed to spawn background reaper during cleanup of PID {}: {}",
-                pid, e
-            );
-        }
-    } else {
-        #[cfg(test)]
-        test_hooks::notify_completion(pid);
-    }
-
-    if status == LaunchProcessStatus::TimedOutStopped {
-        let mut read_error = None;
-        let stdout_val = match read_and_truncate_file(stdout_path) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                read_error = Some(format!("Failed to read stdout: {}", e));
-                None
-            }
-        };
-        let stderr_val = match read_and_truncate_file(stderr_path) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                if read_error.is_none() {
-                    read_error = Some(format!("Failed to read stderr: {}", e));
-                } else {
-                    read_error = Some(format!("Failed to read stdout and stderr: {}", e));
-                }
-                None
-            }
-        };
-        (
-            status,
-            read_error,
-            wait_res.ok().and_then(|s| s.code()),
-            stdout_val,
-            stderr_val,
-        )
-    } else {
-        (status, Some(err_msg), None, None, None)
-    }
-}
-
-fn execute_launch_process_blocking(req: LaunchProcessRequest) -> LaunchProcessResult {
+fn execute_launch_process_blocking(
+    req: LaunchProcessRequest,
+    tx: Sender<UiEvent>,
+    start_time: Instant,
+) -> LaunchProcessResult {
     let (stdout_file, stderr_file, stdout_path, stderr_path) = match generate_output_files() {
         Ok(files) => files,
         Err(e) => {
@@ -347,11 +556,23 @@ fn execute_launch_process_blocking(req: LaunchProcessRequest) -> LaunchProcessRe
 
     #[cfg(target_os = "windows")]
     {
-        cmd.raw_arg(&req.arguments);
+        if let Some(arguments) = req
+            .arguments
+            .as_ref()
+            .filter(|arguments| !arguments.is_empty())
+        {
+            cmd.raw_arg(arguments);
+        }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        cmd.args(&req.arguments);
+        if let Some(arguments) = req
+            .arguments
+            .as_ref()
+            .filter(|arguments| !arguments.is_empty())
+        {
+            cmd.args(arguments);
+        }
     }
 
     let child = match cmd.spawn() {
@@ -444,23 +665,25 @@ fn execute_launch_process_blocking(req: LaunchProcessRequest) -> LaunchProcessRe
             let child_arc_clone = child_arc.clone();
             let monitor_stdout = stdout_path.clone();
             let monitor_stderr = stderr_path.clone();
+            let tx_clone = tx.clone();
             let monitor_spawn = std::thread::Builder::new()
                 .name(format!("mcp-monitor-{}", pid))
                 .spawn(move || {
                     let start = std::time::Instant::now();
                     let timeout_duration = std::time::Duration::from_millis(timeout_ms);
-                    let mut exited = false;
+                    let mut outcome = MonitorOutcome::TimedOut;
 
                     while start.elapsed() < timeout_duration {
                         let mut lock = child_arc_clone.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(ref mut child) = *lock {
                             match child.try_wait() {
-                                Ok(Some(_status)) => {
-                                    exited = true;
+                                Ok(Some(status)) => {
+                                    outcome = MonitorOutcome::Exited(status);
                                     break;
                                 }
                                 Ok(None) => {}
-                                Err(_) => {
+                                Err(e) => {
+                                    outcome = MonitorOutcome::WaitFailed(e);
                                     break;
                                 }
                             }
@@ -474,24 +697,44 @@ fn execute_launch_process_blocking(req: LaunchProcessRequest) -> LaunchProcessRe
                         .unwrap_or_else(|e| e.into_inner())
                         .take();
                     if let Some(child) = child_opt {
-                        if !exited {
-                            let _ = cleanup_child(
-                                child,
-                                pid,
-                                "Process timed out",
-                                true,
-                                &monitor_stdout,
-                                &monitor_stderr,
-                            );
-                        } else {
-                            let _ = cleanup_child(
-                                child,
-                                pid,
-                                "Process exited",
-                                false,
-                                &monitor_stdout,
-                                &monitor_stderr,
-                            );
+                        match outcome {
+                            MonitorOutcome::Exited(_status) => {
+                                #[cfg(test)]
+                                test_hooks::notify_completion(pid);
+                            }
+                            MonitorOutcome::TimedOut => {
+                                let (status, error, ..) = cleanup_child(
+                                    child,
+                                    pid,
+                                    "Process timed out",
+                                    true,
+                                    &monitor_stdout,
+                                    &monitor_stderr,
+                                );
+                                if status != LaunchProcessStatus::TimedOutStopped {
+                                    let error = error.unwrap_or_else(|| {
+                                        "Detached timeout cleanup failed without further details"
+                                            .to_string()
+                                    });
+                                    report_background_error(&tx_clone, start_time, pid, error);
+                                }
+                            }
+                            MonitorOutcome::WaitFailed(ref e) => {
+                                let original_error = format!(
+                                    "Detached monitor failed to check process status: {}",
+                                    e
+                                );
+                                let (_, cleanup_error, ..) = cleanup_child(
+                                    child,
+                                    pid,
+                                    &original_error,
+                                    false,
+                                    &monitor_stdout,
+                                    &monitor_stderr,
+                                );
+                                let error = cleanup_error.unwrap_or(original_error);
+                                report_background_error(&tx_clone, start_time, pid, error);
+                            }
                         }
                     }
                 });

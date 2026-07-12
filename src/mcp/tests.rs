@@ -1,4 +1,7 @@
-use crate::mcp::launch_process::{classify_cleanup, read_and_truncate_file, validate_request};
+use crate::mcp::launch_process::{
+    ChildOps, CleanupOutcome, perform_cleanup, read_and_truncate_file, report_background_error,
+    validate_request,
+};
 use crate::mcp::{
     EnvironmentConfig, LaunchProcessRequest, LaunchProcessResult, LaunchProcessStatus, McpServer,
     TimeoutAction, UiEventKind, run_mcp_server_loop, test_hooks,
@@ -6,6 +9,18 @@ use crate::mcp::{
 use std::time::{Duration, Instant};
 
 static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn test_background_monitor_error_event() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    report_background_error(&tx, Instant::now(), 42, "status check failed".to_string());
+    let event = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(matches!(
+        event.kind,
+        UiEventKind::LaunchProcessBackgroundError { pid: 42, ref error }
+            if error == "status check failed"
+    ));
+}
 
 #[cfg(target_os = "windows")]
 fn escape_windows_arg(arg: &str) -> String {
@@ -65,24 +80,21 @@ fn generate_temp_test_path(prefix: &str) -> std::path::PathBuf {
 }
 
 fn make_helper_request() -> LaunchProcessRequest {
-    let process_name = std::env::current_exe()
-        .unwrap()
+    let test_executable = std::env::current_exe().unwrap();
+    let debug_directory = test_executable.parent().unwrap().parent().unwrap();
+    let process_name = debug_directory
+        .join("examples")
+        .join(format!(
+            "launch_process_test_helper{}",
+            std::env::consts::EXE_SUFFIX
+        ))
         .to_string_lossy()
         .into_owned();
-
-    #[cfg(target_os = "windows")]
-    let arguments = escape_windows_args(&["launch_process_test_helper", "--ignored"]);
-
-    #[cfg(not(target_os = "windows"))]
-    let arguments = vec![
-        "launch_process_test_helper".to_string(),
-        "--ignored".to_string(),
-    ];
 
     LaunchProcessRequest {
         working_directory: None,
         process_name,
-        arguments,
+        arguments: None,
         environment: EnvironmentConfig {
             inherit: true,
             variables: std::collections::HashMap::new(),
@@ -90,173 +102,6 @@ fn make_helper_request() -> LaunchProcessRequest {
         detached: false,
         timeout_ms: None,
         timeout_action: None,
-    }
-}
-
-struct HelperOutputs {
-    stdout: std::fs::File,
-    stderr: std::fs::File,
-}
-
-impl HelperOutputs {
-    fn new() -> Self {
-        #[cfg(target_os = "windows")]
-        {
-            use std::io::{Seek, SeekFrom};
-            use std::os::windows::io::{AsRawHandle, FromRawHandle};
-            let stdout_raw = std::io::stdout().as_raw_handle();
-            let mut stdout = unsafe { std::fs::File::from_raw_handle(stdout_raw) };
-            let _ = stdout.set_len(0);
-            let _ = stdout.seek(SeekFrom::Start(0));
-
-            let stderr_raw = std::io::stderr().as_raw_handle();
-            let mut stderr = unsafe { std::fs::File::from_raw_handle(stderr_raw) };
-            let _ = stderr.set_len(0);
-            let _ = stderr.seek(SeekFrom::Start(0));
-            Self { stdout, stderr }
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            use std::io::{Seek, SeekFrom};
-            use std::os::unix::io::{AsRawFd, FromRawFd};
-            let stdout_raw = std::io::stdout().as_raw_fd();
-            let mut stdout = unsafe { std::fs::File::from_raw_fd(stdout_raw) };
-            let _ = stdout.set_len(0);
-            let _ = stdout.seek(SeekFrom::Start(0));
-
-            let stderr_raw = std::io::stderr().as_raw_fd();
-            let mut stderr = unsafe { std::fs::File::from_raw_fd(stderr_raw) };
-            let _ = stderr.set_len(0);
-            let _ = stderr.seek(SeekFrom::Start(0));
-            Self { stdout, stderr }
-        }
-    }
-
-    fn write_stdout(&mut self, s: &str) {
-        use std::io::Write;
-        let _ = self.stdout.write_all(s.as_bytes());
-        let _ = self.stdout.flush();
-    }
-
-    fn write_stdout_bytes(&mut self, bytes: &[u8]) {
-        use std::io::Write;
-        let _ = self.stdout.write_all(bytes);
-        let _ = self.stdout.flush();
-    }
-
-    fn write_stderr(&mut self, s: &str) {
-        use std::io::Write;
-        let _ = self.stderr.write_all(s.as_bytes());
-        let _ = self.stderr.flush();
-    }
-}
-
-#[test]
-#[ignore]
-fn launch_process_test_helper() {
-    if let Ok(action) = std::env::var("RMCP_TEST_HELPER_ACTION") {
-        let mut outputs = HelperOutputs::new();
-        match action.as_str() {
-            "stdout_stderr" => {
-                let stdout_val = std::env::var("RMCP_TEST_HELPER_STDOUT").unwrap_or_default();
-                let stderr_val = std::env::var("RMCP_TEST_HELPER_STDERR").unwrap_or_default();
-                outputs.write_stdout(&stdout_val);
-                outputs.write_stderr(&stderr_val);
-                std::process::exit(0);
-            }
-            "exit_code" => {
-                let code: i32 = std::env::var("RMCP_TEST_HELPER_CODE")
-                    .unwrap_or_default()
-                    .parse()
-                    .unwrap_or(0);
-                std::process::exit(code);
-            }
-            "pwd" => {
-                if let Ok(cwd) = std::env::current_dir() {
-                    outputs.write_stdout(&cwd.to_string_lossy());
-                }
-                std::process::exit(0);
-            }
-            "env" => {
-                let name = std::env::var("RMCP_TEST_HELPER_ENV_NAME").unwrap_or_default();
-                if let Ok(val) = std::env::var(&name) {
-                    outputs.write_stdout(&val);
-                }
-                std::process::exit(0);
-            }
-            "stdin_eof" => {
-                use std::io::Read;
-                let mut buffer = String::new();
-                let stdin_res = std::io::stdin().read_to_string(&mut buffer);
-                if stdin_res.is_ok() {
-                    outputs.write_stdout("STDIN_EOF");
-                } else {
-                    outputs.write_stdout("STDIN_ERROR");
-                }
-                std::process::exit(0);
-            }
-            "sleep" => {
-                let ms: u64 = std::env::var("RMCP_TEST_HELPER_SLEEP_MS")
-                    .unwrap_or_default()
-                    .parse()
-                    .unwrap_or(0);
-                if let Ok(val) = std::env::var("RMCP_TEST_HELPER_PARTIAL_STDOUT") {
-                    outputs.write_stdout(&format!("{}\n", val));
-                }
-                if let Ok(val) = std::env::var("RMCP_TEST_HELPER_PARTIAL_STDERR") {
-                    outputs.write_stderr(&format!("{}\n", val));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-                if let Ok(marker) = std::env::var("RMCP_TEST_HELPER_MARKER") {
-                    let _ = std::fs::write(&marker, "done");
-                }
-                std::process::exit(0);
-            }
-            "large_output" => {
-                let count: usize = std::env::var("RMCP_TEST_HELPER_COUNT")
-                    .unwrap_or_default()
-                    .parse()
-                    .unwrap_or(2000);
-                let stdout_char = std::env::var("RMCP_TEST_HELPER_STDOUT_CHAR")
-                    .unwrap_or_else(|_| "A".to_string());
-                let stderr_char = std::env::var("RMCP_TEST_HELPER_STDERR_CHAR")
-                    .unwrap_or_else(|_| "B".to_string());
-                let stdout_tail = std::env::var("RMCP_TEST_HELPER_STDOUT_TAIL").unwrap_or_default();
-                let stderr_tail = std::env::var("RMCP_TEST_HELPER_STDERR_TAIL").unwrap_or_default();
-
-                outputs.write_stdout(&format!("{}{}", stdout_char.repeat(count), stdout_tail));
-                outputs.write_stderr(&format!("{}{}", stderr_char.repeat(count), stderr_tail));
-                std::process::exit(0);
-            }
-            "invalid_utf8" => {
-                outputs.write_stdout_bytes(&[0xff, 0xff, 0xff, 0xff]);
-                std::process::exit(0);
-            }
-            "echo_args" => {
-                let args: Vec<String> = std::env::args().collect();
-                if let Some(pos) = args.iter().position(|x| x == "launch_process_test_helper") {
-                    let helper_args = &args[pos + 1..];
-                    let filtered: Vec<&String> = helper_args
-                        .iter()
-                        .filter(|x| *x != "--ignored" && *x != "--nocapture")
-                        .collect();
-                    let formatted = filtered
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join("|");
-                    outputs.write_stdout(&formatted);
-                } else {
-                    outputs.write_stdout("no_helper_arg");
-                }
-                std::process::exit(0);
-            }
-            _ => {
-                std::process::exit(0);
-            }
-        }
-    } else {
-        std::process::exit(0);
     }
 }
 
@@ -437,7 +282,7 @@ fn test_validation() {
     #[cfg(target_os = "windows")]
     {
         let mut req = base_req.clone();
-        req.arguments = "some\0args".to_string();
+        req.arguments = Some("some\0args".to_string());
         assert!(validate_request(&req).is_err());
     }
 
@@ -445,7 +290,7 @@ fn test_validation() {
     #[cfg(not(target_os = "windows"))]
     {
         let mut req = base_req.clone();
-        req.arguments = vec!["arg1".to_string(), "arg\0two".to_string()];
+        req.arguments = Some(vec!["arg1".to_string(), "arg\0two".to_string()]);
         assert!(validate_request(&req).is_err());
     }
 
@@ -505,6 +350,24 @@ fn test_validation() {
     // Valid request validation test
     let req = base_req.clone();
     assert!(validate_request(&req).is_ok());
+
+    // Optional arguments validation
+    // A. None is valid
+    let mut req = base_req.clone();
+    req.arguments = None;
+    assert!(validate_request(&req).is_ok());
+
+    // B. Empty string/vector is valid
+    let mut req = base_req.clone();
+    #[cfg(target_os = "windows")]
+    {
+        req.arguments = Some("".to_string());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        req.arguments = Some(vec![]);
+    }
+    assert!(validate_request(&req).is_ok());
 }
 
 #[test]
@@ -520,12 +383,39 @@ fn test_schema_arguments() {
 
     #[cfg(target_os = "windows")]
     {
-        assert_eq!(args_schema.get("type").unwrap().as_str().unwrap(), "string");
+        assert_eq!(
+            args_schema.get("type").and_then(|value| value.as_str()),
+            Some("string")
+        );
     }
     #[cfg(not(target_os = "windows"))]
     {
-        assert_eq!(args_schema.get("type").unwrap().as_str().unwrap(), "array");
+        assert_eq!(
+            args_schema.get("type").and_then(|value| value.as_str()),
+            Some("array")
+        );
     }
+}
+
+#[test]
+fn test_schema_required_fields() {
+    let attr = McpServer::launch_process_tool_attr();
+    let required = attr
+        .input_schema
+        .get("required")
+        .unwrap()
+        .as_array()
+        .unwrap();
+
+    let required_fields: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+
+    // arguments must NOT be in required
+    assert!(!required_fields.contains(&"arguments"));
+
+    // process_name, environment, detached must be in required
+    assert!(required_fields.contains(&"process_name"));
+    assert!(required_fields.contains(&"environment"));
+    assert!(required_fields.contains(&"detached"));
 }
 
 #[test]
@@ -593,6 +483,37 @@ fn test_successful_completion() {
 }
 
 #[test]
+fn test_successful_completion_without_arguments() {
+    let _guard = match ENV_MUTEX.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+
+    let req = LaunchProcessRequest {
+        working_directory: None,
+        process_name: make_helper_request().process_name,
+        arguments: None,
+        environment: EnvironmentConfig {
+            inherit: true,
+            variables: std::collections::HashMap::new(),
+        },
+        detached: false,
+        timeout_ms: None,
+        timeout_action: None,
+    };
+
+    assert!(validate_request(&req).is_ok());
+    let res = rt.block_on(async { server.execute_launch_process(req).await });
+    assert!(matches!(res.status, LaunchProcessStatus::Completed));
+    assert_eq!(res.exit_code, Some(0));
+}
+
+#[test]
 fn test_working_directory() {
     let _guard = match ENV_MUTEX.lock() {
         Ok(g) => g,
@@ -656,13 +577,10 @@ fn test_working_directory() {
     let _ = std::fs::remove_dir_all(&explicit_dir);
 
     // 3. Nonexistent working directory returns launch_process_failed
+    let nonexistent_path = generate_temp_test_path("nonexistent_working_directory");
+    assert!(!nonexistent_path.exists());
     let mut req = make_helper_request();
-    req.working_directory = Some(
-        std::env::temp_dir()
-            .join("nonexistent_dir_123456")
-            .to_string_lossy()
-            .into_owned(),
-    );
+    req.working_directory = Some(nonexistent_path.to_string_lossy().into_owned());
     assert!(validate_request(&req).is_ok());
 
     let res = rt.block_on(async { server.execute_launch_process(req).await });
@@ -779,7 +697,7 @@ fn test_null_stdin() {
 
     let res = rt.block_on(async { server.execute_launch_process(req).await });
     assert!(matches!(res.status, LaunchProcessStatus::Completed));
-    assert_eq!(res.stdout.as_deref().unwrap().trim(), "STDIN_EOF");
+    assert_eq!(res.stdout.as_deref(), Some("STDIN_EOF"));
 }
 
 #[test]
@@ -1231,6 +1149,38 @@ fn test_detached_with_stop_timeout() {
     assert_eq!(completed_pid, pid);
 
     assert!(!marker_path.exists());
+
+    // A naturally exiting detached child is reaped as an exit, not as a timeout.
+    let natural_marker_path = generate_temp_test_path("det_stop_natural_marker");
+    let mut req = make_helper_request();
+    req.detached = true;
+    req.timeout_ms = Some(2000);
+    req.timeout_action = Some(TimeoutAction::Stop);
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_ACTION".to_string(),
+        Some("sleep".to_string()),
+    );
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_SLEEP_MS".to_string(),
+        Some("100".to_string()),
+    );
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_MARKER".to_string(),
+        Some(natural_marker_path.to_string_lossy().into_owned()),
+    );
+
+    let res = rt.block_on(async { server.execute_launch_process(req).await });
+    assert!(matches!(
+        res.status,
+        LaunchProcessStatus::DetachedWithStopTimeout
+    ));
+    let natural_pid = res.pid.unwrap();
+    let completed_pid = completion_rx
+        .recv_timeout(Duration::from_millis(5000))
+        .unwrap();
+    assert_eq!(completed_pid, natural_pid);
+    assert!(natural_marker_path.exists());
+    let _ = std::fs::remove_file(natural_marker_path);
 }
 
 #[test]
@@ -1307,9 +1257,9 @@ fn test_gui_events_launch_process() {
         working_directory: None,
         process_name: "".to_string(),
         #[cfg(target_os = "windows")]
-        arguments: "".to_string(),
+        arguments: Some("".to_string()),
         #[cfg(not(target_os = "windows"))]
-        arguments: vec![],
+        arguments: Some(vec![]),
         environment: EnvironmentConfig {
             inherit: true,
             variables: std::collections::HashMap::new(),
@@ -1384,12 +1334,30 @@ fn launch_process_integration_test_over_duplex() {
         let args_schema = properties.get("arguments").unwrap().as_object().unwrap();
         #[cfg(target_os = "windows")]
         {
-            assert_eq!(args_schema.get("type").unwrap().as_str().unwrap(), "string");
+            assert_eq!(
+                args_schema.get("type").and_then(|value| value.as_str()),
+                Some("string")
+            );
         }
         #[cfg(not(target_os = "windows"))]
         {
-            assert_eq!(args_schema.get("type").unwrap().as_str().unwrap(), "array");
+            assert_eq!(
+                args_schema.get("type").and_then(|value| value.as_str()),
+                Some("array")
+            );
         }
+        let required = launch_tool
+            .input_schema
+            .get("required")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        let required_fields: Vec<&str> =
+            required.iter().filter_map(|value| value.as_str()).collect();
+        assert!(!required_fields.contains(&"arguments"));
+        assert!(required_fields.contains(&"process_name"));
+        assert!(required_fields.contains(&"environment"));
+        assert!(required_fields.contains(&"detached"));
 
         let mut variables: std::collections::HashMap<String, Option<String>> =
             std::collections::HashMap::new();
@@ -1407,15 +1375,9 @@ fn launch_process_integration_test_over_duplex() {
         );
 
         #[cfg(target_os = "windows")]
-        let base_arguments_val = rmcp::serde_json::json!(escape_windows_args(&[
-            "launch_process_test_helper",
-            "--ignored"
-        ]));
+        let base_arguments_val = rmcp::serde_json::json!(escape_windows_args(&["integration_arg"]));
         #[cfg(not(target_os = "windows"))]
-        let base_arguments_val = rmcp::serde_json::json!(vec![
-            "launch_process_test_helper".to_string(),
-            "--ignored".to_string()
-        ]);
+        let base_arguments_val = rmcp::serde_json::json!(vec!["integration_arg".to_string()]);
 
         let mut call_params = rmcp::model::CallToolRequestParams::new("launch_process");
         call_params.arguments = Some(
@@ -1453,6 +1415,36 @@ fn launch_process_integration_test_over_duplex() {
             result.stderr.as_deref().unwrap().trim(),
             "stderr: integration_test"
         );
+
+        // 2. Omitted arguments are accepted through the real MCP interface.
+        let mut no_arguments_params = rmcp::model::CallToolRequestParams::new("launch_process");
+        no_arguments_params.arguments = Some(
+            rmcp::serde_json::json!({
+                "process_name": make_helper_request().process_name,
+                "environment": {
+                    "inherit": true,
+                    "variables": {}
+                },
+                "detached": false
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let no_arguments_result = client
+            .call_tool(no_arguments_params)
+            .await
+            .expect("launch_process should accept omitted arguments");
+        let no_arguments_structured = no_arguments_result
+            .structured_content
+            .expect("Expected structured no-arguments result");
+        let no_arguments_result: LaunchProcessResult =
+            rmcp::serde_json::from_value(no_arguments_structured).unwrap();
+        assert!(matches!(
+            no_arguments_result.status,
+            LaunchProcessStatus::Completed
+        ));
+        assert_eq!(no_arguments_result.exit_code, Some(0));
 
         // 3. Validation-error integration test
         let mut invalid_call_params = rmcp::model::CallToolRequestParams::new("launch_process");
@@ -1567,6 +1559,8 @@ fn test_concurrency_blocking_off_runtime() {
 
         let client_for_launch = client.clone();
         let client_for_ping = client.clone();
+        let started_marker = generate_temp_test_path("concurrency_started");
+        let started_marker_for_launch = started_marker.clone();
 
         let launch_handle = tokio::spawn(async move {
             let mut variables = std::collections::HashMap::new();
@@ -1578,23 +1572,15 @@ fn test_concurrency_blocking_off_runtime() {
                 "RMCP_TEST_HELPER_SLEEP_MS".to_string(),
                 Some("1500".to_string()),
             );
-
-            #[cfg(target_os = "windows")]
-            let arguments_val = rmcp::serde_json::json!(escape_windows_args(&[
-                "launch_process_test_helper",
-                "--ignored"
-            ]));
-            #[cfg(not(target_os = "windows"))]
-            let arguments_val = rmcp::serde_json::json!(vec![
-                "launch_process_test_helper".to_string(),
-                "--ignored".to_string()
-            ]);
+            variables.insert(
+                "RMCP_TEST_HELPER_STARTED_MARKER".to_string(),
+                Some(started_marker_for_launch.to_string_lossy().into_owned()),
+            );
 
             let mut call_params = rmcp::model::CallToolRequestParams::new("launch_process");
             call_params.arguments = Some(
                 rmcp::serde_json::json!({
-                    "process_name": std::env::current_exe().unwrap().to_string_lossy(),
-                    "arguments": arguments_val,
+                    "process_name": make_helper_request().process_name,
                     "environment": {
                         "inherit": true,
                         "variables": variables
@@ -1611,7 +1597,17 @@ fn test_concurrency_blocking_off_runtime() {
             (res, start.elapsed())
         });
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !started_marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("helper did not create its started marker");
+        assert!(
+            !launch_handle.is_finished(),
+            "foreground launch completed before ping was sent"
+        );
 
         let ping_start = Instant::now();
         let ping_params = rmcp::model::CallToolRequestParams::new("ping");
@@ -1644,6 +1640,7 @@ fn test_concurrency_blocking_off_runtime() {
         assert!(matches!(result.status, LaunchProcessStatus::Completed));
         assert_eq!(result.exit_code, Some(0));
         assert!(launch_elapsed >= Duration::from_millis(1500));
+        let _ = std::fs::remove_file(&started_marker);
 
         client.close().await.expect("Failed to close client");
         server_task.await.expect("Server task panicked");
@@ -1670,24 +1667,16 @@ fn test_argument_boundaries() {
 
     #[cfg(target_os = "windows")]
     {
-        let helper_args = vec![
-            "launch_process_test_helper",
-            "--ignored",
-            "arg1",
-            "arg 2",
-            "arg\"3",
-        ];
-        req.arguments = escape_windows_args(&helper_args);
+        let helper_args = vec!["arg1", "arg 2", "arg\"3"];
+        req.arguments = Some(escape_windows_args(&helper_args));
     }
     #[cfg(not(target_os = "windows"))]
     {
-        req.arguments = vec![
-            "launch_process_test_helper".to_string(),
-            "--ignored".to_string(),
+        req.arguments = Some(vec![
             "arg1".to_string(),
             "arg 2".to_string(),
             "arg\"3".to_string(),
-        ];
+        ]);
     }
 
     let res = rt.block_on(async { server.execute_launch_process(req).await });
@@ -1695,47 +1684,244 @@ fn test_argument_boundaries() {
     assert_eq!(res.stdout.unwrap().trim(), "arg1|arg 2|arg\"3");
 }
 
+#[derive(Clone, Copy)]
+enum FakeTryWait {
+    Exited,
+    Running,
+    Failed,
+}
+
+struct FakeChild {
+    kill_succeeds: bool,
+    wait_succeeds: bool,
+    try_wait: FakeTryWait,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+impl ChildOps for FakeChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.calls.lock().unwrap().push("kill");
+        if self.kill_succeeds {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("injected kill failure"))
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.calls.lock().unwrap().push("wait");
+        if self.wait_succeeds {
+            Ok(successful_exit_status())
+        } else {
+            Err(std::io::Error::other("injected wait failure"))
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.calls.lock().unwrap().push("try_wait");
+        match self.try_wait {
+            FakeTryWait::Exited => Ok(Some(successful_exit_status())),
+            FakeTryWait::Running => Ok(None),
+            FakeTryWait::Failed => Err(std::io::Error::other("injected status failure")),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn successful_exit_status() -> std::process::ExitStatus {
+    std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "exit /b 0"])
+        .status()
+        .unwrap()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn successful_exit_status() -> std::process::ExitStatus {
+    std::process::Command::new("sh")
+        .args(["-c", "true"])
+        .status()
+        .unwrap()
+}
+
+fn fake_child(
+    kill_succeeds: bool,
+    wait_succeeds: bool,
+    try_wait: FakeTryWait,
+) -> (
+    FakeChild,
+    std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+) {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    (
+        FakeChild {
+            kill_succeeds,
+            wait_succeeds,
+            try_wait,
+            calls: calls.clone(),
+        },
+        calls,
+    )
+}
+
 #[test]
-fn test_classify_cleanup_logic() {
-    // 1. Both failed
-    let (status, err, spawn_reaper) = classify_cleanup(false, false, "status failed", false);
-    assert_eq!(status, LaunchProcessStatus::WaitFailed);
-    assert!(err.contains("status failed"));
-    assert!(err.contains("Both termination and waiting failed; the process may still be running and may remain unreaped."));
-    assert!(spawn_reaper);
+fn test_cleanup_uses_non_blocking_reaper_after_kill_failure() {
+    let (child, calls) = fake_child(false, true, FakeTryWait::Running);
+    let reaper_calls = calls.clone();
+    let (status, error, _, _, _, outcome) = perform_cleanup(
+        child,
+        1,
+        "Process timed out",
+        true,
+        "unused-stdout",
+        "unused-stderr",
+        move |_child| {
+            reaper_calls.lock().unwrap().push("reaper");
+            Ok(())
+        },
+    );
 
-    // 2. Kill failed, wait succeeded
-    let (status, err, spawn_reaper) = classify_cleanup(false, true, "status failed", false);
-    assert_eq!(status, LaunchProcessStatus::WaitFailed);
-    assert!(err.contains("status failed"));
-    assert!(err.contains("Termination failed, but waiting succeeded; the process is not running but may have exited on its own."));
-    assert!(!spawn_reaper);
-
-    // 3. Kill succeeded, wait failed
-    let (status, err, spawn_reaper) = classify_cleanup(true, false, "status failed", false);
-    assert_eq!(status, LaunchProcessStatus::WaitFailed);
-    assert!(err.contains("status failed"));
-    assert!(err.contains("Termination succeeded, but waiting failed; the process is terminated but may remain unreaped."));
-    assert!(spawn_reaper);
-
-    // 4. Both succeeded (non-timeout)
-    let (status, err, spawn_reaper) = classify_cleanup(true, true, "status failed", false);
-    assert_eq!(status, LaunchProcessStatus::WaitFailed);
-    assert!(err.contains("status failed"));
-    assert!(err.contains("The process was successfully terminated and reaped; it is not running."));
-    assert!(!spawn_reaper);
-
-    // 5. Both succeeded (timeout stop)
-    let (status, err, spawn_reaper) = classify_cleanup(true, true, "timed out", true);
-    assert_eq!(status, LaunchProcessStatus::TimedOutStopped);
-    assert!(err.contains("timed out"));
-    assert!(!spawn_reaper);
-
-    // 6. Kill failed (timeout stop)
-    let (status, err, spawn_reaper) = classify_cleanup(false, true, "timed out", true);
     assert_eq!(status, LaunchProcessStatus::StopFailed);
-    assert!(err.contains("timed out"));
-    assert!(!spawn_reaper);
+    assert_eq!(
+        outcome,
+        CleanupOutcome::KillFailedChildRunning {
+            reaper_started: true
+        }
+    );
+    assert_eq!(*calls.lock().unwrap(), ["kill", "try_wait", "reaper"]);
+    let error = error.unwrap();
+    assert!(error.contains("injected kill failure"));
+    assert!(error.contains("may still be running"));
+}
+
+#[test]
+fn test_cleanup_kill_failure_with_exited_child_is_reaped() {
+    let (child, calls) = fake_child(false, true, FakeTryWait::Exited);
+    let (status, error, exit_code, _, _, outcome) = perform_cleanup(
+        child,
+        1,
+        "Status check failed",
+        false,
+        "unused-stdout",
+        "unused-stderr",
+        |_child| panic!("reaper should not start for an exited child"),
+    );
+
+    assert_eq!(status, LaunchProcessStatus::WaitFailed);
+    assert_eq!(outcome, CleanupOutcome::KillFailedChildExited);
+    assert_eq!(exit_code, None);
+    assert_eq!(*calls.lock().unwrap(), ["kill", "try_wait"]);
+    let error = error.unwrap();
+    assert!(error.contains("successfully reaped"));
+    assert!(!error.contains("may still be running"));
+}
+
+#[test]
+fn test_cleanup_success_returns_timeout_output() {
+    let stdout_path = generate_temp_test_path("cleanup_stdout");
+    let stderr_path = generate_temp_test_path("cleanup_stderr");
+    std::fs::write(&stdout_path, "final stdout").unwrap();
+    std::fs::write(&stderr_path, "final stderr").unwrap();
+    let (child, calls) = fake_child(true, true, FakeTryWait::Running);
+
+    let (status, error, exit_code, stdout, stderr, outcome) = perform_cleanup(
+        child,
+        1,
+        "Process timed out",
+        true,
+        stdout_path.to_str().unwrap(),
+        stderr_path.to_str().unwrap(),
+        |_child| panic!("reaper should not start after successful cleanup"),
+    );
+
+    assert_eq!(status, LaunchProcessStatus::TimedOutStopped);
+    assert_eq!(outcome, CleanupOutcome::KillSucceeded);
+    assert_eq!(exit_code, Some(0));
+    assert_eq!(stdout.as_deref(), Some("final stdout"));
+    assert_eq!(stderr.as_deref(), Some("final stderr"));
+    assert!(error.is_none());
+    assert_eq!(*calls.lock().unwrap(), ["kill", "wait"]);
+    let _ = std::fs::remove_file(stdout_path);
+    let _ = std::fs::remove_file(stderr_path);
+}
+
+#[test]
+fn test_cleanup_wait_failure_starts_reaper() {
+    let (child, calls) = fake_child(true, false, FakeTryWait::Running);
+    let reaper_calls = calls.clone();
+    let (status, error, _, _, _, outcome) = perform_cleanup(
+        child,
+        1,
+        "Status check failed",
+        false,
+        "unused-stdout",
+        "unused-stderr",
+        move |_child| {
+            reaper_calls.lock().unwrap().push("reaper");
+            Ok(())
+        },
+    );
+
+    assert_eq!(status, LaunchProcessStatus::WaitFailed);
+    assert_eq!(outcome, CleanupOutcome::WaitFailedReaperStarted);
+    assert_eq!(*calls.lock().unwrap(), ["kill", "wait", "reaper"]);
+    assert!(error.unwrap().contains("injected wait failure"));
+}
+
+#[test]
+fn test_cleanup_reaper_start_failure_is_cautious() {
+    let (child, calls) = fake_child(false, true, FakeTryWait::Running);
+    let (status, error, _, _, _, outcome) = perform_cleanup(
+        child,
+        1,
+        "Process timed out",
+        true,
+        "unused-stdout",
+        "unused-stderr",
+        |_child| Err(std::io::Error::other("injected reaper failure")),
+    );
+
+    assert_eq!(status, LaunchProcessStatus::StopFailed);
+    assert_eq!(
+        outcome,
+        CleanupOutcome::KillFailedChildRunning {
+            reaper_started: false
+        }
+    );
+    assert_eq!(*calls.lock().unwrap(), ["kill", "try_wait"]);
+    let error = error.unwrap();
+    assert!(error.contains("injected reaper failure"));
+    assert!(error.contains("may still be running"));
+    assert!(error.contains("may remain unreaped"));
+}
+
+#[test]
+fn test_cleanup_unknown_status_starts_reaper_without_waiting() {
+    let (child, calls) = fake_child(false, true, FakeTryWait::Failed);
+    let reaper_calls = calls.clone();
+    let (status, error, _, _, _, outcome) = perform_cleanup(
+        child,
+        1,
+        "Status check failed",
+        false,
+        "unused-stdout",
+        "unused-stderr",
+        move |_child| {
+            reaper_calls.lock().unwrap().push("reaper");
+            Ok(())
+        },
+    );
+
+    assert_eq!(status, LaunchProcessStatus::WaitFailed);
+    assert_eq!(
+        outcome,
+        CleanupOutcome::KillFailedStatusUnknown {
+            reaper_started: true
+        }
+    );
+    assert_eq!(*calls.lock().unwrap(), ["kill", "try_wait", "reaper"]);
+    let error = error.unwrap();
+    assert!(error.contains("injected status failure"));
+    assert!(error.contains("may still be running"));
 }
 
 #[test]
