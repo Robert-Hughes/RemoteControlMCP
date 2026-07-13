@@ -30,6 +30,7 @@ struct RequestEntry {
     status_text: String,
     detail_text: Option<String>,
     pid: Option<u32>,
+    background_failure: bool,
 }
 
 impl RequestEntry {
@@ -215,17 +216,35 @@ fn apply_request_event(requests: &mut Vec<RequestEntry>, event: UiEvent) {
             status_text: "In progress".to_string(),
             detail_text: None,
             pid: None,
+            background_failure: false,
         }),
         UiEventKind::RequestUpdated { id, update } => {
             if let Some(request) = requests.iter_mut().rev().find(|request| request.id == id) {
-                if request.finished_duration.is_none() {
+                let is_primary_terminal = matches!(
+                    &update,
+                    RequestUpdate::PingCompleted
+                        | RequestUpdate::LaunchProcessResponded { .. }
+                        | RequestUpdate::ReadFileResponded { .. }
+                        | RequestUpdate::Rejected { .. }
+                        | RequestUpdate::InternalFailure { .. }
+                );
+                let is_background_failure =
+                    matches!(&update, RequestUpdate::LaunchProcessBackgroundError { .. });
+                if is_primary_terminal && request.finished_duration.is_none() {
                     request.finished_duration =
                         Some(event.elapsed.saturating_sub(request.started_elapsed));
                 }
+
                 let presentation = presentation_for_update(update);
-                request.state = presentation.state;
-                request.status_text = presentation.status_text;
-                request.detail_text = presentation.detail_text;
+                if is_background_failure {
+                    request.background_failure = true;
+                }
+
+                if is_background_failure || !request.background_failure {
+                    request.state = presentation.state;
+                    request.status_text = presentation.status_text;
+                    request.detail_text = presentation.detail_text;
+                }
                 if presentation.pid.is_some() {
                     request.pid = presentation.pid;
                 }
@@ -517,6 +536,75 @@ mod tests {
     }
 
     #[test]
+    fn background_failure_before_launch_response_is_sticky() {
+        let mut requests = Vec::new();
+        apply_request_event(
+            &mut requests,
+            UiEvent {
+                elapsed: Duration::from_secs(2),
+                kind: UiEventKind::RequestStarted {
+                    id: RequestId(1),
+                    request: RequestData::LaunchProcess {
+                        process_name: "test.exe".to_string(),
+                    },
+                    started_at: Local::now(),
+                },
+            },
+        );
+        apply_request_event(
+            &mut requests,
+            updated_event(
+                1,
+                Duration::from_secs(3),
+                RequestUpdate::LaunchProcessBackgroundError {
+                    pid: 42,
+                    error: "injected wait failure".to_string(),
+                },
+            ),
+        );
+
+        assert_eq!(requests[0].state, RequestState::Failed);
+        assert_eq!(
+            requests[0].status_text,
+            "Background process handling failed"
+        );
+        assert_eq!(
+            requests[0].detail_text.as_deref(),
+            Some("injected wait failure")
+        );
+        assert!(requests[0].finished_duration.is_none());
+
+        apply_request_event(
+            &mut requests,
+            updated_event(
+                1,
+                Duration::from_secs(7),
+                RequestUpdate::LaunchProcessResponded {
+                    status: LaunchProcessStatus::Detached,
+                    error: None,
+                    pid: Some(42),
+                    exit_code: None,
+                },
+            ),
+        );
+
+        assert_eq!(requests[0].state, RequestState::Failed);
+        assert_eq!(
+            requests[0].status_text,
+            "Background process handling failed"
+        );
+        assert_eq!(
+            requests[0].detail_text.as_deref(),
+            Some("injected wait failure")
+        );
+        assert_eq!(requests[0].pid, Some(42));
+        assert_eq!(
+            requests[0].duration(Duration::from_secs(20)),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
     fn in_progress_duration_uses_current_monotonic_elapsed_time() {
         let mut requests = Vec::new();
         apply_request_event(&mut requests, started_event(1, Duration::from_secs(2)));
@@ -674,6 +762,7 @@ mod tests {
             status_text: "In progress".to_string(),
             detail_text: None,
             pid: Some(42),
+            background_failure: false,
         };
         assert_eq!(request_summary(&launch), "safe.exe · PID 42");
         for sensitive in ["secret argument", "SECRET_ENV", "stdout", "stderr"] {
