@@ -1377,7 +1377,47 @@ fn launch_process_output_schema_remains_complete() {
             "missing output field {field}"
         );
     }
+
+    let pid_schema = resolve_local_schema_ref(&schema, &properties["pid"]);
+    assert!(pid_schema.get("format").is_none());
+    let pid_integer_schema = pid_schema
+        .get("anyOf")
+        .and_then(|value| value.as_array())
+        .and_then(|schemas| schemas.iter().find(|schema| schema["type"] == "integer"))
+        .unwrap_or(pid_schema);
+    let pid_types = pid_schema
+        .get("type")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    assert!(
+        pid_integer_schema["type"] == "integer"
+            || pid_types
+                .iter()
+                .any(|value| value.as_str() == Some("integer"))
+    );
+    assert!(
+        pid_schema["type"] == "null"
+            || pid_types.iter().any(|value| value.as_str() == Some("null"))
+            || pid_schema
+                .get("anyOf")
+                .and_then(|value| value.as_array())
+                .is_some_and(|schemas| schemas.iter().any(|schema| schema["type"] == "null"))
+    );
+    assert_eq!(pid_integer_schema["minimum"], 0);
+    assert_eq!(
+        pid_integer_schema["maximum"],
+        rmcp::serde_json::json!(u32::MAX)
+    );
+
     let encoded = schema.to_string();
+    assert!(!encoded.contains("\"format\":\"uint32\""));
+    assert!(
+        !root["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|field| field == "pid"))
+    );
     for status in [
         "completed",
         "detached",
@@ -2259,13 +2299,13 @@ fn test_gui_events_launch_process() {
     assert_eq!(events.len(), 2);
     let UiEventKind::RequestStarted {
         id,
-        request: RequestData::LaunchProcess { ref process_name },
+        request: RequestData::LaunchProcess { ref command_line },
         ..
     } = events[0]
     else {
         panic!("expected launch_process request start");
     };
-    assert_eq!(process_name, &make_helper_request().process_name);
+    assert_eq!(command_line, &make_helper_request().process_name);
     assert!(matches!(
         events[1],
         UiEventKind::RequestUpdated {
@@ -2321,7 +2361,7 @@ fn test_gui_events_launch_process() {
 }
 
 #[test]
-fn launch_process_events_exclude_arguments_environment_and_output() {
+fn launch_process_events_include_command_line_but_exclude_environment_and_output() {
     let (tx, rx) = std::sync::mpsc::channel();
     let server = McpServer::new(tx, Instant::now());
     let mut variables = std::collections::HashMap::new();
@@ -2354,9 +2394,8 @@ fn launch_process_events_exclude_arguments_environment_and_output() {
     let events = rx.try_iter().map(|event| event.kind).collect::<Vec<_>>();
     assert_eq!(events.len(), 2);
     let debug = format!("{events:?}");
-    assert!(debug.contains("safe-process-name"));
+    assert!(debug.contains("safe-process-name secret argument"));
     for sensitive in [
-        "secret argument",
         "SECRET_ENV_NAME",
         "secret value",
         "private stdout",

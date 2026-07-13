@@ -29,6 +29,7 @@ pub enum LaunchProcessStatus {
 pub struct LaunchProcessResult {
     pub status: LaunchProcessStatus,
     pub error: Option<String>,
+    #[schemars(with = "Option<ProcessIdSchema>")]
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub stdout: Option<String>,
@@ -60,6 +61,26 @@ fn nullable_positive_integer_schema(_: &mut schemars::SchemaGenerator) -> schema
             { "type": "null" }
         ]
     })
+}
+
+struct ProcessIdSchema;
+
+impl JsonSchema for ProcessIdSchema {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ProcessId".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4_294_967_295_u64
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -149,7 +170,7 @@ impl RequestId {
 pub enum RequestData {
     Ping,
     LaunchProcess {
-        process_name: String,
+        command_line: String,
     },
     ReadFile {
         path: String,

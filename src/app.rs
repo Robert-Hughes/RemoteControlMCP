@@ -9,6 +9,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 const MAX_REQUESTS: usize = 500;
+const MAX_COMMAND_LINE_CHARACTERS: usize = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestState {
@@ -287,15 +288,36 @@ fn request_tool_name(request: &RequestData) -> &'static str {
 fn request_summary(request: &RequestEntry) -> String {
     match &request.request {
         RequestData::Ping => "Server health check".to_string(),
-        RequestData::LaunchProcess { process_name } => request.pid.map_or_else(
-            || process_name.clone(),
-            |pid| format!("{process_name} · PID {pid}"),
-        ),
+        RequestData::LaunchProcess { command_line } => {
+            let command_line = truncate_with_ellipsis(command_line, MAX_COMMAND_LINE_CHARACTERS);
+            request.pid.map_or(command_line.clone(), |pid| {
+                format!("{command_line} · PID {pid}")
+            })
+        }
         RequestData::ReadFile {
             path,
             start_line,
             end_line,
         } => format!("{path} · requested lines {start_line}–{end_line}"),
+    }
+}
+
+fn truncate_with_ellipsis(text: &str, maximum_characters: usize) -> String {
+    let character_count = text.chars().count();
+    if character_count <= maximum_characters {
+        return text.to_string();
+    }
+
+    text.chars()
+        .take(maximum_characters.saturating_sub(1))
+        .chain((maximum_characters != 0).then_some('…'))
+        .collect()
+}
+
+fn request_summary_tooltip(request: &RequestEntry) -> Option<&str> {
+    match &request.request {
+        RequestData::LaunchProcess { command_line } => Some(command_line),
+        RequestData::Ping | RequestData::ReadFile { .. } => None,
     }
 }
 
@@ -353,7 +375,10 @@ fn render_request_row(ui: &mut egui::Ui, request: &RequestEntry, current_elapsed
                         ui.colored_label(state_colour(ui, request.state), &request.status_text);
                     });
                 });
-                ui.label(request_summary(request));
+                let summary = ui.label(request_summary(request));
+                if let Some(command_line) = request_summary_tooltip(request) {
+                    summary.on_hover_text(command_line);
+                }
                 ui.weak(format!(
                     "Started {} · Duration {}",
                     format_start_time(&request.started_at),
@@ -545,7 +570,7 @@ mod tests {
                 kind: UiEventKind::RequestStarted {
                     id: RequestId(1),
                     request: RequestData::LaunchProcess {
-                        process_name: "test.exe".to_string(),
+                        command_line: "test.exe --background".to_string(),
                     },
                     started_at: Local::now(),
                 },
@@ -749,11 +774,11 @@ mod tests {
     }
 
     #[test]
-    fn request_summaries_exclude_sensitive_tool_data() {
+    fn launch_process_summary_includes_arguments_and_has_full_tooltip() {
         let launch = RequestEntry {
             id: RequestId(1),
             request: RequestData::LaunchProcess {
-                process_name: "safe.exe".to_string(),
+                command_line: "safe.exe visible argument".to_string(),
             },
             started_at: Local::now(),
             started_elapsed: Duration::ZERO,
@@ -764,10 +789,23 @@ mod tests {
             pid: Some(42),
             background_failure: false,
         };
-        assert_eq!(request_summary(&launch), "safe.exe · PID 42");
-        for sensitive in ["secret argument", "SECRET_ENV", "stdout", "stderr"] {
-            assert!(!request_summary(&launch).contains(sensitive));
-        }
+        assert_eq!(
+            request_summary(&launch),
+            "safe.exe visible argument · PID 42"
+        );
+        assert_eq!(
+            request_summary_tooltip(&launch),
+            Some("safe.exe visible argument")
+        );
+    }
+
+    #[test]
+    fn command_line_truncation_is_bounded_and_unicode_safe() {
+        assert_eq!(truncate_with_ellipsis("abcdef", 6), "abcdef");
+        assert_eq!(truncate_with_ellipsis("abcdef", 5), "abcd…");
+        assert_eq!(truncate_with_ellipsis("åßçdé", 4), "åßç…");
+        assert_eq!(truncate_with_ellipsis("abcdef", 1), "…");
+        assert_eq!(truncate_with_ellipsis("abcdef", 0), "");
     }
 
     #[test]

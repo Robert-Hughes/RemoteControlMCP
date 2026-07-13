@@ -179,6 +179,34 @@ pub(crate) fn validate_request(req: &LaunchProcessRequest) -> Result<(), String>
     Ok(())
 }
 
+fn command_line_for_display(req: &LaunchProcessRequest) -> String {
+    let mut command_line = req.process_name.clone();
+
+    #[cfg(target_os = "windows")]
+    if let Some(arguments) = req
+        .arguments
+        .as_deref()
+        .filter(|arguments| !arguments.is_empty())
+    {
+        command_line.push(' ');
+        command_line.push_str(arguments);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    if let Some(arguments) = req
+        .arguments
+        .as_deref()
+        .filter(|arguments| !arguments.is_empty())
+    {
+        for argument in arguments {
+            command_line.push(' ');
+            command_line.push_str(argument);
+        }
+    }
+
+    command_line
+}
+
 #[cfg(test)]
 pub use crate::mcp::test_hooks;
 
@@ -585,7 +613,7 @@ impl McpServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let req = params.0;
         let id = self.start_request(RequestData::LaunchProcess {
-            process_name: req.process_name.clone(),
+            command_line: command_line_for_display(&req),
         });
 
         if let Err(err_msg) = validate_request(&req) {

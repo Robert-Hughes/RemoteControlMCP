@@ -1,5 +1,3 @@
-- Inspector reports the pre-existing uint32 warning for launch_process.pid
-- for launch_process, show (at least part) of the command line
 - write_file tool
   - consistent semantics to read_file
   - can replace regions of lines between given range (doesn't need to maintain the number of lines)
