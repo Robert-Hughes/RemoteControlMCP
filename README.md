@@ -37,14 +37,16 @@ Standard output (`stdout`) is strictly reserved for MCP protocol messages.
 
 ## Exposed Tools
 
-The application exposes three tools:
+The application exposes four tools:
 1. `ping`
 2. `launch_process`
 3. `read_file`
+4. `write_file`
 
 > [!WARNING]
 > The `launch_process` tool provides unrestricted local process execution under the user account running the MCP server. There is no security allowlist.
 > The `read_file` tool likewise has unrestricted read access to regular files that account can access; its relative-path base is a convenience, not a security boundary.
+> The `write_file` tool has unrestricted write access to regular files that account can modify and can explicitly create files.
 
 ---
 
@@ -160,6 +162,44 @@ Valid requests return ordinary non-error MCP tool results even for structured fi
 
 ---
 
+### 4. `write_file`
+
+Replace a strict, 1-based inclusive line range in a local regular file. The replacement may contain fewer lines, more lines, or no lines. An empty `text` therefore deletes the selected range.
+
+#### Parameters and paths
+
+* **`path`** (string, required): Uses the same absolute, relative, UNC, literal-path, and ambiguous-Windows-path rules as `read_file`.
+* **`start_line`** / **`end_line`** (positive integers, required): Inclusive range containing at most 500 lines.
+* **`text`** (string, required): UTF-8 replacement text, limited to 256 KiB when encoded.
+* **`create_if_missing`** (boolean, required): Missing files are created only when this is `true` and the requested range is exactly `1-1`.
+
+For an existing non-empty file, every requested line must exist. A range extending beyond EOF returns `range_out_of_bounds` and leaves the original unchanged. An empty existing file has one virtual editable line, so range `1-1` can populate it.
+
+Creation never creates parent directories. A missing parent returns `parent_not_found`; a parent path that is not a directory returns `parent_not_a_directory`. A missing file with `create_if_missing = false` returns `not_found`.
+
+The server follows filesystem symlinks or Windows reparse points for existing files and replaces the resolved target while retaining the link. Only regular files are accepted.
+
+#### Text and replacement behaviour
+
+Untouched file bytes are copied exactly, including invalid UTF-8, a leading UTF-8 BOM, blank lines, mixed line endings, and final-newline state. Replacement `text` is written as supplied. When unselected lines follow and non-empty replacement text does not end in LF, the selected range's original LF or CRLF terminator is inserted before the suffix. When the selected range reaches EOF, the replacement controls the final newline exactly.
+
+Filesystem work runs through `spawn_blocking`. Existing files are rewritten to a unique staging file in the resolved target directory and committed only after the full staged write succeeds. On Windows the final replacement uses `ReplaceFileW`; other platforms use same-filesystem rename. Missing-file creation uses create-new commit semantics so a concurrently appearing target is not silently overwritten. Temporary staging files are removed on failure where possible.
+
+#### Result shape
+
+`content` contains exactly one concise human-readable summary and never contains the replacement text. `structuredContent` contains:
+
+* **`status`**: `completed`, `created`, `not_found`, `parent_not_found`, `parent_not_a_directory`, `access_denied`, `not_a_file`, `range_out_of_bounds`, `read_failed`, `write_failed`, or `replace_failed`.
+* **`error`**: Optional filesystem or operating-system detail.
+* **`path`**: Resolved absolute request path.
+* **`requested_start_line`** / **`requested_end_line`**: Original validated range.
+* **`replaced_line_count`**: Number of existing lines replaced, or `null` for creation and failures.
+* **`inserted_bytes`**: UTF-8 byte length inserted on success; zero for failed results.
+
+Valid requests return ordinary non-error MCP tool results even for structured filesystem failures. Invalid paths, ranges, or oversized replacement text return MCP invalid-parameter errors.
+
+---
+
 ## Building
 
 To build the application, run:
@@ -192,6 +232,7 @@ The suite covers:
 * Bounded timeout behaviours (`stop` and `detach`).
 * Cleanup, best-effort reaping, and classification policies.
 * Incremental `read_file` line selection, path handling, encoding, complete-line limits, continuation, response schemas, and GUI events.
+* Strict staged `write_file` replacement, explicit creation, line-ending preservation, failure atomicity, schemas, privacy, GUI events, and runtime responsiveness.
 * A real MCP initialisation and tool-call sequence over an in-memory duplex connection.
 * Concurrency checks verifying that long-running process and file operations do not block other requests like `ping`.
 
@@ -209,7 +250,7 @@ When you run this command:
 1. The Inspector web UI launches.
 2. The `Remote Control MCP` GUI window appears.
 3. The Inspector connects to the application over stdio.
-4. The Inspector UI shows the `ping`, `launch_process`, and `read_file` tools.
+4. The Inspector UI shows the `ping`, `launch_process`, `read_file`, and `write_file` tools.
 5. You can invoke any tool and inspect outputs.
 
 ### CLI Mode
@@ -236,6 +277,11 @@ This no-argument example is suitable for a typical Windows installation; executa
 **Call the `read_file` tool:**
 ```powershell
 npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.exe --method tools/call --tool-name read_file --tool-arg path=RemoteControlMCP\example.stdout.log --tool-arg start_line=1 --tool-arg end_line=100
+```
+
+**Call the `write_file` tool:**
+```powershell
+npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.exe --method tools/call --tool-name write_file --tool-arg path=RemoteControlMCP\example.txt --tool-arg start_line=1 --tool-arg end_line=1 --tool-arg text=updated --tool-arg create_if_missing=true
 ```
 
 ## Connect to ChatGPT

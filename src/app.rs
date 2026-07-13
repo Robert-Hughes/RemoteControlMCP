@@ -1,6 +1,6 @@
 use crate::mcp::{
     LaunchProcessStatus, ReadFileStatus, RequestData, RequestId, RequestUpdate, UiEvent,
-    UiEventKind,
+    UiEventKind, WriteFileStatus,
 };
 use chrono::{DateTime, Local, TimeZone};
 use eframe::egui;
@@ -139,6 +139,60 @@ fn read_file_presentation(
     }
 }
 
+fn write_file_presentation(
+    status: WriteFileStatus,
+    error: Option<String>,
+    replaced_line_count: Option<u64>,
+    inserted_bytes: u64,
+) -> RequestPresentation {
+    let (state, status_text) = match status {
+        WriteFileStatus::Completed if inserted_bytes == 0 => (
+            RequestState::Completed,
+            replaced_line_count.map_or_else(
+                || "Completed \u{00b7} lines deleted".to_string(),
+                |count| format!("Completed \u{00b7} deleted {count} lines"),
+            ),
+        ),
+        WriteFileStatus::Completed => (
+            RequestState::Completed,
+            replaced_line_count.map_or_else(
+                || "Completed \u{00b7} lines replaced".to_string(),
+                |count| format!("Completed \u{00b7} replaced {count} lines"),
+            ),
+        ),
+        WriteFileStatus::Created => (
+            RequestState::Completed,
+            format!("Created \u{00b7} {inserted_bytes} bytes"),
+        ),
+        WriteFileStatus::NotFound => (RequestState::Failed, "File not found".to_string()),
+        WriteFileStatus::ParentNotFound => (
+            RequestState::Failed,
+            "Parent directory not found".to_string(),
+        ),
+        WriteFileStatus::ParentNotADirectory => (
+            RequestState::Failed,
+            "Parent is not a directory".to_string(),
+        ),
+        WriteFileStatus::AccessDenied => (RequestState::Failed, "Access denied".to_string()),
+        WriteFileStatus::NotAFile => (RequestState::Failed, "Not a regular file".to_string()),
+        WriteFileStatus::RangeOutOfBounds => {
+            (RequestState::Failed, "Line range out of bounds".to_string())
+        }
+        WriteFileStatus::ReadFailed => (RequestState::Failed, "Read failed".to_string()),
+        WriteFileStatus::WriteFailed => (RequestState::Failed, "Write failed".to_string()),
+        WriteFileStatus::ReplaceFailed => (
+            RequestState::Failed,
+            "Replacement commit failed".to_string(),
+        ),
+    };
+    RequestPresentation {
+        state,
+        status_text,
+        detail_text: (state == RequestState::Failed).then_some(error).flatten(),
+        pid: None,
+    }
+}
+
 fn presentation_for_update(update: RequestUpdate) -> RequestPresentation {
     match update {
         RequestUpdate::PingCompleted => RequestPresentation {
@@ -168,6 +222,12 @@ fn presentation_for_update(update: RequestUpdate) -> RequestPresentation {
             next_start_line,
             eof,
         ),
+        RequestUpdate::WriteFileResponded {
+            status,
+            error,
+            replaced_line_count,
+            inserted_bytes,
+        } => write_file_presentation(status, error, replaced_line_count, inserted_bytes),
         RequestUpdate::Rejected { error } => RequestPresentation {
             state: RequestState::Rejected,
             status_text: "Invalid parameters".to_string(),
@@ -226,6 +286,7 @@ fn apply_request_event(requests: &mut Vec<RequestEntry>, event: UiEvent) {
                     RequestUpdate::PingCompleted
                         | RequestUpdate::LaunchProcessResponded { .. }
                         | RequestUpdate::ReadFileResponded { .. }
+                        | RequestUpdate::WriteFileResponded { .. }
                         | RequestUpdate::Rejected { .. }
                         | RequestUpdate::InternalFailure { .. }
                 );
@@ -282,6 +343,7 @@ fn request_tool_name(request: &RequestData) -> &'static str {
         RequestData::Ping => "ping",
         RequestData::LaunchProcess { .. } => "launch_process",
         RequestData::ReadFile { .. } => "read_file",
+        RequestData::WriteFile { .. } => "write_file",
     }
 }
 
@@ -299,6 +361,22 @@ fn request_summary(request: &RequestEntry) -> String {
             start_line,
             end_line,
         } => format!("{path} · requested lines {start_line}–{end_line}"),
+        RequestData::WriteFile {
+            path,
+            start_line,
+            end_line,
+            replacement_bytes,
+            create_if_missing,
+        } => {
+            let create_suffix = if *create_if_missing {
+                " \u{00b7} create if missing"
+            } else {
+                ""
+            };
+            format!(
+                "{path} \u{00b7} requested lines {start_line}\u{2013}{end_line} \u{00b7} {replacement_bytes}-byte replacement{create_suffix}"
+            )
+        }
     }
 }
 
@@ -317,7 +395,7 @@ fn truncate_with_ellipsis(text: &str, maximum_characters: usize) -> String {
 fn request_summary_tooltip(request: &RequestEntry) -> Option<&str> {
     match &request.request {
         RequestData::LaunchProcess { command_line } => Some(command_line),
-        RequestData::Ping | RequestData::ReadFile { .. } => None,
+        RequestData::Ping | RequestData::ReadFile { .. } | RequestData::WriteFile { .. } => None,
     }
 }
 
@@ -806,6 +884,78 @@ mod tests {
         assert_eq!(truncate_with_ellipsis("åßçdé", 4), "åßç…");
         assert_eq!(truncate_with_ellipsis("abcdef", 1), "…");
         assert_eq!(truncate_with_ellipsis("abcdef", 0), "");
+    }
+
+    #[test]
+    fn write_file_statuses_summaries_and_terminal_updates_are_privacy_safe() {
+        for status in [WriteFileStatus::Completed, WriteFileStatus::Created] {
+            assert_eq!(
+                write_file_presentation(status, None, Some(2), 12).state,
+                RequestState::Completed
+            );
+        }
+        for status in [
+            WriteFileStatus::NotFound,
+            WriteFileStatus::ParentNotFound,
+            WriteFileStatus::ParentNotADirectory,
+            WriteFileStatus::AccessDenied,
+            WriteFileStatus::NotAFile,
+            WriteFileStatus::RangeOutOfBounds,
+            WriteFileStatus::ReadFailed,
+            WriteFileStatus::WriteFailed,
+            WriteFileStatus::ReplaceFailed,
+        ] {
+            assert_eq!(
+                write_file_presentation(status, Some("safe detail".to_string()), None, 0).state,
+                RequestState::Failed
+            );
+        }
+
+        let request_data = RequestData::WriteFile {
+            path: "C:\\safe\\file.txt".to_string(),
+            start_line: 4,
+            end_line: 6,
+            replacement_bytes: 123,
+            create_if_missing: true,
+        };
+        let mut requests = Vec::new();
+        apply_request_event(
+            &mut requests,
+            UiEvent {
+                elapsed: Duration::from_secs(2),
+                kind: UiEventKind::RequestStarted {
+                    id: RequestId(77),
+                    request: request_data,
+                    started_at: Local::now(),
+                },
+            },
+        );
+        assert_eq!(request_tool_name(&requests[0].request), "write_file");
+        let summary = request_summary(&requests[0]);
+        assert!(summary.contains("C:\\safe\\file.txt"));
+        assert!(summary.contains("123-byte replacement"));
+        assert!(summary.contains("create if missing"));
+
+        apply_request_event(
+            &mut requests,
+            updated_event(
+                77,
+                Duration::from_secs(5),
+                RequestUpdate::WriteFileResponded {
+                    status: WriteFileStatus::Completed,
+                    error: None,
+                    replaced_line_count: Some(3),
+                    inserted_bytes: 123,
+                },
+            ),
+        );
+        assert_eq!(requests[0].state, RequestState::Completed);
+        assert_eq!(
+            requests[0].duration(Duration::from_secs(20)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(requests[0].status_text, "Completed · replaced 3 lines");
+        assert!(!format!("{:?}", requests[0].request).contains("replacement body"));
     }
 
     #[test]

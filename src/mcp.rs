@@ -7,9 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
+mod file_path;
 mod launch_process;
 mod ping;
 mod read_file;
+mod write_file;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -50,6 +52,22 @@ pub enum ReadFileStatus {
     LineTooLong,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteFileStatus {
+    Completed,
+    Created,
+    NotFound,
+    ParentNotFound,
+    ParentNotADirectory,
+    AccessDenied,
+    NotAFile,
+    RangeOutOfBounds,
+    ReadFailed,
+    WriteFailed,
+    ReplaceFailed,
+}
+
 fn positive_integer_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({ "type": "integer", "minimum": 1 })
 }
@@ -58,6 +76,19 @@ fn nullable_positive_integer_schema(_: &mut schemars::SchemaGenerator) -> schema
     schemars::json_schema!({
         "anyOf": [
             { "type": "integer", "minimum": 1 },
+            { "type": "null" }
+        ]
+    })
+}
+
+fn nonnegative_integer_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": "integer", "minimum": 0 })
+}
+
+fn nullable_nonnegative_integer_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "anyOf": [
+            { "type": "integer", "minimum": 0 },
             { "type": "null" }
         ]
     })
@@ -110,6 +141,32 @@ pub struct ReadFileResult {
     #[schemars(schema_with = "nullable_positive_integer_schema")]
     pub next_start_line: Option<u64>,
     pub lossy_utf8: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WriteFileRequest {
+    pub path: String,
+    #[schemars(schema_with = "positive_integer_schema")]
+    pub start_line: u64,
+    #[schemars(schema_with = "positive_integer_schema")]
+    pub end_line: u64,
+    pub text: String,
+    pub create_if_missing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WriteFileResult {
+    pub status: WriteFileStatus,
+    pub error: Option<String>,
+    pub path: String,
+    #[schemars(schema_with = "positive_integer_schema")]
+    pub requested_start_line: u64,
+    #[schemars(schema_with = "positive_integer_schema")]
+    pub requested_end_line: u64,
+    #[schemars(schema_with = "nullable_nonnegative_integer_schema")]
+    pub replaced_line_count: Option<u64>,
+    #[schemars(schema_with = "nonnegative_integer_schema")]
+    pub inserted_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -177,6 +234,13 @@ pub enum RequestData {
         start_line: u64,
         end_line: u64,
     },
+    WriteFile {
+        path: String,
+        start_line: u64,
+        end_line: u64,
+        replacement_bytes: u64,
+        create_if_missing: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +259,12 @@ pub enum RequestUpdate {
         actual_end_line: Option<u64>,
         next_start_line: Option<u64>,
         eof: Option<bool>,
+    },
+    WriteFileResponded {
+        status: WriteFileStatus,
+        error: Option<String>,
+        replaced_line_count: Option<u64>,
+        inserted_bytes: u64,
     },
     Rejected {
         error: String,
@@ -387,6 +457,24 @@ impl McpServer {
         params: rmcp::handler::server::wrapper::Parameters<ReadFileRequest>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         self.read_file_impl(params).await
+    }
+
+    #[tool(
+        description = "Replace a strict 1-based inclusive line range in a local regular file, or explicitly create a missing file.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<WriteFileResult>()
+            .expect("WriteFileResult should generate a valid output schema"),
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn write_file(
+        &self,
+        params: rmcp::handler::server::wrapper::Parameters<WriteFileRequest>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        self.write_file_impl(params).await
     }
 }
 

@@ -7,10 +7,15 @@ use crate::mcp::read_file::{
     install_blocking_test_hook, open_regular_file_with_metadata, read_file_summary,
     validate_read_file_request,
 };
+use crate::mcp::write_file::{
+    install_blocking_test_hook as install_write_file_blocking_test_hook,
+    validate_write_file_request, write_file_summary,
+};
 use crate::mcp::{
     EnvironmentConfig, LaunchProcessRequest, LaunchProcessResult, LaunchProcessStatus, McpServer,
     ReadFileRequest, ReadFileResult, ReadFileStatus, RequestData, RequestId, RequestUpdate,
-    TimeoutAction, UiEventKind, build_mcp_runtime, run_mcp_server_loop, test_hooks,
+    TimeoutAction, UiEventKind, WriteFileRequest, WriteFileResult, WriteFileStatus,
+    build_mcp_runtime, run_mcp_server_loop, test_hooks,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -269,6 +274,51 @@ fn read_file_structured_result(result: &rmcp::model::CallToolResult) -> ReadFile
             .structured_content
             .clone()
             .expect("read_file should return structured content"),
+    )
+    .unwrap()
+}
+
+fn make_write_file_request(
+    path: &std::path::Path,
+    start_line: u64,
+    end_line: u64,
+    text: &str,
+    create_if_missing: bool,
+) -> WriteFileRequest {
+    WriteFileRequest {
+        path: path.to_string_lossy().into_owned(),
+        start_line,
+        end_line,
+        text: text.to_string(),
+        create_if_missing,
+    }
+}
+
+fn call_write_file_direct(
+    req: WriteFileRequest,
+) -> (rmcp::model::CallToolResult, Vec<UiEventKind>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let result = rt
+        .block_on(async {
+            server
+                .write_file(rmcp::handler::server::wrapper::Parameters(req))
+                .await
+        })
+        .unwrap();
+    let events = rx.try_iter().map(|event| event.kind).collect();
+    (result, events)
+}
+
+fn write_file_structured_result(result: &rmcp::model::CallToolResult) -> WriteFileResult {
+    rmcp::serde_json::from_value(
+        result
+            .structured_content
+            .clone()
+            .expect("write_file should return structured content"),
     )
     .unwrap()
 }
@@ -1018,6 +1068,173 @@ fn read_file_enforces_complete_line_byte_limit_and_continuation() {
 }
 
 #[test]
+fn write_file_returns_structured_result_and_privacy_safe_events() {
+    let path = write_temp_test_file("write_direct", b"one\ntwo\nthree\n");
+    let replacement = "private\nreplacement";
+    let (call, events) =
+        call_write_file_direct(make_write_file_request(&path, 2, 2, replacement, false));
+    let result = write_file_structured_result(&call);
+
+    assert_eq!(result.status, WriteFileStatus::Completed);
+    assert_eq!(result.replaced_line_count, Some(1));
+    assert_eq!(result.inserted_bytes, replacement.len() as u64);
+    assert_eq!(call.is_error, Some(false));
+    assert_eq!(only_text_content(&call), write_file_summary(&result));
+    assert!(!only_text_content(&call).contains(replacement));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"one\nprivate\nreplacement\nthree\n"
+    );
+
+    assert_eq!(events.len(), 2);
+    let UiEventKind::RequestStarted {
+        id,
+        request:
+            RequestData::WriteFile {
+                path: ref event_path,
+                start_line: 2,
+                end_line: 2,
+                replacement_bytes,
+                create_if_missing: false,
+            },
+        ..
+    } = events[0]
+    else {
+        panic!("expected write_file request start");
+    };
+    assert_eq!(event_path, &path.to_string_lossy().into_owned());
+    assert_eq!(replacement_bytes, replacement.len() as u64);
+    assert!(matches!(
+        events[1],
+        UiEventKind::RequestUpdated {
+            id: update_id,
+            update: RequestUpdate::WriteFileResponded {
+                status: WriteFileStatus::Completed,
+                replaced_line_count: Some(1),
+                inserted_bytes,
+                ..
+            },
+        } if update_id == id && inserted_bytes == replacement.len() as u64
+    ));
+    assert!(!format!("{events:?}").contains(replacement));
+
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn write_file_validation_rejection_has_one_privacy_safe_lifecycle() {
+    let path = generate_temp_test_path("write_rejected");
+    let replacement = "secret".repeat(50_000);
+    let req = make_write_file_request(&path, 1, 1, &replacement, true);
+    let validation_error = validate_write_file_request(&req).unwrap_err();
+    assert!(validation_error.contains("262144"));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let error = rt.block_on(async {
+        server
+            .write_file(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+    });
+    assert!(error.is_err());
+
+    let events = rx.try_iter().map(|event| event.kind).collect::<Vec<_>>();
+    assert_eq!(events.len(), 2);
+    let UiEventKind::RequestStarted {
+        id,
+        request: RequestData::WriteFile {
+            replacement_bytes, ..
+        },
+        ..
+    } = events[0]
+    else {
+        panic!("expected rejected write_file to start");
+    };
+    assert_eq!(replacement_bytes, replacement.len() as u64);
+    assert!(matches!(
+        events[1],
+        UiEventKind::RequestUpdated {
+            id: update_id,
+            update: RequestUpdate::Rejected { .. },
+        } if update_id == id
+    ));
+    assert!(!format!("{events:?}").contains("secretsecret"));
+}
+
+#[test]
+fn write_file_metadata_and_schemas_are_explicit() {
+    let attr = McpServer::write_file_tool_attr();
+    assert_eq!(attr.name, "write_file");
+
+    let annotations = attr.annotations.as_ref().expect("write_file annotations");
+    assert_eq!(annotations.read_only_hint, Some(false));
+    assert_eq!(annotations.destructive_hint, Some(true));
+    assert_eq!(annotations.idempotent_hint, Some(false));
+    assert_eq!(annotations.open_world_hint, Some(false));
+
+    let required = attr.input_schema["required"].as_array().unwrap();
+    for field in [
+        "path",
+        "start_line",
+        "end_line",
+        "text",
+        "create_if_missing",
+    ] {
+        assert!(required.iter().any(|value| value == field));
+    }
+    let input_properties = attr.input_schema["properties"].as_object().unwrap();
+    for field in ["start_line", "end_line"] {
+        assert_eq!(input_properties[field]["type"], "integer");
+        assert_eq!(input_properties[field]["minimum"], 1);
+        assert!(input_properties[field].get("format").is_none());
+    }
+
+    let output_schema = attr
+        .output_schema
+        .as_ref()
+        .expect("write_file output schema should be present");
+    let output_schema = rmcp::serde_json::Value::Object((**output_schema).clone());
+    let root = resolve_local_schema_ref(&output_schema, &output_schema);
+    let properties = root["properties"].as_object().unwrap();
+    for field in [
+        "status",
+        "error",
+        "path",
+        "requested_start_line",
+        "requested_end_line",
+        "replaced_line_count",
+        "inserted_bytes",
+    ] {
+        assert!(
+            properties.contains_key(field),
+            "missing output field {field}"
+        );
+    }
+
+    let encoded = output_schema.to_string();
+    for status in [
+        "completed",
+        "created",
+        "not_found",
+        "parent_not_found",
+        "parent_not_a_directory",
+        "access_denied",
+        "not_a_file",
+        "range_out_of_bounds",
+        "read_failed",
+        "write_failed",
+        "replace_failed",
+    ] {
+        assert!(encoded.contains(status), "missing status {status}");
+    }
+    assert!(!encoded.contains("\"format\":\"uint64\""));
+    assert!(!encoded.contains("\"default\":null"));
+}
+
+#[test]
 fn ping_metadata_is_read_only_and_idempotent() {
     let attr = McpServer::ping_tool_attr();
     assert_eq!(attr.name, "ping");
@@ -1091,7 +1308,7 @@ fn ping_works_over_mcp_duplex_transport() {
 
         // 1. Tool discovery through tools/list
         let tools = client.list_all_tools().await.expect("Failed to list tools");
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
         let tool = tools
             .iter()
             .find(|t| t.name == "ping")
@@ -2437,7 +2654,7 @@ fn launch_process_integration_test_over_duplex() {
 
         // 1. Tool discovery integration test
         let tools = client.list_all_tools().await.expect("Failed to list tools");
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
 
         let launch_tool = tools
             .iter()
@@ -3000,6 +3217,234 @@ fn launch_process_mcp_summaries_cover_nonzero_detach_timeouts_and_failure() {
 }
 
 #[test]
+fn write_file_integration_test_over_duplex() {
+    let path = write_temp_test_file("mcp_write", b"one\ntwo\nthree\n");
+    let created_path = generate_temp_test_path("mcp_write_created");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let server_task = tokio::spawn(async move {
+            run_mcp_server_loop(tx, Instant::now(), server_transport).await;
+        });
+
+        use rmcp::ServiceExt;
+        let mut client = ().serve(client_transport).await.expect("serve client");
+        let tools = client.list_all_tools().await.expect("list tools");
+        assert_eq!(tools.len(), 4);
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "write_file")
+            .expect("write_file tool should be exposed");
+        let annotations = tool.annotations.as_ref().expect("write_file annotations");
+        assert_eq!(annotations.read_only_hint, Some(false));
+        assert_eq!(annotations.destructive_hint, Some(true));
+        assert_eq!(annotations.idempotent_hint, Some(false));
+        assert_eq!(annotations.open_world_hint, Some(false));
+
+        let replacement = "middle\nextra";
+        let mut replace_params = rmcp::model::CallToolRequestParams::new("write_file");
+        replace_params.arguments = Some(
+            rmcp::serde_json::json!({
+                "path": path.to_string_lossy(),
+                "start_line": 2,
+                "end_line": 2,
+                "text": replacement,
+                "create_if_missing": false
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let replaced_call = client
+            .call_tool(replace_params)
+            .await
+            .expect("replace file range");
+        assert_eq!(replaced_call.is_error, Some(false));
+        let replaced = write_file_structured_result(&replaced_call);
+        assert_eq!(replaced.status, WriteFileStatus::Completed);
+        assert_eq!(replaced.replaced_line_count, Some(1));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"one\nmiddle\nextra\nthree\n"
+        );
+        assert!(!only_text_content(&replaced_call).contains(replacement));
+
+        let mut create_params = rmcp::model::CallToolRequestParams::new("write_file");
+        create_params.arguments = Some(
+            rmcp::serde_json::json!({
+                "path": created_path.to_string_lossy(),
+                "start_line": 1,
+                "end_line": 1,
+                "text": "created body",
+                "create_if_missing": true
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let created_call = client
+            .call_tool(create_params)
+            .await
+            .expect("create missing file");
+        assert_eq!(
+            write_file_structured_result(&created_call).status,
+            WriteFileStatus::Created
+        );
+        assert_eq!(std::fs::read(&created_path).unwrap(), b"created body");
+
+        let before_failure = std::fs::read(&path).unwrap();
+        let mut range_params = rmcp::model::CallToolRequestParams::new("write_file");
+        range_params.arguments = Some(
+            rmcp::serde_json::json!({
+                "path": path.to_string_lossy(),
+                "start_line": 20,
+                "end_line": 20,
+                "text": "must not appear",
+                "create_if_missing": false
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let range_call = client
+            .call_tool(range_params)
+            .await
+            .expect("structured range failure");
+        assert_eq!(
+            write_file_structured_result(&range_call).status,
+            WriteFileStatus::RangeOutOfBounds
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before_failure);
+
+        let mut invalid_params = rmcp::model::CallToolRequestParams::new("write_file");
+        invalid_params.arguments = Some(
+            rmcp::serde_json::json!({
+                "path": path.to_string_lossy(),
+                "start_line": 1,
+                "end_line": 501,
+                "text": "",
+                "create_if_missing": false
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let invalid_error = client.call_tool(invalid_params).await.unwrap_err();
+        let rmcp::ServiceError::McpError(error) = invalid_error else {
+            panic!("expected MCP invalid-parameter error");
+        };
+        assert_eq!(error.code.0, -32602);
+        assert!(error.message.contains("500"));
+
+        let events = rx.try_iter().map(|event| event.kind).collect::<Vec<_>>();
+        for status in [
+            WriteFileStatus::Completed,
+            WriteFileStatus::Created,
+            WriteFileStatus::RangeOutOfBounds,
+        ] {
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    UiEventKind::RequestUpdated {
+                        update: RequestUpdate::WriteFileResponded {
+                            status: event_status,
+                            ..
+                        },
+                        ..
+                    } if *event_status == status
+                )),
+                "missing write_file GUI update for {status:?}: {events:?}"
+            );
+        }
+        for sensitive in [replacement, "created body", "must not appear"] {
+            assert!(!format!("{events:?}").contains(sensitive));
+        }
+
+        client.close().await.expect("close client");
+        server_task.await.expect("server task");
+    });
+
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_file(created_path).unwrap();
+}
+
+#[test]
+fn write_file_blocking_work_does_not_block_ping() {
+    let path = write_temp_test_file("write_responsiveness", b"before\n");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    install_write_file_blocking_test_hook(path.clone(), started_tx, release_rx);
+
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let (server_transport, client_transport) = tokio::io::duplex(8192);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let server_task = tokio::spawn(async move {
+            run_mcp_server_loop(tx, Instant::now(), server_transport).await;
+        });
+        use rmcp::ServiceExt;
+        let mut client = ().serve(client_transport).await.expect("serve client");
+        let write_client = client.clone();
+        let write_path = path.clone();
+        let write_handle = tokio::spawn(async move {
+            let mut params = rmcp::model::CallToolRequestParams::new("write_file");
+            params.arguments = Some(
+                rmcp::serde_json::json!({
+                    "path": write_path.to_string_lossy(),
+                    "start_line": 1,
+                    "end_line": 1,
+                    "text": "after",
+                    "create_if_missing": false
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            );
+            write_client.call_tool(params).await
+        });
+
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("write_file blocking work did not start");
+        assert!(!write_handle.is_finished());
+
+        let ping = client
+            .call_tool(rmcp::model::CallToolRequestParams::new("ping"))
+            .await
+            .expect("ping should complete while file write is held");
+        assert_eq!(only_text_content(&ping), "pong");
+        assert!(!write_handle.is_finished());
+
+        release_tx.send(()).unwrap();
+        let write = write_handle
+            .await
+            .expect("write task")
+            .expect("write call should complete");
+        assert_eq!(
+            write_file_structured_result(&write).status,
+            WriteFileStatus::Completed
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"after");
+
+        client.close().await.expect("close client");
+        server_task.await.expect("server task");
+    });
+
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn read_file_integration_test_over_duplex() {
     let relative_name = generate_temp_test_path("mcp_read_relative")
         .file_name()
@@ -3029,7 +3474,7 @@ fn read_file_integration_test_over_duplex() {
         use rmcp::ServiceExt;
         let mut client = ().serve(client_transport).await.expect("serve client");
         let tools = client.list_all_tools().await.expect("list tools");
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
         let tool = tools
             .iter()
             .find(|tool| tool.name == "read_file")
