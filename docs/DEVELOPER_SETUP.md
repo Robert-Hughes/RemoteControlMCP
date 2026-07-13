@@ -239,6 +239,16 @@ Start the tunnel client daemon in the active PowerShell session (where `$env:CON
 & $TunnelClient run --profile remote-control-mcp
 ```
 
+For longer development sessions, increase the maximum lifetime of the local MCP transport connection from the tunnel client's 10-minute default:
+
+```powershell
+& $TunnelClient run `
+    --profile remote-control-mcp `
+    --mcp.connection-max-ttl 24h
+```
+
+This reduces stdio child-process rotation during a typical development session. It does not repair an already stale MCP session; after restarting the tunnel or local MCP process, start a new ChatGPT conversation so that the new connection receives a fresh MCP `initialize` handshake.
+
 * **Keep Running:** Leave this terminal pane open. The process must remain active to handle connection dispatches.
 * **Structured Logs:** A large volume of structured tunnel-client startup and lifecycle logs may appear in the terminal.
 * **Automatic UI Launch:** The local Rust GUI application will launch automatically.
