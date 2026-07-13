@@ -556,7 +556,7 @@ impl McpServer {
     pub async fn launch_process_impl(
         &self,
         params: rmcp::handler::server::wrapper::Parameters<LaunchProcessRequest>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<LaunchProcessResult>, rmcp::ErrorData> {
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let req = params.0;
 
         if let Err(err_msg) = validate_request(&req) {
@@ -577,7 +577,8 @@ impl McpServer {
             pid: result.pid,
         });
 
-        Ok(rmcp::handler::server::wrapper::Json(result))
+        let summary = launch_process_summary(&result);
+        Self::structured_success(summary, &result)
     }
 
     pub async fn execute_launch_process(&self, req: LaunchProcessRequest) -> LaunchProcessResult {
@@ -599,6 +600,51 @@ impl McpServer {
                 stderr_file: None,
             },
         }
+    }
+}
+
+pub(crate) fn launch_process_summary(result: &LaunchProcessResult) -> String {
+    match result.status {
+        LaunchProcessStatus::Completed => match (result.pid, result.exit_code) {
+            (Some(pid), Some(exit_code)) => {
+                format!("Process {pid} completed with exit code {exit_code}.")
+            }
+            (Some(pid), None) => format!("Process {pid} completed."),
+            (None, _) => "Process completed.".to_string(),
+        },
+        LaunchProcessStatus::Detached => result.pid.map_or_else(
+            || "Process started and was detached.".to_string(),
+            |pid| format!("Process {pid} started and was detached."),
+        ),
+        LaunchProcessStatus::DetachedWithStopTimeout => result.pid.map_or_else(
+            || "Process started detached with a stop timeout.".to_string(),
+            |pid| format!("Process {pid} started detached with a stop timeout."),
+        ),
+        LaunchProcessStatus::TimedOutDetached => result.pid.map_or_else(
+            || "Process timed out and was detached.".to_string(),
+            |pid| format!("Process {pid} timed out and was detached."),
+        ),
+        LaunchProcessStatus::TimedOutStopped => result.pid.map_or_else(
+            || "Process timed out and was stopped.".to_string(),
+            |pid| format!("Process {pid} timed out and was stopped."),
+        ),
+        LaunchProcessStatus::SetupFailed => "Process setup failed.".to_string(),
+        LaunchProcessStatus::LaunchProcessFailed => "Process launch failed.".to_string(),
+        LaunchProcessStatus::WaitFailed => result.pid.map_or_else(
+            || "Waiting for the process failed.".to_string(),
+            |pid| format!("Waiting for process {pid} failed."),
+        ),
+        LaunchProcessStatus::StopFailed => result.pid.map_or_else(
+            || {
+                "Stopping the process failed; successful termination could not be confirmed."
+                    .to_string()
+            },
+            |pid| {
+                format!(
+                    "Stopping process {pid} failed; successful termination could not be confirmed."
+                )
+            },
+        ),
     }
 }
 

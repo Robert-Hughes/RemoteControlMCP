@@ -1,12 +1,17 @@
 use crate::mcp::launch_process::{
-    ChildOps, CleanupOutcome, handle_background_wait_result_with_notifier, perform_cleanup,
-    read_and_truncate_file, report_background_error, validate_request,
+    ChildOps, CleanupOutcome, handle_background_wait_result_with_notifier, launch_process_summary,
+    perform_cleanup, read_and_truncate_file, report_background_error, validate_request,
 };
 use crate::mcp::ping::PingResult;
+use crate::mcp::read_file::{
+    install_blocking_test_hook, read_file_summary, validate_read_file_request,
+};
 use crate::mcp::{
     EnvironmentConfig, LaunchProcessRequest, LaunchProcessResult, LaunchProcessStatus, McpServer,
-    TimeoutAction, UiEventKind, run_mcp_server_loop, test_hooks,
+    ReadFileRequest, ReadFileResult, ReadFileStatus, TimeoutAction, UiEventKind,
+    run_mcp_server_loop, test_hooks,
 };
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -195,6 +200,59 @@ fn generate_temp_test_path(prefix: &str) -> std::path::PathBuf {
     path
 }
 
+fn write_temp_test_file(prefix: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let path = generate_temp_test_path(prefix);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+fn make_read_file_request(
+    path: &std::path::Path,
+    start_line: u64,
+    end_line: u64,
+) -> ReadFileRequest {
+    ReadFileRequest {
+        path: path.to_string_lossy().into_owned(),
+        start_line,
+        end_line,
+    }
+}
+
+fn call_read_file_direct(req: ReadFileRequest) -> (rmcp::model::CallToolResult, Vec<UiEventKind>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let result = rt
+        .block_on(async {
+            server
+                .read_file(rmcp::handler::server::wrapper::Parameters(req))
+                .await
+        })
+        .unwrap();
+    let events = rx.try_iter().map(|event| event.kind).collect();
+    (result, events)
+}
+
+fn read_file_structured_result(result: &rmcp::model::CallToolResult) -> ReadFileResult {
+    rmcp::serde_json::from_value(
+        result
+            .structured_content
+            .clone()
+            .expect("read_file should return structured content"),
+    )
+    .unwrap()
+}
+
+fn only_text_content(result: &rmcp::model::CallToolResult) -> &str {
+    assert_eq!(result.content.len(), 1);
+    let rmcp::model::ContentBlock::Text(text) = &result.content[0] else {
+        panic!("expected exactly one text content block");
+    };
+    &text.text
+}
+
 fn make_helper_request() -> LaunchProcessRequest {
     let test_executable = std::env::current_exe().unwrap();
     let debug_directory = test_executable.parent().unwrap().parent().unwrap();
@@ -273,6 +331,441 @@ fn ping_emits_request_and_response_events() {
     );
 }
 
+fn launch_result_for_summary(
+    status: LaunchProcessStatus,
+    pid: Option<u32>,
+    exit_code: Option<i32>,
+) -> LaunchProcessResult {
+    LaunchProcessResult {
+        status,
+        error: Some("sensitive operating-system detail".to_string()),
+        pid,
+        exit_code,
+        stdout: Some("sensitive stdout".to_string()),
+        stderr: Some("sensitive stderr".to_string()),
+        stdout_file: Some("stdout file".to_string()),
+        stderr_file: Some("stderr file".to_string()),
+    }
+}
+
+#[test]
+fn launch_process_summaries_are_stable_and_concise() {
+    let cases = [
+        (
+            LaunchProcessStatus::Completed,
+            Some(123),
+            Some(0),
+            "Process 123 completed with exit code 0.",
+        ),
+        (
+            LaunchProcessStatus::Completed,
+            Some(123),
+            Some(7),
+            "Process 123 completed with exit code 7.",
+        ),
+        (
+            LaunchProcessStatus::Completed,
+            Some(123),
+            None,
+            "Process 123 completed.",
+        ),
+        (
+            LaunchProcessStatus::Completed,
+            None,
+            None,
+            "Process completed.",
+        ),
+        (
+            LaunchProcessStatus::Detached,
+            Some(123),
+            None,
+            "Process 123 started and was detached.",
+        ),
+        (
+            LaunchProcessStatus::DetachedWithStopTimeout,
+            Some(123),
+            None,
+            "Process 123 started detached with a stop timeout.",
+        ),
+        (
+            LaunchProcessStatus::TimedOutDetached,
+            Some(123),
+            None,
+            "Process 123 timed out and was detached.",
+        ),
+        (
+            LaunchProcessStatus::TimedOutStopped,
+            Some(123),
+            None,
+            "Process 123 timed out and was stopped.",
+        ),
+        (
+            LaunchProcessStatus::SetupFailed,
+            None,
+            None,
+            "Process setup failed.",
+        ),
+        (
+            LaunchProcessStatus::LaunchProcessFailed,
+            None,
+            None,
+            "Process launch failed.",
+        ),
+        (
+            LaunchProcessStatus::WaitFailed,
+            Some(123),
+            None,
+            "Waiting for process 123 failed.",
+        ),
+        (
+            LaunchProcessStatus::WaitFailed,
+            None,
+            None,
+            "Waiting for the process failed.",
+        ),
+        (
+            LaunchProcessStatus::StopFailed,
+            Some(123),
+            None,
+            "Stopping process 123 failed; successful termination could not be confirmed.",
+        ),
+        (
+            LaunchProcessStatus::StopFailed,
+            None,
+            None,
+            "Stopping the process failed; successful termination could not be confirmed.",
+        ),
+    ];
+
+    for (status, pid, exit_code, expected) in cases {
+        let result = launch_result_for_summary(status, pid, exit_code);
+        let summary = launch_process_summary(&result);
+        assert_eq!(summary, expected);
+        for sensitive in [
+            "sensitive operating-system detail",
+            "sensitive stdout",
+            "sensitive stderr",
+            "stdout file",
+            "stderr file",
+        ] {
+            assert!(!summary.contains(sensitive));
+        }
+    }
+}
+
+#[test]
+fn read_file_preserves_logical_lines_and_newline_semantics() {
+    let path = write_temp_test_file("read_lines", b"\xEF\xBB\xBFfirst\r\n\r\nthird\nlast");
+    let (call_result, events) = call_read_file_direct(make_read_file_request(&path, 1, 4));
+    let result = read_file_structured_result(&call_result);
+
+    assert_eq!(result.status, ReadFileStatus::Completed);
+    assert_eq!(result.actual_start_line, Some(1));
+    assert_eq!(result.actual_end_line, Some(4));
+    assert_eq!(result.text, "first\n\nthird\nlast");
+    assert_eq!(result.eof, Some(true));
+    assert!(!result.lossy_utf8);
+    assert_eq!(result.next_start_line, None);
+    assert_eq!(call_result.is_error, Some(false));
+    assert_eq!(only_text_content(&call_result), read_file_summary(&result));
+    assert!(!only_text_content(&call_result).contains("third"));
+    assert!(matches!(events[0], UiEventKind::ReadFileRequested { .. }));
+    assert!(matches!(
+        events[1],
+        UiEventKind::ReadFileResponded {
+            status: ReadFileStatus::Completed,
+            actual_start_line: Some(1),
+            actual_end_line: Some(4)
+        }
+    ));
+    assert!(!format!("{events:?}").contains("third"));
+
+    let (single_call, _) = call_read_file_direct(make_read_file_request(&path, 2, 2));
+    let single = read_file_structured_result(&single_call);
+    assert_eq!(single.text, "");
+    assert_eq!(single.actual_start_line, Some(2));
+    assert_eq!(single.actual_end_line, Some(2));
+    assert_eq!(single.eof, Some(false));
+
+    let leading_blanks_path = write_temp_test_file("leading_blanks", b"\n\nthird\n");
+    let leading_blanks = read_file_structured_result(
+        &call_read_file_direct(make_read_file_request(&leading_blanks_path, 1, 3)).0,
+    );
+    assert_eq!(leading_blanks.text, "\n\nthird");
+    assert_eq!(leading_blanks.actual_start_line, Some(1));
+    assert_eq!(leading_blanks.actual_end_line, Some(3));
+
+    let bom_elsewhere = write_temp_test_file("bom_elsewhere", b"first\n\xEF\xBB\xBFsecond\n");
+    let (bom_call, _) = call_read_file_direct(make_read_file_request(&bom_elsewhere, 2, 2));
+    assert_eq!(
+        read_file_structured_result(&bom_call).text,
+        "\u{feff}second"
+    );
+
+    let lf_path = write_temp_test_file("lf", b"one\ntwo\n");
+    let crlf_path = write_temp_test_file("crlf", b"one\r\ntwo\r\n");
+    let lf = read_file_structured_result(
+        &call_read_file_direct(make_read_file_request(&lf_path, 1, 2)).0,
+    );
+    let crlf = read_file_structured_result(
+        &call_read_file_direct(make_read_file_request(&crlf_path, 1, 2)).0,
+    );
+    assert_eq!(lf.text, crlf.text);
+
+    for path in [path, leading_blanks_path, bom_elsewhere, lf_path, crlf_path] {
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn read_file_handles_eof_empty_files_unicode_and_lossy_utf8() {
+    let path = write_temp_test_file("eof", b"one\ntwo\nthree");
+
+    let beyond = read_file_structured_result(
+        &call_read_file_direct(make_read_file_request(&path, 20, 21)).0,
+    );
+    assert_eq!(beyond.status, ReadFileStatus::Completed);
+    assert_eq!(beyond.actual_start_line, None);
+    assert_eq!(beyond.actual_end_line, None);
+    assert_eq!(beyond.text, "");
+    assert_eq!(beyond.eof, Some(true));
+    assert_eq!(beyond.next_start_line, None);
+
+    let past_end =
+        read_file_structured_result(&call_read_file_direct(make_read_file_request(&path, 2, 10)).0);
+    assert_eq!(past_end.text, "two\nthree");
+    assert_eq!(past_end.actual_end_line, Some(3));
+    assert_eq!(past_end.eof, Some(true));
+
+    let before_eof =
+        read_file_structured_result(&call_read_file_direct(make_read_file_request(&path, 1, 2)).0);
+    assert_eq!(before_eof.text, "one\ntwo");
+    assert_eq!(before_eof.eof, Some(false));
+
+    let empty_path = write_temp_test_file("empty", b"");
+    let empty = read_file_structured_result(
+        &call_read_file_direct(make_read_file_request(&empty_path, 1, 1)).0,
+    );
+    assert_eq!(empty.text, "");
+    assert_eq!(empty.actual_start_line, None);
+    assert_eq!(empty.eof, Some(true));
+
+    let unicode_path = write_temp_test_file("unicode_雪", "雪\n🙂\n".as_bytes());
+    let unicode = read_file_structured_result(
+        &call_read_file_direct(make_read_file_request(&unicode_path, 1, 2)).0,
+    );
+    assert_eq!(unicode.text, "雪\n🙂");
+    assert!(!unicode.lossy_utf8);
+
+    let invalid_path = write_temp_test_file("invalid_utf8", b"valid\n\xFF\xFE\n");
+    let invalid = read_file_structured_result(
+        &call_read_file_direct(make_read_file_request(&invalid_path, 2, 2)).0,
+    );
+    assert_eq!(invalid.text, "\u{fffd}\u{fffd}");
+    assert!(invalid.lossy_utf8);
+
+    for path in [path, empty_path, unicode_path, invalid_path] {
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn read_file_resolves_absolute_relative_and_parent_paths() {
+    let absolute_path = write_temp_test_file("absolute", b"absolute\n");
+    let absolute = read_file_structured_result(
+        &call_read_file_direct(make_read_file_request(&absolute_path, 1, 1)).0,
+    );
+    assert!(Path::new(&absolute.path).is_absolute());
+    assert_eq!(absolute.text, "absolute");
+
+    let relative_name = generate_temp_test_path("relative")
+        .file_name()
+        .unwrap()
+        .to_owned();
+    let relative_path = std::env::temp_dir().join(&relative_name);
+    std::fs::write(&relative_path, b"relative\n").unwrap();
+    let relative_request = ReadFileRequest {
+        path: PathBuf::from(&relative_name).to_string_lossy().into_owned(),
+        start_line: 1,
+        end_line: 1,
+    };
+    let relative = read_file_structured_result(&call_read_file_direct(relative_request).0);
+    assert_eq!(relative.text, "relative");
+    assert!(Path::new(&relative.path).is_absolute());
+
+    let parent_name = generate_temp_test_path("parent")
+        .file_name()
+        .unwrap()
+        .to_owned();
+    let parent_path = std::env::temp_dir().join(&parent_name);
+    std::fs::write(&parent_path, b"parent\n").unwrap();
+    let subdir = generate_temp_test_path("parent_subdir");
+    std::fs::create_dir(&subdir).unwrap();
+    let parent_request = ReadFileRequest {
+        path: PathBuf::from(subdir.file_name().unwrap())
+            .join("..")
+            .join(&parent_name)
+            .to_string_lossy()
+            .into_owned(),
+        start_line: 1,
+        end_line: 1,
+    };
+    let parent = read_file_structured_result(&call_read_file_direct(parent_request).0);
+    assert_eq!(parent.text, "parent");
+
+    std::fs::remove_file(absolute_path).unwrap();
+    std::fs::remove_file(relative_path).unwrap();
+    std::fs::remove_file(parent_path).unwrap();
+    std::fs::remove_dir(subdir).unwrap();
+}
+
+#[test]
+fn read_file_validates_ranges_and_ambiguous_windows_paths() {
+    let valid_path = generate_temp_test_path("validation");
+    for (start_line, end_line, message) in [
+        (0, 1, "start_line"),
+        (1, 0, "end_line"),
+        (2, 1, "less than or equal"),
+        (1, 501, "500"),
+    ] {
+        let req = make_read_file_request(&valid_path, start_line, end_line);
+        let error = validate_read_file_request(&req).unwrap_err();
+        assert!(error.contains(message), "unexpected error: {error}");
+    }
+
+    for path in ["", "bad\0path"] {
+        let req = ReadFileRequest {
+            path: path.to_string(),
+            start_line: 1,
+            end_line: 1,
+        };
+        assert!(validate_read_file_request(&req).is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    for path in [r"C:some-file.txt", r"\some-file.txt"] {
+        let req = ReadFileRequest {
+            path: path.to_string(),
+            start_line: 1,
+            end_line: 1,
+        };
+        assert!(validate_read_file_request(&req).is_err());
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let invalid = make_read_file_request(&valid_path, 1, 501);
+    let error = rt.block_on(async {
+        server
+            .read_file(rmcp::handler::server::wrapper::Parameters(invalid))
+            .await
+    });
+    assert!(error.is_err());
+    assert!(matches!(
+        rx.try_recv().unwrap().kind,
+        UiEventKind::ReadFileRejected { .. }
+    ));
+}
+
+#[test]
+fn read_file_returns_structured_filesystem_failures() {
+    let missing_path = generate_temp_test_path("missing");
+    let missing_call = call_read_file_direct(make_read_file_request(&missing_path, 1, 1)).0;
+    let missing = read_file_structured_result(&missing_call);
+    assert_eq!(missing.status, ReadFileStatus::NotFound);
+    assert_eq!(missing_call.is_error, Some(false));
+    assert!(missing.error.is_some());
+    assert!(missing.text.is_empty());
+    assert!(!only_text_content(&missing_call).contains(missing.error.as_deref().unwrap()));
+
+    let directory = generate_temp_test_path("directory");
+    std::fs::create_dir(&directory).unwrap();
+    let directory_call = call_read_file_direct(make_read_file_request(&directory, 1, 1)).0;
+    let directory_result = read_file_structured_result(&directory_call);
+    assert_eq!(directory_result.status, ReadFileStatus::NotAFile);
+    assert_eq!(directory_call.is_error, Some(false));
+    assert!(directory_result.text.is_empty());
+    std::fs::remove_dir(directory).unwrap();
+}
+
+#[test]
+fn read_file_enforces_complete_line_byte_limit_and_continuation() {
+    let exact_path = write_temp_test_file("exact_limit", &vec![b'a'; 256 * 1024]);
+    let exact_call = call_read_file_direct(make_read_file_request(&exact_path, 1, 1)).0;
+    let exact = read_file_structured_result(&exact_call);
+    assert_eq!(exact.status, ReadFileStatus::Completed);
+    assert_eq!(exact.text.len(), 256 * 1024);
+
+    let below_path = write_temp_test_file("below_limit", &vec![b'b'; 256 * 1024 - 1]);
+    let below = read_file_structured_result(
+        &call_read_file_direct(make_read_file_request(&below_path, 1, 1)).0,
+    );
+    assert_eq!(below.status, ReadFileStatus::Completed);
+
+    let mut truncation_bytes = vec![b'c'; 200 * 1024];
+    truncation_bytes.push(b'\n');
+    truncation_bytes.extend(vec![b'd'; 100 * 1024]);
+    truncation_bytes.push(b'\n');
+    truncation_bytes.extend_from_slice(b"third\n");
+    let truncated_path = write_temp_test_file("truncated", &truncation_bytes);
+    let truncated_call = call_read_file_direct(make_read_file_request(&truncated_path, 1, 3)).0;
+    let truncated = read_file_structured_result(&truncated_call);
+    assert_eq!(truncated.status, ReadFileStatus::Truncated);
+    assert_eq!(truncated.actual_start_line, Some(1));
+    assert_eq!(truncated.actual_end_line, Some(1));
+    assert_eq!(truncated.next_start_line, Some(2));
+    assert_eq!(truncated.eof, Some(false));
+    assert_eq!(truncated.text.len(), 200 * 1024);
+    assert_eq!(truncated_call.is_error, Some(false));
+    assert!(!only_text_content(&truncated_call).contains(&"c".repeat(100)));
+
+    let continued = read_file_structured_result(
+        &call_read_file_direct(make_read_file_request(&truncated_path, 2, 3)).0,
+    );
+    assert_eq!(continued.status, ReadFileStatus::Completed);
+    assert_eq!(continued.actual_start_line, Some(2));
+    assert_eq!(continued.actual_end_line, Some(3));
+    assert!(continued.text.starts_with(&"d".repeat(100)));
+    assert!(continued.text.ends_with("\nthird"));
+
+    let oversized_path = write_temp_test_file("oversized", &vec![b'e'; 256 * 1024 + 1]);
+    let oversized_call = call_read_file_direct(make_read_file_request(&oversized_path, 1, 1)).0;
+    let oversized = read_file_structured_result(&oversized_call);
+    assert_eq!(oversized.status, ReadFileStatus::LineTooLong);
+    assert_eq!(oversized.actual_start_line, None);
+    assert_eq!(oversized.actual_end_line, None);
+    assert!(oversized.text.is_empty());
+    assert_eq!(oversized.next_start_line, None);
+    assert!(oversized.error.as_deref().unwrap().contains("Line 1"));
+    assert_eq!(oversized_call.is_error, Some(false));
+
+    let mut blank_then_oversized_bytes = vec![b'\n'];
+    blank_then_oversized_bytes.extend(vec![b'f'; 256 * 1024 + 1]);
+    let blank_then_oversized_path =
+        write_temp_test_file("blank_then_oversized", &blank_then_oversized_bytes);
+    let blank_then_oversized = read_file_structured_result(
+        &call_read_file_direct(make_read_file_request(&blank_then_oversized_path, 1, 2)).0,
+    );
+    assert_eq!(blank_then_oversized.status, ReadFileStatus::Truncated);
+    assert_eq!(blank_then_oversized.actual_start_line, Some(1));
+    assert_eq!(blank_then_oversized.actual_end_line, Some(1));
+    assert_eq!(blank_then_oversized.text, "");
+    assert_eq!(blank_then_oversized.next_start_line, Some(2));
+
+    for path in [
+        exact_path,
+        below_path,
+        truncated_path,
+        oversized_path,
+        blank_then_oversized_path,
+    ] {
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
 #[test]
 fn ping_metadata_is_read_only_and_idempotent() {
     let attr = McpServer::ping_tool_attr();
@@ -347,7 +840,7 @@ fn ping_works_over_mcp_duplex_transport() {
 
         // 1. Tool discovery through tools/list
         let tools = client.list_all_tools().await.expect("Failed to list tools");
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
         let tool = tools
             .iter()
             .find(|t| t.name == "ping")
@@ -612,6 +1105,47 @@ fn test_schema_required_fields() {
     assert!(required_fields.contains(&"process_name"));
     assert!(required_fields.contains(&"environment"));
     assert!(required_fields.contains(&"detached"));
+}
+
+#[test]
+fn launch_process_output_schema_remains_complete() {
+    let attr = McpServer::launch_process_tool_attr();
+    let schema = attr
+        .output_schema
+        .as_ref()
+        .expect("launch_process output schema should be present");
+    let schema = rmcp::serde_json::Value::Object((**schema).clone());
+    let root = resolve_local_schema_ref(&schema, &schema);
+    let properties = root["properties"].as_object().unwrap();
+    for field in [
+        "status",
+        "error",
+        "pid",
+        "exit_code",
+        "stdout",
+        "stderr",
+        "stdout_file",
+        "stderr_file",
+    ] {
+        assert!(
+            properties.contains_key(field),
+            "missing output field {field}"
+        );
+    }
+    let encoded = schema.to_string();
+    for status in [
+        "completed",
+        "detached",
+        "detached_with_stop_timeout",
+        "timed_out_detached",
+        "timed_out_stopped",
+        "setup_failed",
+        "launch_process_failed",
+        "wait_failed",
+        "stop_failed",
+    ] {
+        assert!(encoded.contains(status), "missing status {status}");
+    }
 }
 
 #[test]
@@ -1471,7 +2005,10 @@ fn test_gui_events_launch_process() {
     let req = make_helper_request();
     let params = rmcp::handler::server::wrapper::Parameters(req);
     let res = rt.block_on(async { server.launch_process(params).await.unwrap() });
-    assert!(matches!(res.0.status, LaunchProcessStatus::Completed));
+    let structured: LaunchProcessResult =
+        rmcp::serde_json::from_value(res.structured_content.clone().expect("structured result"))
+            .unwrap();
+    assert!(matches!(structured.status, LaunchProcessStatus::Completed));
 
     let events: Vec<UiEventKind> = rx.try_iter().map(|e| e.kind).collect();
     assert_eq!(events.len(), 2);
@@ -1491,7 +2028,7 @@ fn test_gui_events_launch_process() {
     ));
     if let UiEventKind::LaunchProcessResponded { status, pid } = events[1] {
         assert_eq!(status, LaunchProcessStatus::Completed);
-        assert_eq!(pid, res.0.pid);
+        assert_eq!(pid, structured.pid);
     } else {
         panic!("Expected LaunchProcessResponded");
     }
@@ -1558,7 +2095,7 @@ fn launch_process_integration_test_over_duplex() {
 
         // 1. Tool discovery integration test
         let tools = client.list_all_tools().await.expect("Failed to list tools");
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
 
         let launch_tool = tools
             .iter()
@@ -1575,6 +2112,15 @@ fn launch_process_integration_test_over_duplex() {
         assert_eq!(ann.destructive_hint, Some(true));
         assert_eq!(ann.idempotent_hint, Some(false));
         assert_eq!(ann.open_world_hint, Some(true));
+
+        let output_schema = launch_tool
+            .output_schema
+            .as_ref()
+            .expect("launch_process output schema should be present");
+        let output_schema = rmcp::serde_json::Value::Object((**output_schema).clone());
+        let output_root = resolve_local_schema_ref(&output_schema, &output_schema);
+        assert!(output_root["properties"].get("stdout").is_some());
+        assert!(output_root["properties"].get("stderr").is_some());
 
         let properties = launch_tool
             .input_schema
@@ -1668,6 +2214,20 @@ fn launch_process_integration_test_over_duplex() {
             .call_tool(call_params)
             .await
             .expect("Failed to call launch_process");
+
+        assert_eq!(call_result.is_error, Some(false));
+        let summary = only_text_content(&call_result).to_string();
+        assert!(summary.starts_with("Process "));
+        assert!(summary.ends_with(" completed with exit code 0."));
+        for sensitive in [
+            "stdout: integration_test",
+            "stderr: integration_test",
+            "integration_arg",
+            "RMCP_TEST_HELPER_ACTION",
+        ] {
+            assert!(!summary.contains(sensitive));
+        }
+        assert!(!summary.starts_with('{'));
 
         let struct_val = call_result
             .structured_content
@@ -1870,6 +2430,438 @@ fn launch_process_integration_test_over_duplex() {
             }
         }
     }
+}
+
+#[test]
+fn launch_process_mcp_summaries_cover_nonzero_detach_timeouts_and_failure() {
+    let _guard = match ENV_MUTEX.lock() {
+        Ok(guard) => guard,
+        Err(error) => error.into_inner(),
+    };
+    let helper = make_helper_request().process_name;
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let server_task = tokio::spawn(async move {
+            run_mcp_server_loop(tx, Instant::now(), server_transport).await;
+        });
+        use rmcp::ServiceExt;
+        let mut client = ().serve(client_transport).await.expect("serve client");
+
+        let mut nonzero_params = rmcp::model::CallToolRequestParams::new("launch_process");
+        nonzero_params.arguments = Some(
+            rmcp::serde_json::json!({
+                "process_name": &helper,
+                "environment": {
+                    "inherit": true,
+                    "variables": {
+                        "RMCP_TEST_HELPER_ACTION": "exit_code",
+                        "RMCP_TEST_HELPER_CODE": "7"
+                    }
+                },
+                "detached": false
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let nonzero_call = client
+            .call_tool(nonzero_params)
+            .await
+            .expect("nonzero launch");
+        let nonzero: LaunchProcessResult =
+            rmcp::serde_json::from_value(nonzero_call.structured_content.clone().unwrap()).unwrap();
+        assert_eq!(nonzero.exit_code, Some(7));
+        assert_eq!(nonzero_call.is_error, Some(false));
+        assert_eq!(
+            only_text_content(&nonzero_call),
+            launch_process_summary(&nonzero)
+        );
+
+        let mut detached_params = rmcp::model::CallToolRequestParams::new("launch_process");
+        detached_params.arguments = Some(
+            rmcp::serde_json::json!({
+                "process_name": &helper,
+                "environment": {
+                    "inherit": true,
+                    "variables": {
+                        "RMCP_TEST_HELPER_ACTION": "sleep",
+                        "RMCP_TEST_HELPER_SLEEP_MS": "300"
+                    }
+                },
+                "detached": true
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let detached_call = client
+            .call_tool(detached_params)
+            .await
+            .expect("detached launch");
+        let detached: LaunchProcessResult =
+            rmcp::serde_json::from_value(detached_call.structured_content.clone().unwrap())
+                .unwrap();
+        assert_eq!(detached.status, LaunchProcessStatus::Detached);
+        assert_eq!(detached_call.is_error, Some(false));
+        assert_eq!(
+            only_text_content(&detached_call),
+            launch_process_summary(&detached)
+        );
+
+        let mut timeout_detach_params = rmcp::model::CallToolRequestParams::new("launch_process");
+        timeout_detach_params.arguments = Some(
+            rmcp::serde_json::json!({
+                "process_name": &helper,
+                "environment": {
+                    "inherit": true,
+                    "variables": {
+                        "RMCP_TEST_HELPER_ACTION": "sleep",
+                        "RMCP_TEST_HELPER_SLEEP_MS": "400"
+                    }
+                },
+                "detached": false,
+                "timeout_ms": 50,
+                "timeout_action": "detach"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let timeout_detach_call = client
+            .call_tool(timeout_detach_params)
+            .await
+            .expect("timeout detach");
+        let timeout_detach: LaunchProcessResult =
+            rmcp::serde_json::from_value(timeout_detach_call.structured_content.clone().unwrap())
+                .unwrap();
+        assert_eq!(timeout_detach.status, LaunchProcessStatus::TimedOutDetached);
+        assert_eq!(timeout_detach_call.is_error, Some(false));
+        assert_eq!(
+            only_text_content(&timeout_detach_call),
+            launch_process_summary(&timeout_detach)
+        );
+
+        let mut timeout_stop_params = rmcp::model::CallToolRequestParams::new("launch_process");
+        timeout_stop_params.arguments = Some(
+            rmcp::serde_json::json!({
+                "process_name": &helper,
+                "environment": {
+                    "inherit": true,
+                    "variables": {
+                        "RMCP_TEST_HELPER_ACTION": "sleep",
+                        "RMCP_TEST_HELPER_SLEEP_MS": "400"
+                    }
+                },
+                "detached": false,
+                "timeout_ms": 50,
+                "timeout_action": "stop"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let timeout_stop_call = client
+            .call_tool(timeout_stop_params)
+            .await
+            .expect("timeout stop");
+        let timeout_stop: LaunchProcessResult =
+            rmcp::serde_json::from_value(timeout_stop_call.structured_content.clone().unwrap())
+                .unwrap();
+        assert_eq!(timeout_stop.status, LaunchProcessStatus::TimedOutStopped);
+        assert_eq!(timeout_stop_call.is_error, Some(false));
+        assert_eq!(
+            only_text_content(&timeout_stop_call),
+            launch_process_summary(&timeout_stop)
+        );
+
+        let mut failure_params = rmcp::model::CallToolRequestParams::new("launch_process");
+        failure_params.arguments = Some(
+            rmcp::serde_json::json!({
+                "process_name": generate_temp_test_path("missing_executable").to_string_lossy(),
+                "environment": { "inherit": true, "variables": {} },
+                "detached": false
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let failure_call = client
+            .call_tool(failure_params)
+            .await
+            .expect("structured launch failure");
+        let failure: LaunchProcessResult =
+            rmcp::serde_json::from_value(failure_call.structured_content.clone().unwrap()).unwrap();
+        assert_eq!(failure.status, LaunchProcessStatus::LaunchProcessFailed);
+        assert_eq!(failure_call.is_error, Some(false));
+        assert_eq!(only_text_content(&failure_call), "Process launch failed.");
+        assert!(!only_text_content(&failure_call).contains(failure.error.as_deref().unwrap()));
+
+        // Keep the process-test mutex until both deliberately detached helper
+        // children have exited and their reapers have sent any test notifications.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        client.close().await.expect("close client");
+        server_task.await.expect("server task");
+    });
+}
+
+#[test]
+fn read_file_integration_test_over_duplex() {
+    let relative_name = generate_temp_test_path("mcp_read_relative")
+        .file_name()
+        .unwrap()
+        .to_owned();
+    let relative_path = std::env::temp_dir().join(&relative_name);
+    std::fs::write(&relative_path, b"alpha\nbeta\ngamma\n").unwrap();
+
+    let mut truncation_bytes = vec![b'x'; 200 * 1024];
+    truncation_bytes.push(b'\n');
+    truncation_bytes.extend(vec![b'y'; 100 * 1024]);
+    let truncated_path = write_temp_test_file("mcp_read_truncated", &truncation_bytes);
+    let missing_path = generate_temp_test_path("mcp_read_missing");
+
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let (server_transport, client_transport) = tokio::io::duplex(1024 * 1024);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let server_task = tokio::spawn(async move {
+            run_mcp_server_loop(tx, Instant::now(), server_transport).await;
+        });
+
+        use rmcp::ServiceExt;
+        let mut client = ().serve(client_transport).await.expect("serve client");
+        let tools = client.list_all_tools().await.expect("list tools");
+        assert_eq!(tools.len(), 3);
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "read_file")
+            .expect("read_file tool should be exposed");
+
+        let annotations = tool.annotations.as_ref().expect("read_file annotations");
+        assert_eq!(annotations.read_only_hint, Some(true));
+        assert_eq!(annotations.destructive_hint, Some(false));
+        assert_eq!(annotations.idempotent_hint, Some(true));
+        assert_eq!(annotations.open_world_hint, Some(false));
+
+        let required = tool.input_schema["required"].as_array().unwrap();
+        for field in ["path", "start_line", "end_line"] {
+            assert!(required.iter().any(|value| value == field));
+        }
+        let input_properties = tool.input_schema["properties"].as_object().unwrap();
+        for field in ["start_line", "end_line"] {
+            let schema = &input_properties[field];
+            assert_eq!(schema["type"], "integer");
+            assert_eq!(schema["minimum"], 1);
+            assert!(schema.get("format").is_none());
+            assert!(schema.get("default").is_none());
+        }
+        let encoded_input_schema =
+            rmcp::serde_json::Value::Object((*tool.input_schema).clone()).to_string();
+        assert!(!encoded_input_schema.contains("\"default\":null"));
+
+        let output_schema = tool
+            .output_schema
+            .as_ref()
+            .expect("read_file output schema should be present");
+        let output_schema = rmcp::serde_json::Value::Object((**output_schema).clone());
+        let output_root = resolve_local_schema_ref(&output_schema, &output_schema);
+        let output_properties = output_root["properties"].as_object().unwrap();
+        for field in [
+            "status",
+            "error",
+            "path",
+            "requested_start_line",
+            "requested_end_line",
+            "actual_start_line",
+            "actual_end_line",
+            "text",
+            "eof",
+            "next_start_line",
+            "lossy_utf8",
+        ] {
+            assert!(
+                output_properties.contains_key(field),
+                "missing output field {field}"
+            );
+        }
+        let encoded_output_schema = output_schema.to_string();
+        for status in [
+            "completed",
+            "truncated",
+            "not_found",
+            "access_denied",
+            "not_a_file",
+            "read_failed",
+            "line_too_long",
+        ] {
+            assert!(encoded_output_schema.contains(status));
+        }
+        assert!(!encoded_output_schema.contains("\"default\":null"));
+
+        let mut completed_params = rmcp::model::CallToolRequestParams::new("read_file");
+        completed_params.arguments = Some(
+            rmcp::serde_json::json!({
+                "path": PathBuf::from(&relative_name).to_string_lossy(),
+                "start_line": 2,
+                "end_line": 3
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let completed_call = client
+            .call_tool(completed_params)
+            .await
+            .expect("read relative file");
+        assert_eq!(completed_call.is_error, Some(false));
+        assert_eq!(completed_call.content.len(), 1);
+        let completed = read_file_structured_result(&completed_call);
+        assert_eq!(completed.status, ReadFileStatus::Completed);
+        assert_eq!(completed.text, "beta\ngamma");
+        assert!(!only_text_content(&completed_call).contains("beta"));
+
+        let mut truncated_params = rmcp::model::CallToolRequestParams::new("read_file");
+        truncated_params.arguments = Some(
+            rmcp::serde_json::json!({
+                "path": truncated_path.to_string_lossy(),
+                "start_line": 1,
+                "end_line": 2
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let truncated_call = client
+            .call_tool(truncated_params)
+            .await
+            .expect("truncated result");
+        assert_eq!(truncated_call.is_error, Some(false));
+        assert_eq!(
+            read_file_structured_result(&truncated_call).status,
+            ReadFileStatus::Truncated
+        );
+
+        let mut missing_params = rmcp::model::CallToolRequestParams::new("read_file");
+        missing_params.arguments = Some(
+            rmcp::serde_json::json!({
+                "path": missing_path.to_string_lossy(),
+                "start_line": 1,
+                "end_line": 1
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let missing_call = client
+            .call_tool(missing_params)
+            .await
+            .expect("structured missing-file result");
+        assert_eq!(missing_call.is_error, Some(false));
+        assert_eq!(
+            read_file_structured_result(&missing_call).status,
+            ReadFileStatus::NotFound
+        );
+
+        let mut invalid_params = rmcp::model::CallToolRequestParams::new("read_file");
+        invalid_params.arguments = Some(
+            rmcp::serde_json::json!({
+                "path": relative_path.to_string_lossy(),
+                "start_line": 3,
+                "end_line": 2
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let invalid_error = client.call_tool(invalid_params).await.unwrap_err();
+        assert!(matches!(
+            invalid_error,
+            rmcp::ServiceError::McpError(ref error) if error.code.0 == -32602
+        ));
+
+        client.close().await.expect("close client");
+        server_task.await.expect("server task");
+    });
+
+    std::fs::remove_file(relative_path).unwrap();
+    std::fs::remove_file(truncated_path).unwrap();
+}
+
+#[test]
+fn read_file_blocking_work_does_not_block_ping() {
+    let path = write_temp_test_file("read_responsiveness", b"responsive\n");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    install_blocking_test_hook(path.clone(), started_tx, release_rx);
+
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let (server_transport, client_transport) = tokio::io::duplex(8192);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let server_task = tokio::spawn(async move {
+            run_mcp_server_loop(tx, Instant::now(), server_transport).await;
+        });
+        use rmcp::ServiceExt;
+        let mut client = ().serve(client_transport).await.expect("serve client");
+        let read_client = client.clone();
+        let read_path = path.clone();
+        let read_handle = tokio::spawn(async move {
+            let mut params = rmcp::model::CallToolRequestParams::new("read_file");
+            params.arguments = Some(
+                rmcp::serde_json::json!({
+                    "path": read_path.to_string_lossy(),
+                    "start_line": 1,
+                    "end_line": 1
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            );
+            read_client.call_tool(params).await
+        });
+
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("read_file blocking work did not start");
+        assert!(!read_handle.is_finished());
+
+        let ping = client
+            .call_tool(rmcp::model::CallToolRequestParams::new("ping"))
+            .await
+            .expect("ping should complete while file read is held");
+        assert_eq!(only_text_content(&ping), "pong");
+        assert!(!read_handle.is_finished());
+
+        release_tx.send(()).unwrap();
+        let read = read_handle
+            .await
+            .expect("read task")
+            .expect("read call should complete");
+        assert_eq!(
+            read_file_structured_result(&read).status,
+            ReadFileStatus::Completed
+        );
+
+        client.close().await.expect("close client");
+        server_task.await.expect("server task");
+    });
+
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

@@ -29,12 +29,14 @@ Standard output (`stdout`) is strictly reserved for MCP protocol messages.
 
 ## Exposed Tools
 
-The application exposes two tools:
+The application exposes three tools:
 1. `ping`
 2. `launch_process`
+3. `read_file`
 
 > [!WARNING]
 > The `launch_process` tool provides unrestricted local process execution under the user account running the MCP server. There is no security allowlist.
+> The `read_file` tool likewise has unrestricted read access to regular files that account can access; its relative-path base is a convenience, not a security boundary.
 
 ---
 
@@ -89,7 +91,7 @@ Launch a local process on the host machine. There is no implicit shell execution
 
 #### Result Schema
 
-On successful tool call, a structured JSON result is returned:
+On a successfully handled tool call, `content` contains one concise outcome summary and `structuredContent` contains the complete typed JSON result described below. Captured `stdout` and `stderr` are not duplicated into the text summary.
 
 * **`status`** (string): The serialised status code of the run:
   * `completed`: Process finished within limits.
@@ -109,6 +111,44 @@ On successful tool call, a structured JSON result is returned:
 * **`stdout_file`** / **`stderr_file`** (string, optional): Absolute file paths to the logs.
 
 Validation errors (e.g., missing process name or invalid parameter combinations) result in immediate MCP validation errors, whereas failures during process execution return a structured result with a failed status (e.g., `launch_process_failed`).
+
+---
+
+### 3. `read_file`
+
+Read a bounded, 1-based inclusive line range from a local regular file. The tool is read-only and performs blocking filesystem work away from the single-threaded MCP runtime.
+
+#### Parameters and paths
+
+* **`path`** (string, required): An absolute path or an ordinary relative path. Absolute drive and UNC paths are supported where the operating system permits them. Relative paths resolve against `std::env::temp_dir()`.
+* **`start_line`** (positive integer, required): First line to return, using 1-based numbering.
+* **`end_line`** (positive integer, required): Last line to return, inclusive. It must be at least `start_line`, and the requested span may contain at most 500 lines.
+
+The server uses normal filesystem permissions and does not sandbox reads. Relative `..` components and filesystem symlinks or Windows reparse points follow normal operating-system behaviour. Only regular files are accepted; directories, devices, and named pipes are rejected. The path is interpreted literally: `%VARIABLE%`, `$env:VARIABLE`, `~`, wildcards, and shell expressions are not expanded. Ambiguous Windows drive-relative and root-relative forms such as `C:some-file.txt` and `\some-file.txt` are rejected.
+
+#### Text, encoding, and size limits
+
+Files are scanned incrementally by LF boundaries rather than loaded in full. A selected line loses its terminating LF and an immediately preceding CR, so LF and CRLF files produce the same logical text. Blank lines and an unterminated final line are preserved. A UTF-8 BOM is removed only at the start of line 1.
+
+Returned bytes use lossy UTF-8 conversion. The `lossy_utf8` result field reports whether replacement characters were needed in the selected range.
+
+At most 256 KiB (`256 * 1024` raw logical-line bytes) is returned, and lines are never split. If the next complete line would exceed the limit after one or more lines have fitted, `status` is `truncated` and `next_start_line` identifies the first omitted line for a continuation call using the original `end_line`. If the first requested line itself exceeds the limit, the result has `status = line_too_long` and contains no partial text.
+
+#### Result shape
+
+`content` contains exactly one concise human-readable summary; it never contains file text. The complete typed result is present only in `structuredContent`, with these fields:
+
+* **`status`**: `completed`, `truncated`, `not_found`, `access_denied`, `not_a_file`, `read_failed`, or `line_too_long`.
+* **`error`**: Optional filesystem or operating-system detail for runtime failures.
+* **`path`**: Resolved absolute path.
+* **`requested_start_line`** / **`requested_end_line`**: Original validated range.
+* **`actual_start_line`** / **`actual_end_line`**: Returned inclusive range, or `null` when no line was returned.
+* **`text`**: Unnumbered selected file text, with logical lines joined by LF.
+* **`eof`**: Whether EOF was reached for a successful read; `null` for runtime failures.
+* **`next_start_line`**: Continuation line for `truncated`, otherwise `null`.
+* **`lossy_utf8`**: Whether returned bytes required lossy replacement.
+
+Valid requests return ordinary non-error MCP tool results even for structured filesystem failures. Invalid paths or line parameters return MCP invalid-parameter errors.
 
 ---
 
@@ -143,8 +183,9 @@ The suite covers:
 * Subprocess execution lifecycle, environment handling, working directories, and null stdin using a self-hosted Rust test helper subprocess.
 * Bounded timeout behaviours (`stop` and `detach`).
 * Cleanup, best-effort reaping, and classification policies.
+* Incremental `read_file` line selection, path handling, encoding, complete-line limits, continuation, response schemas, and GUI events.
 * A real MCP initialisation and tool-call sequence over an in-memory duplex connection.
-* Concurrency checks verifying that a long-running foreground `launch_process` call does not block other requests like `ping`.
+* Concurrency checks verifying that long-running process and file operations do not block other requests like `ping`.
 
 ## Testing with MCP Inspector
 
@@ -160,8 +201,8 @@ When you run this command:
 1. The Inspector web UI launches.
 2. The `Remote Control MCP` GUI window appears.
 3. The Inspector connects to the application over stdio.
-4. The Inspector UI shows both the `ping` and `launch_process` tools.
-5. You can invoke either tool and inspect outputs.
+4. The Inspector UI shows the `ping`, `launch_process`, and `read_file` tools.
+5. You can invoke any tool and inspect outputs.
 
 ### CLI Mode
 
@@ -179,10 +220,15 @@ npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.e
 
 **Call the `launch_process` tool:**
 ```powershell
-npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.exe --method tools/call --tool-name launch_process --arguments "{\"process_name\":\"whoami.exe\",\"environment\":{\"inherit\":true,\"variables\":{}},\"detached\":false}"
+npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.exe --method tools/call --tool-name launch_process --tool-arg process_name=whoami.exe --tool-arg 'environment={"inherit":true,"variables":{}}' --tool-arg detached=false
 ```
 
 This no-argument example is suitable for a typical Windows installation; executable availability differs between systems.
+
+**Call the `read_file` tool:**
+```powershell
+npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.exe --method tools/call --tool-name read_file --tool-arg path=RemoteControlMCP\example.stdout.log --tool-arg start_line=1 --tool-arg end_line=100
+```
 
 ## Connect to ChatGPT
 

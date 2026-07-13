@@ -35,6 +35,24 @@ fn event_description(kind: &UiEventKind) -> String {
         UiEventKind::LaunchProcessBackgroundError { pid, error } => {
             format!("Background process handling failed for PID {pid}: {error}")
         }
+        UiEventKind::ReadFileRequested {
+            path,
+            start_line,
+            end_line,
+        } => format!("Tool 'read_file' requested '{path}' lines {start_line}-{end_line}"),
+        UiEventKind::ReadFileResponded {
+            status,
+            actual_start_line,
+            actual_end_line,
+        } => match (actual_start_line, actual_end_line) {
+            (Some(start), Some(end)) => {
+                format!("Tool 'read_file' responded: {status:?} (lines {start}-{end})")
+            }
+            _ => format!("Tool 'read_file' responded: {status:?} (no lines returned)"),
+        },
+        UiEventKind::ReadFileRejected { error } => {
+            format!("Tool 'read_file' rejected: {error}")
+        }
         UiEventKind::ServerStopped => "MCP service stopped".to_string(),
         UiEventKind::ServerError { error } => format!("Fatal MCP error: {error}"),
     }
@@ -120,6 +138,7 @@ impl eframe::App for RemoteControlApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::ReadFileStatus;
 
     #[test]
     fn background_error_event_is_formatted_for_the_gui() {
@@ -154,5 +173,38 @@ mod tests {
             events.iter().next_back().unwrap().elapsed,
             Duration::from_secs(MAX_EVENTS as u64)
         );
+    }
+
+    #[test]
+    fn read_file_events_are_concise_and_never_include_file_text() {
+        let requested = event_description(&UiEventKind::ReadFileRequested {
+            path: r"T:\Temp\example.rs".to_string(),
+            start_line: 20,
+            end_line: 40,
+        });
+        let responded = event_description(&UiEventKind::ReadFileResponded {
+            status: ReadFileStatus::Completed,
+            actual_start_line: Some(20),
+            actual_end_line: Some(31),
+        });
+        let rejected = event_description(&UiEventKind::ReadFileRejected {
+            error: "start_line must be at least 1".to_string(),
+        });
+
+        assert_eq!(
+            requested,
+            r"Tool 'read_file' requested 'T:\Temp\example.rs' lines 20-40"
+        );
+        assert_eq!(
+            responded,
+            "Tool 'read_file' responded: Completed (lines 20-31)"
+        );
+        assert_eq!(
+            rejected,
+            "Tool 'read_file' rejected: start_line must be at least 1"
+        );
+        for description in [requested, responded, rejected] {
+            assert!(!description.contains("private file body"));
+        }
     }
 }

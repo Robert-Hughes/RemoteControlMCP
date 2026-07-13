@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 mod launch_process;
 mod ping;
+mod read_file;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +33,60 @@ pub struct LaunchProcessResult {
     pub stderr: Option<String>,
     pub stdout_file: Option<String>,
     pub stderr_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadFileStatus {
+    Completed,
+    Truncated,
+    NotFound,
+    AccessDenied,
+    NotAFile,
+    ReadFailed,
+    LineTooLong,
+}
+
+fn positive_integer_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": "integer", "minimum": 1 })
+}
+
+fn nullable_positive_integer_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "anyOf": [
+            { "type": "integer", "minimum": 1 },
+            { "type": "null" }
+        ]
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReadFileRequest {
+    pub path: String,
+    #[schemars(schema_with = "positive_integer_schema")]
+    pub start_line: u64,
+    #[schemars(schema_with = "positive_integer_schema")]
+    pub end_line: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReadFileResult {
+    pub status: ReadFileStatus,
+    pub error: Option<String>,
+    pub path: String,
+    #[schemars(schema_with = "positive_integer_schema")]
+    pub requested_start_line: u64,
+    #[schemars(schema_with = "positive_integer_schema")]
+    pub requested_end_line: u64,
+    #[schemars(schema_with = "nullable_positive_integer_schema")]
+    pub actual_start_line: Option<u64>,
+    #[schemars(schema_with = "nullable_positive_integer_schema")]
+    pub actual_end_line: Option<u64>,
+    pub text: String,
+    pub eof: Option<bool>,
+    #[schemars(schema_with = "nullable_positive_integer_schema")]
+    pub next_start_line: Option<u64>,
+    pub lossy_utf8: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -100,6 +155,19 @@ pub enum UiEventKind {
         pid: u32,
         error: String,
     },
+    ReadFileRequested {
+        path: String,
+        start_line: u64,
+        end_line: u64,
+    },
+    ReadFileResponded {
+        status: ReadFileStatus,
+        actual_start_line: Option<u64>,
+        actual_end_line: Option<u64>,
+    },
+    ReadFileRejected {
+        error: String,
+    },
     ServerStopped,
     ServerError {
         error: String,
@@ -154,6 +222,22 @@ impl McpServer {
         let _ = self.tx.send(event);
     }
 
+    fn structured_success<T: Serialize>(
+        summary: String,
+        value: &T,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let structured_content = rmcp::serde_json::to_value(value).map_err(|error| {
+            rmcp::ErrorData::internal_error(
+                format!("Failed to serialise tool structured content: {error}"),
+                None,
+            )
+        })?;
+        let mut result =
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(summary)]);
+        result.structured_content = Some(structured_content);
+        Ok(result)
+    }
+
     #[tool(
         description = "Check whether the local Remote Control MCP server is running and responding.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ping::PingResult>()
@@ -185,6 +269,8 @@ impl McpServer {
 
     #[tool(
         description = "Launch a local process on the host machine with optional working directory, arguments, environment configuration, timeout, and detachment options.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<LaunchProcessResult>()
+            .expect("LaunchProcessResult should generate a valid output schema"),
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -195,8 +281,26 @@ impl McpServer {
     async fn launch_process(
         &self,
         params: rmcp::handler::server::wrapper::Parameters<LaunchProcessRequest>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<LaunchProcessResult>, rmcp::ErrorData> {
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         self.launch_process_impl(params).await
+    }
+
+    #[tool(
+        description = "Read a 1-based inclusive line range from a local regular file.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ReadFileResult>()
+            .expect("ReadFileResult should generate a valid output schema"),
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn read_file(
+        &self,
+        params: rmcp::handler::server::wrapper::Parameters<ReadFileRequest>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        self.read_file_impl(params).await
     }
 }
 
