@@ -10,12 +10,24 @@ use crate::mcp::read_file::{
 use crate::mcp::{
     EnvironmentConfig, LaunchProcessRequest, LaunchProcessResult, LaunchProcessStatus, McpServer,
     ReadFileRequest, ReadFileResult, ReadFileStatus, RequestData, RequestId, RequestUpdate,
-    TimeoutAction, UiEventKind, run_mcp_server_loop, test_hooks,
+    TimeoutAction, UiEventKind, build_mcp_runtime, run_mcp_server_loop, test_hooks,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn mcp_runtime_supports_tokio_timers() {
+    let rt = build_mcp_runtime().expect("MCP runtime should build");
+
+    rt.block_on(async {
+        let result =
+            tokio::time::timeout(Duration::from_millis(1), std::future::pending::<()>()).await;
+
+        assert!(result.is_err(), "pending future should time out");
+    });
+}
 
 #[test]
 fn test_background_monitor_error_event() {

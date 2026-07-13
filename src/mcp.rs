@@ -377,8 +377,14 @@ impl McpServer {
 )]
 impl ServerHandler for McpServer {}
 
+fn build_mcp_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+}
+
 pub fn run_mcp_server(tx: Sender<UiEvent>, start_time: Instant) {
-    let rt = match tokio::runtime::Builder::new_current_thread().build() {
+    let rt = match build_mcp_runtime() {
         Ok(rt) => rt,
         Err(e) => {
             let _ = tx.send(UiEvent {
