@@ -399,22 +399,47 @@ fn request_summary_tooltip(request: &RequestEntry) -> Option<&str> {
     }
 }
 
-fn text_state_icon(state: RequestState) -> Option<&'static str> {
-    match state {
-        RequestState::InProgress | RequestState::Completed => None,
-        RequestState::Warning => Some("!"),
-        RequestState::Failed => Some("×"),
-        RequestState::Rejected => Some("⊘"),
-    }
-}
-
-fn paint_completed_icon(ui: &mut egui::Ui, colour: egui::Color32) {
+fn paint_state_icon(ui: &mut egui::Ui, state: RequestState, colour: egui::Color32) {
     let (response, painter) = ui.allocate_painter(egui::vec2(16.0, 16.0), egui::Sense::hover());
     let rect = response.rect.shrink(2.0);
     let stroke = egui::Stroke::new(2.0, colour);
-    let middle = egui::pos2(rect.left() + rect.width() * 0.4, rect.bottom());
-    painter.line_segment([egui::pos2(rect.left(), rect.center().y), middle], stroke);
-    painter.line_segment([middle, egui::pos2(rect.right(), rect.top())], stroke);
+
+    match state {
+        RequestState::Completed => {
+            let middle = egui::pos2(rect.left() + rect.width() * 0.4, rect.bottom());
+            painter.line_segment([egui::pos2(rect.left(), rect.center().y), middle], stroke);
+            painter.line_segment([middle, egui::pos2(rect.right(), rect.top())], stroke);
+        }
+        RequestState::Warning => {
+            let top = egui::pos2(rect.center().x, rect.top());
+            let left = egui::pos2(rect.left(), rect.bottom());
+            let right = egui::pos2(rect.right(), rect.bottom());
+            painter.line_segment([top, left], stroke);
+            painter.line_segment([left, right], stroke);
+            painter.line_segment([right, top], stroke);
+            painter.line_segment(
+                [
+                    egui::pos2(rect.center().x, rect.top() + 3.5),
+                    egui::pos2(rect.center().x, rect.bottom() - 4.0),
+                ],
+                stroke,
+            );
+            painter.circle_filled(
+                egui::pos2(rect.center().x, rect.bottom() - 1.5),
+                1.0,
+                colour,
+            );
+        }
+        RequestState::Failed => {
+            painter.line_segment([rect.left_top(), rect.right_bottom()], stroke);
+            painter.line_segment([rect.right_top(), rect.left_bottom()], stroke);
+        }
+        RequestState::Rejected => {
+            painter.circle_stroke(rect.center(), rect.width() / 2.0, stroke);
+            painter.line_segment([rect.left_bottom(), rect.right_top()], stroke);
+        }
+        RequestState::InProgress => {}
+    }
 }
 
 fn state_colour(ui: &egui::Ui, state: RequestState) -> egui::Color32 {
@@ -437,12 +462,10 @@ fn render_request_row(ui: &mut egui::Ui, request: &RequestEntry, current_elapsed
                         ui.add(egui::Spinner::new().size(14.0));
                     }
                     RequestState::Completed => {
-                        paint_completed_icon(ui, state_colour(ui, request.state));
+                        paint_state_icon(ui, request.state, state_colour(ui, request.state));
                     }
                     state => {
-                        if let Some(icon) = text_state_icon(state) {
-                            ui.colored_label(state_colour(ui, state), icon);
-                        }
+                        paint_state_icon(ui, state, state_colour(ui, state));
                     }
                 },
             );
