@@ -4,7 +4,8 @@ use crate::mcp::launch_process::{
 };
 use crate::mcp::ping::PingResult;
 use crate::mcp::read_file::{
-    install_blocking_test_hook, read_file_summary, validate_read_file_request,
+    install_blocking_test_hook, open_regular_file_with_metadata, read_file_summary,
+    validate_read_file_request,
 };
 use crate::mcp::{
     EnvironmentConfig, LaunchProcessRequest, LaunchProcessResult, LaunchProcessStatus, McpServer,
@@ -671,6 +672,27 @@ fn read_file_validates_ranges_and_ambiguous_windows_paths() {
 }
 
 #[test]
+fn read_file_range_validation_handles_u64_boundaries() {
+    let path = generate_temp_test_path("range_boundaries");
+
+    let excessive = make_read_file_request(&path, 1, u64::MAX);
+    let excessive_error = std::panic::catch_unwind(|| validate_read_file_request(&excessive))
+        .expect("u64::MAX range validation must not panic")
+        .unwrap_err();
+    assert!(excessive_error.contains("500"));
+
+    let exactly_500 = make_read_file_request(&path, 1, 500);
+    assert!(validate_read_file_request(&exactly_500).is_ok());
+
+    let lines_501 = make_read_file_request(&path, 1, 501);
+    let lines_501_error = validate_read_file_request(&lines_501).unwrap_err();
+    assert!(lines_501_error.contains("500"));
+
+    let high_single_line = make_read_file_request(&path, u64::MAX, u64::MAX);
+    assert!(validate_read_file_request(&high_single_line).is_ok());
+}
+
+#[test]
 fn read_file_returns_structured_filesystem_failures() {
     let missing_path = generate_temp_test_path("missing");
     let missing_call = call_read_file_direct(make_read_file_request(&missing_path, 1, 1)).0;
@@ -688,6 +710,40 @@ fn read_file_returns_structured_filesystem_failures() {
     assert_eq!(directory_result.status, ReadFileStatus::NotAFile);
     assert_eq!(directory_call.is_error, Some(false));
     assert!(directory_result.text.is_empty());
+    std::fs::remove_dir(directory).unwrap();
+}
+
+#[test]
+fn read_file_validates_metadata_from_the_opened_handle() {
+    let path = write_temp_test_file("opened_metadata", b"regular file\n");
+    let req = make_read_file_request(&path, 1, 1);
+
+    let file = open_regular_file_with_metadata(&req, &path, std::fs::File::metadata)
+        .expect("ordinary regular file should be accepted");
+    drop(file);
+
+    let metadata_failure = open_regular_file_with_metadata(&req, &path, |_| {
+        Err(std::io::Error::other(
+            "injected opened-handle metadata failure",
+        ))
+    })
+    .unwrap_err();
+    assert_eq!(metadata_failure.status, ReadFileStatus::ReadFailed);
+    assert!(
+        metadata_failure
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("injected opened-handle metadata failure"))
+    );
+
+    let directory = generate_temp_test_path("opened_metadata_directory");
+    std::fs::create_dir(&directory).unwrap();
+    let directory_metadata = std::fs::metadata(&directory).unwrap();
+    let swapped_object =
+        open_regular_file_with_metadata(&req, &path, move |_| Ok(directory_metadata)).unwrap_err();
+    assert_eq!(swapped_object.status, ReadFileStatus::NotAFile);
+
+    std::fs::remove_file(path).unwrap();
     std::fs::remove_dir(directory).unwrap();
 }
 
@@ -2626,7 +2682,7 @@ fn read_file_integration_test_over_duplex() {
     let truncated_path = write_temp_test_file("mcp_read_truncated", &truncation_bytes);
     let missing_path = generate_temp_test_path("mcp_read_missing");
 
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel();
     let (server_transport, client_transport) = tokio::io::duplex(1024 * 1024);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2772,22 +2828,43 @@ fn read_file_integration_test_over_duplex() {
             ReadFileStatus::NotFound
         );
 
+        while rx.try_recv().is_ok() {}
+
+        let excessive_arguments = rmcp::serde_json::json!({
+            "path": relative_path.to_string_lossy(),
+            "start_line": 1,
+            "end_line": u64::MAX
+        });
+        assert_eq!(excessive_arguments["end_line"].as_u64(), Some(u64::MAX));
+        let deserialised: ReadFileRequest =
+            rmcp::serde_json::from_value(excessive_arguments.clone()).unwrap();
+        assert_eq!(deserialised.end_line, u64::MAX);
+
         let mut invalid_params = rmcp::model::CallToolRequestParams::new("read_file");
-        invalid_params.arguments = Some(
-            rmcp::serde_json::json!({
-                "path": relative_path.to_string_lossy(),
-                "start_line": 3,
-                "end_line": 2
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        );
+        invalid_params.arguments = Some(excessive_arguments.as_object().unwrap().clone());
         let invalid_error = client.call_tool(invalid_params).await.unwrap_err();
-        assert!(matches!(
-            invalid_error,
-            rmcp::ServiceError::McpError(ref error) if error.code.0 == -32602
-        ));
+        let rmcp::ServiceError::McpError(error) = invalid_error else {
+            panic!("expected MCP invalid-parameter error");
+        };
+        assert_eq!(error.code.0, -32602);
+        assert!(error.message.contains("500"));
+
+        let ping = client
+            .call_tool(rmcp::model::CallToolRequestParams::new("ping"))
+            .await
+            .expect("ping should remain responsive after rejected u64::MAX range");
+        assert_eq!(only_text_content(&ping), "pong");
+
+        let events: Vec<_> = rx.try_iter().map(|event| event.kind).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            UiEventKind::ReadFileRejected { error } if error.contains("500")
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, UiEventKind::ReadFileRequested { .. }))
+        );
 
         client.close().await.expect("close client");
         server_task.await.expect("server task");

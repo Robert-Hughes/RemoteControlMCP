@@ -24,7 +24,7 @@ pub(crate) fn validate_read_file_request(req: &ReadFileRequest) -> Result<PathBu
     if req.start_line > req.end_line {
         return Err("start_line must be less than or equal to end_line".to_string());
     }
-    if req.end_line - req.start_line + 1 > MAX_REQUESTED_LINES {
+    if req.end_line - req.start_line >= MAX_REQUESTED_LINES {
         return Err(format!(
             "requested line range cannot exceed {MAX_REQUESTED_LINES} lines"
         ));
@@ -167,26 +167,53 @@ fn read_line_bounded(
     }
 }
 
+pub(crate) fn open_regular_file_with_metadata(
+    req: &ReadFileRequest,
+    path: &Path,
+    opened_metadata: impl FnOnce(&std::fs::File) -> std::io::Result<std::fs::Metadata>,
+) -> Result<std::fs::File, Box<ReadFileResult>> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => return Err(Box::new(io_failure(req, path, error))),
+    };
+    if !metadata.is_file() {
+        return Err(Box::new(failure_result(
+            req,
+            path,
+            ReadFileStatus::NotAFile,
+            "The resolved path is not a regular file",
+        )));
+    }
+
+    // The pathname check gives useful early classification, while metadata from
+    // the opened handle prevents reading a different non-file swapped in before open.
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return Err(Box::new(io_failure(req, path, error))),
+    };
+    let metadata = match opened_metadata(&file) {
+        Ok(metadata) => metadata,
+        Err(error) => return Err(Box::new(io_failure(req, path, error))),
+    };
+    if !metadata.is_file() {
+        return Err(Box::new(failure_result(
+            req,
+            path,
+            ReadFileStatus::NotAFile,
+            "The opened path is not a regular file",
+        )));
+    }
+
+    Ok(file)
+}
+
 fn read_file_blocking(req: ReadFileRequest, path: PathBuf) -> ReadFileResult {
     #[cfg(test)]
     test_hooks::wait_if_installed(&path);
 
-    let metadata = match std::fs::metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) => return io_failure(&req, &path, error),
-    };
-    if !metadata.is_file() {
-        return failure_result(
-            &req,
-            &path,
-            ReadFileStatus::NotAFile,
-            "The resolved path is not a regular file",
-        );
-    }
-
-    let file = match std::fs::File::open(&path) {
+    let file = match open_regular_file_with_metadata(&req, &path, std::fs::File::metadata) {
         Ok(file) => file,
-        Err(error) => return io_failure(&req, &path, error),
+        Err(result) => return *result,
     };
     let mut reader = std::io::BufReader::new(file);
     let mut line_number = 1_u64;
