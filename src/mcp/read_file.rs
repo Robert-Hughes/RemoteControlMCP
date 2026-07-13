@@ -1,4 +1,6 @@
-use crate::mcp::{McpServer, ReadFileRequest, ReadFileResult, ReadFileStatus, UiEventKind};
+use crate::mcp::{
+    McpServer, ReadFileRequest, ReadFileResult, ReadFileStatus, RequestData, RequestUpdate,
+};
 use std::io::BufRead;
 use std::path::{Component, Path, PathBuf};
 
@@ -379,21 +381,23 @@ impl McpServer {
         params: rmcp::handler::server::wrapper::Parameters<ReadFileRequest>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let req = params.0;
-        let path = match validate_read_file_request(&req) {
-            Ok(path) => path,
-            Err(error) => {
-                self.send_event(UiEventKind::ReadFileRejected {
-                    error: error.clone(),
-                });
-                return Err(rmcp::ErrorData::invalid_params(error, None));
-            }
-        };
-
-        self.send_event(UiEventKind::ReadFileRequested {
+        let id = self.start_request(RequestData::ReadFile {
             path: req.path.clone(),
             start_line: req.start_line,
             end_line: req.end_line,
         });
+        let path = match validate_read_file_request(&req) {
+            Ok(path) => path,
+            Err(error) => {
+                self.update_request(
+                    id,
+                    RequestUpdate::Rejected {
+                        error: error.clone(),
+                    },
+                );
+                return Err(rmcp::ErrorData::invalid_params(error, None));
+            }
+        };
 
         let fallback_req = req.clone();
         let fallback_path = path.clone();
@@ -408,14 +412,17 @@ impl McpServer {
             ),
         };
 
-        self.send_event(UiEventKind::ReadFileResponded {
+        let update = RequestUpdate::ReadFileResponded {
             status: result.status,
+            error: result.error.clone(),
             actual_start_line: result.actual_start_line,
             actual_end_line: result.actual_end_line,
-        });
+            next_start_line: result.next_start_line,
+            eof: result.eof,
+        };
 
         let summary = read_file_summary(&result);
-        Self::structured_success(summary, &result)
+        self.finish_structured_request(id, summary, &result, update)
     }
 }
 

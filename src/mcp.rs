@@ -2,6 +2,8 @@ use rmcp::{ServerHandler, handler::server::tool::ToolRouter, tool, tool_handler,
 use rmcp::{schemars, serde};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -133,40 +135,72 @@ pub struct LaunchProcessRequest {
     pub timeout_action: Option<TimeoutAction>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestId(pub(crate) u64);
+
+impl RequestId {
+    #[cfg(test)]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UiEventKind {
-    WorkerStarted,
-    ServerStarting,
-    WaitingForClient,
-    ClientConnected,
-    PingRequested,
-    PingResponded,
-    LaunchProcessRequested {
+pub enum RequestData {
+    Ping,
+    LaunchProcess {
         process_name: String,
     },
+    ReadFile {
+        path: String,
+        start_line: u64,
+        end_line: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestUpdate {
+    PingCompleted,
     LaunchProcessResponded {
         status: LaunchProcessStatus,
+        error: Option<String>,
         pid: Option<u32>,
+        exit_code: Option<i32>,
     },
-    LaunchProcessRejected {
+    ReadFileResponded {
+        status: ReadFileStatus,
+        error: Option<String>,
+        actual_start_line: Option<u64>,
+        actual_end_line: Option<u64>,
+        next_start_line: Option<u64>,
+        eof: Option<bool>,
+    },
+    Rejected {
+        error: String,
+    },
+    InternalFailure {
         error: String,
     },
     LaunchProcessBackgroundError {
         pid: u32,
         error: String,
     },
-    ReadFileRequested {
-        path: String,
-        start_line: u64,
-        end_line: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiEventKind {
+    WorkerStarted,
+    ServerStarting,
+    WaitingForClient,
+    ClientConnected,
+    RequestStarted {
+        id: RequestId,
+        request: RequestData,
+        started_at: chrono::DateTime<chrono::Local>,
     },
-    ReadFileResponded {
-        status: ReadFileStatus,
-        actual_start_line: Option<u64>,
-        actual_end_line: Option<u64>,
-    },
-    ReadFileRejected {
-        error: String,
+    RequestUpdated {
+        id: RequestId,
+        update: RequestUpdate,
     },
     ServerStopped,
     ServerError {
@@ -184,6 +218,7 @@ pub struct UiEvent {
 pub struct McpServer {
     tx: Sender<UiEvent>,
     start_time: Instant,
+    next_request_id: Arc<AtomicU64>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -210,6 +245,7 @@ impl McpServer {
         Self {
             tx,
             start_time,
+            next_request_id: Arc::new(AtomicU64::new(1)),
             tool_router: Self::tool_router(),
         }
     }
@@ -220,6 +256,20 @@ impl McpServer {
             kind,
         };
         let _ = self.tx.send(event);
+    }
+
+    fn start_request(&self, request: RequestData) -> RequestId {
+        let id = RequestId(self.next_request_id.fetch_add(1, Ordering::Relaxed));
+        self.send_event(UiEventKind::RequestStarted {
+            id,
+            request,
+            started_at: chrono::Local::now(),
+        });
+        id
+    }
+
+    fn update_request(&self, id: RequestId, update: RequestUpdate) {
+        self.send_event(UiEventKind::RequestUpdated { id, update });
     }
 
     fn structured_success<T: Serialize>(
@@ -238,6 +288,30 @@ impl McpServer {
         Ok(result)
     }
 
+    fn finish_structured_request<T: Serialize>(
+        &self,
+        id: RequestId,
+        summary: String,
+        value: &T,
+        update: RequestUpdate,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        match Self::structured_success(summary, value) {
+            Ok(result) => {
+                self.update_request(id, update);
+                Ok(result)
+            }
+            Err(error) => {
+                self.update_request(
+                    id,
+                    RequestUpdate::InternalFailure {
+                        error: error.message.to_string(),
+                    },
+                );
+                Err(error)
+            }
+        }
+    }
+
     #[tool(
         description = "Check whether the local Remote Control MCP server is running and responding.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ping::PingResult>()
@@ -250,21 +324,12 @@ impl McpServer {
         )
     )]
     async fn ping(&self) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let id = self.start_request(RequestData::Ping);
         let message = self.ping_impl().await;
-        let structured_content = rmcp::serde_json::to_value(ping::PingResult {
+        let result = ping::PingResult {
             message: message.clone(),
-        })
-        .map_err(|error| {
-            rmcp::ErrorData::internal_error(
-                format!("Failed to serialise ping structured content: {error}"),
-                None,
-            )
-        })?;
-
-        let mut result =
-            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(message)]);
-        result.structured_content = Some(structured_content);
-        Ok(result)
+        };
+        self.finish_structured_request(id, message, &result, RequestUpdate::PingCompleted)
     }
 
     #[tool(

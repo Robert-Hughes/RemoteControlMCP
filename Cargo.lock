@@ -1997,6 +1997,7 @@ dependencies = [
 name = "remote-control-mcp"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "eframe",
  "rmcp",
  "schemars",

@@ -24,6 +24,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Remote Control MCP",
         options,
-        Box::new(move |_cc| Ok(Box::new(app::RemoteControlApp::new(rx)))),
+        Box::new(move |_cc| Ok(Box::new(app::RemoteControlApp::new(rx, start_time)))),
     )
 }

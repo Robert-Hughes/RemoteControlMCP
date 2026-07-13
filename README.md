@@ -5,7 +5,7 @@ A lightweight, Windows GUI application that also acts as a Model Context Protoco
 ## Architecture
 
 This application uses a multi-threaded architecture to separate the user interface from the MCP communication protocol:
-* **Main Thread:** Runs an `egui`/`eframe` native Windows GUI that displays application state and a scrolling activity log of events.
+* **Main Thread:** Runs an `egui`/`eframe` native Windows GUI that displays server state and a scrolling list of tool requests.
 * **Background Thread:** Spawns a dedicated Tokio runtime and runs the `rmcp` MCP server over `stdin`/`stdout`.
 * **Communication:** The background worker sends structured events to the UI thread using a standard library channel (`std::sync::mpsc::channel`).
 
@@ -20,6 +20,14 @@ Rust MCP worker thread
     ▼
 egui main thread
 ```
+
+## GUI request list
+
+The server lifecycle remains in the status area at the top of the window. A fatal server error is shown separately and is never represented as a tool request.
+
+Every invocation that reaches a typed tool handler creates one request row. Rows are ordered by request start and displayed newest-first; subsequent completion, warning, failure, rejection, or background-error events update the originating row in place without moving it. Each row includes a state icon and readable state text, the tool name, a privacy-conscious request summary, the local start time in `DD/MM/YYYY HH:MM:SS` format, and a live or frozen elapsed duration. Detached-process background handling failures update their original `launch_process` row.
+
+The GUI retains at most 500 requests under normal conditions, pruning the oldest finished request first. In-progress requests are never removed to enforce that limit, so the list may temporarily exceed 500 while more than 500 calls overlap. Protocol requests rejected by `rmcp` before typed-handler entry, such as malformed JSON or schema-invalid arguments, cannot receive an application request ID and may not appear in this first version.
 
 ## Critical Stdout Rule
 
@@ -179,7 +187,7 @@ cargo test
 The suite covers:
 * Direct tool behaviour of the `ping` method.
 * Correct tool metadata exposure.
-* UI event emission and ordering.
+* Correlated request lifecycle emission, update-in-place GUI state, ordering, retention, timestamps, durations, and privacy boundaries.
 * Subprocess execution lifecycle, environment handling, working directories, and null stdin using a self-hosted Rust test helper subprocess.
 * Bounded timeout behaviours (`stop` and `detach`).
 * Cleanup, best-effort reaping, and classification policies.

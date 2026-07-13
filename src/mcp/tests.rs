@@ -9,8 +9,8 @@ use crate::mcp::read_file::{
 };
 use crate::mcp::{
     EnvironmentConfig, LaunchProcessRequest, LaunchProcessResult, LaunchProcessStatus, McpServer,
-    ReadFileRequest, ReadFileResult, ReadFileStatus, TimeoutAction, UiEventKind,
-    run_mcp_server_loop, test_hooks,
+    ReadFileRequest, ReadFileResult, ReadFileStatus, RequestData, RequestId, RequestUpdate,
+    TimeoutAction, UiEventKind, run_mcp_server_loop, test_hooks,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -20,12 +20,20 @@ static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[test]
 fn test_background_monitor_error_event() {
     let (tx, rx) = std::sync::mpsc::channel();
-    report_background_error(&tx, Instant::now(), 42, "status check failed".to_string());
+    report_background_error(
+        &tx,
+        Instant::now(),
+        RequestId(7),
+        42,
+        "status check failed".to_string(),
+    );
     let event = rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(matches!(
         event.kind,
-        UiEventKind::LaunchProcessBackgroundError { pid: 42, ref error }
-            if error == "status check failed"
+        UiEventKind::RequestUpdated {
+            id: RequestId(7),
+            update: RequestUpdate::LaunchProcessBackgroundError { pid: 42, ref error },
+        } if error == "status check failed"
     ));
 }
 
@@ -39,6 +47,7 @@ fn test_successful_background_wait_notifies_without_error_event() {
         43,
         &event_tx,
         Instant::now(),
+        RequestId(8),
         "Detached reaper failed",
         move |pid| completion_tx.send(pid).unwrap(),
     );
@@ -60,15 +69,21 @@ fn test_failed_background_wait_reports_error_without_success_notification() {
         44,
         &event_tx,
         Instant::now(),
+        RequestId(9),
         "Timeout-detach reaper failed",
         move |pid| completion_tx.send(pid).unwrap(),
     );
 
     assert!(completion_rx.try_recv().is_err());
     let event = event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    let UiEventKind::LaunchProcessBackgroundError { pid, error } = event.kind else {
+    let UiEventKind::RequestUpdated {
+        id,
+        update: RequestUpdate::LaunchProcessBackgroundError { pid, error },
+    } = event.kind
+    else {
         panic!("expected background error event");
     };
+    assert_eq!(id, RequestId(9));
     assert_eq!(pid, 44);
     assert!(error.contains("Timeout-detach reaper failed"));
     assert!(!error.contains("PID 44"));
@@ -326,10 +341,92 @@ fn ping_emits_request_and_response_events() {
     let _result = rt.block_on(async { server.ping().await }).unwrap();
 
     let events: Vec<UiEventKind> = rx.try_iter().map(|e| e.kind).collect();
+    assert_eq!(events.len(), 2);
+    let UiEventKind::RequestStarted {
+        id,
+        request: RequestData::Ping,
+        ..
+    } = events[0]
+    else {
+        panic!("expected ping request start");
+    };
     assert_eq!(
-        events,
-        vec![UiEventKind::PingRequested, UiEventKind::PingResponded]
+        events[1],
+        UiEventKind::RequestUpdated {
+            id,
+            update: RequestUpdate::PingCompleted,
+        }
     );
+}
+
+#[test]
+fn request_ids_are_nonzero_shared_by_clones_and_unique_under_overlap() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    let first = server.start_request(RequestData::Ping);
+    let second = server.clone().start_request(RequestData::Ping);
+    assert_eq!(first.get(), 1);
+    assert_ne!(first, second);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let server = server.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            server.start_request(RequestData::Ping)
+        }));
+    }
+    barrier.wait();
+    let ids = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap().get())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids.len(), 8);
+    assert!(!ids.contains(&0));
+    assert_eq!(rx.try_iter().count(), 10);
+}
+
+#[test]
+fn response_serialisation_failure_emits_internal_failure_not_completion() {
+    struct FailingSerialize;
+
+    impl serde::Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("injected serialisation failure"))
+        }
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    let id = server.start_request(RequestData::Ping);
+    let result = server.finish_structured_request(
+        id,
+        "unused".to_string(),
+        &FailingSerialize,
+        RequestUpdate::PingCompleted,
+    );
+    assert!(result.is_err());
+    let events = rx.try_iter().map(|event| event.kind).collect::<Vec<_>>();
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        &events[1],
+        UiEventKind::RequestUpdated {
+            id: update_id,
+            update: RequestUpdate::InternalFailure { error },
+        } if *update_id == id && error.contains("injected serialisation failure")
+    ));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        UiEventKind::RequestUpdated {
+            update: RequestUpdate::PingCompleted,
+            ..
+        }
+    )));
 }
 
 fn launch_result_for_summary(
@@ -470,14 +567,31 @@ fn read_file_preserves_logical_lines_and_newline_semantics() {
     assert_eq!(call_result.is_error, Some(false));
     assert_eq!(only_text_content(&call_result), read_file_summary(&result));
     assert!(!only_text_content(&call_result).contains("third"));
-    assert!(matches!(events[0], UiEventKind::ReadFileRequested { .. }));
+    let UiEventKind::RequestStarted {
+        id,
+        request:
+            RequestData::ReadFile {
+                path: ref event_path,
+                start_line: 1,
+                end_line: 4,
+            },
+        ..
+    } = events[0]
+    else {
+        panic!("expected read_file request start");
+    };
+    assert_eq!(event_path, &path.to_string_lossy().into_owned());
     assert!(matches!(
         events[1],
-        UiEventKind::ReadFileResponded {
-            status: ReadFileStatus::Completed,
-            actual_start_line: Some(1),
-            actual_end_line: Some(4)
-        }
+        UiEventKind::RequestUpdated {
+            id: update_id,
+            update: RequestUpdate::ReadFileResponded {
+                status: ReadFileStatus::Completed,
+                actual_start_line: Some(1),
+                actual_end_line: Some(4),
+                ..
+            },
+        } if update_id == id
     ));
     assert!(!format!("{events:?}").contains("third"));
 
@@ -568,6 +682,40 @@ fn read_file_handles_eof_empty_files_unicode_and_lossy_utf8() {
     for path in [path, empty_path, unicode_path, invalid_path] {
         std::fs::remove_file(path).unwrap();
     }
+}
+
+#[test]
+fn empty_read_file_result_has_one_correlated_lifecycle_without_file_text() {
+    let path = write_temp_test_file("empty_lifecycle", b"");
+    let (call, events) = call_read_file_direct(make_read_file_request(&path, 1, 1));
+    let result = read_file_structured_result(&call);
+    assert_eq!(result.status, ReadFileStatus::Completed);
+    assert_eq!(result.actual_start_line, None);
+    assert_eq!(result.eof, Some(true));
+    assert_eq!(events.len(), 2);
+    let UiEventKind::RequestStarted {
+        id,
+        request: RequestData::ReadFile { .. },
+        ..
+    } = events[0]
+    else {
+        panic!("expected read_file start");
+    };
+    assert!(matches!(
+        events[1],
+        UiEventKind::RequestUpdated {
+            id: update_id,
+            update: RequestUpdate::ReadFileResponded {
+                status: ReadFileStatus::Completed,
+                actual_start_line: None,
+                actual_end_line: None,
+                eof: Some(true),
+                ..
+            },
+        } if update_id == id
+    ));
+    assert!(!format!("{events:?}").contains("private file body"));
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -665,9 +813,22 @@ fn read_file_validates_ranges_and_ambiguous_windows_paths() {
             .await
     });
     assert!(error.is_err());
+    let started = rx.try_recv().unwrap().kind;
+    let updated = rx.try_recv().unwrap().kind;
+    let UiEventKind::RequestStarted {
+        id,
+        request: RequestData::ReadFile { .. },
+        ..
+    } = started
+    else {
+        panic!("expected rejected read_file to start");
+    };
     assert!(matches!(
-        rx.try_recv().unwrap().kind,
-        UiEventKind::ReadFileRejected { .. }
+        updated,
+        UiEventKind::RequestUpdated {
+            id: update_id,
+            update: RequestUpdate::Rejected { .. },
+        } if update_id == id
     ));
 }
 
@@ -767,7 +928,8 @@ fn read_file_enforces_complete_line_byte_limit_and_continuation() {
     truncation_bytes.push(b'\n');
     truncation_bytes.extend_from_slice(b"third\n");
     let truncated_path = write_temp_test_file("truncated", &truncation_bytes);
-    let truncated_call = call_read_file_direct(make_read_file_request(&truncated_path, 1, 3)).0;
+    let (truncated_call, truncated_events) =
+        call_read_file_direct(make_read_file_request(&truncated_path, 1, 3));
     let truncated = read_file_structured_result(&truncated_call);
     assert_eq!(truncated.status, ReadFileStatus::Truncated);
     assert_eq!(truncated.actual_start_line, Some(1));
@@ -777,6 +939,27 @@ fn read_file_enforces_complete_line_byte_limit_and_continuation() {
     assert_eq!(truncated.text.len(), 200 * 1024);
     assert_eq!(truncated_call.is_error, Some(false));
     assert!(!only_text_content(&truncated_call).contains(&"c".repeat(100)));
+    assert!(matches!(
+        truncated_events.as_slice(),
+        [
+            UiEventKind::RequestStarted {
+                id,
+                request: RequestData::ReadFile { .. },
+                ..
+            },
+            UiEventKind::RequestUpdated {
+                id: update_id,
+                update: RequestUpdate::ReadFileResponded {
+                    status: ReadFileStatus::Truncated,
+                    actual_start_line: Some(1),
+                    actual_end_line: Some(1),
+                    next_start_line: Some(2),
+                    eof: Some(false),
+                    ..
+                },
+            },
+        ] if id == update_id
+    ));
 
     let continued = read_file_structured_result(
         &call_read_file_direct(make_read_file_request(&truncated_path, 2, 3)).0,
@@ -960,26 +1143,20 @@ fn ping_works_over_mcp_duplex_transport() {
 
     // 6. UI lifecycle and tool events
     let events: Vec<UiEventKind> = rx.try_iter().map(|e| e.kind).collect();
-    let expected_subsequence = &[
-        UiEventKind::ServerStarting,
-        UiEventKind::WaitingForClient,
-        UiEventKind::ClientConnected,
-        UiEventKind::PingRequested,
-        UiEventKind::PingResponded,
-    ];
-    let mut event_iter = events.iter();
-    for expected in expected_subsequence {
-        loop {
-            match event_iter.next() {
-                Some(e) if e == expected => break,
-                Some(_) => continue,
-                None => panic!(
-                    "Expected event sequence {:?} not found in actual events {:?}",
-                    expected_subsequence, events
-                ),
-            }
-        }
-    }
+    assert!(events.windows(2).any(|pair| matches!(
+        pair,
+        [
+            UiEventKind::RequestStarted {
+                id,
+                request: RequestData::Ping,
+                ..
+            },
+            UiEventKind::RequestUpdated {
+                id: update_id,
+                update: RequestUpdate::PingCompleted,
+            },
+        ] if id == update_id
+    )));
 
     assert!(
         !events
@@ -2068,26 +2245,27 @@ fn test_gui_events_launch_process() {
 
     let events: Vec<UiEventKind> = rx.try_iter().map(|e| e.kind).collect();
     assert_eq!(events.len(), 2);
-    assert!(matches!(
-        events[0],
-        UiEventKind::LaunchProcessRequested { .. }
-    ));
-    if let UiEventKind::LaunchProcessRequested { ref process_name } = events[0] {
-        assert_eq!(process_name, &make_helper_request().process_name);
-    } else {
-        panic!("Expected LaunchProcessRequested");
-    }
-
+    let UiEventKind::RequestStarted {
+        id,
+        request: RequestData::LaunchProcess { ref process_name },
+        ..
+    } = events[0]
+    else {
+        panic!("expected launch_process request start");
+    };
+    assert_eq!(process_name, &make_helper_request().process_name);
     assert!(matches!(
         events[1],
-        UiEventKind::LaunchProcessResponded { .. }
+        UiEventKind::RequestUpdated {
+            id: update_id,
+            update: RequestUpdate::LaunchProcessResponded {
+                status: LaunchProcessStatus::Completed,
+                pid,
+                exit_code: Some(0),
+                ..
+            },
+        } if update_id == id && pid == structured.pid
     ));
-    if let UiEventKind::LaunchProcessResponded { status, pid } = events[1] {
-        assert_eq!(status, LaunchProcessStatus::Completed);
-        assert_eq!(pid, structured.pid);
-    } else {
-        panic!("Expected LaunchProcessResponded");
-    }
 
     let (tx2, rx2) = std::sync::mpsc::channel();
     let server2 = McpServer::new(tx2, Instant::now());
@@ -2112,11 +2290,68 @@ fn test_gui_events_launch_process() {
 
     assert!(call_res.is_err());
     let events2: Vec<UiEventKind> = rx2.try_iter().map(|e| e.kind).collect();
-    assert_eq!(events2.len(), 1);
+    assert_eq!(events2.len(), 2);
+    let UiEventKind::RequestStarted {
+        id: rejected_id,
+        request: RequestData::LaunchProcess { .. },
+        ..
+    } = events2[0]
+    else {
+        panic!("expected rejected launch_process to start");
+    };
     assert!(matches!(
-        events2[0],
-        UiEventKind::LaunchProcessRejected { .. }
+        events2[1],
+        UiEventKind::RequestUpdated {
+            id,
+            update: RequestUpdate::Rejected { .. },
+        } if id == rejected_id
     ));
+}
+
+#[test]
+fn launch_process_events_exclude_arguments_environment_and_output() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    let mut variables = std::collections::HashMap::new();
+    variables.insert(
+        "SECRET_ENV_NAME".to_string(),
+        Some("secret value".to_string()),
+    );
+    let request = LaunchProcessRequest {
+        working_directory: None,
+        process_name: "safe-process-name".to_string(),
+        #[cfg(target_os = "windows")]
+        arguments: Some("secret argument".to_string()),
+        #[cfg(not(target_os = "windows"))]
+        arguments: Some(vec!["secret argument".to_string()]),
+        environment: EnvironmentConfig {
+            inherit: true,
+            variables,
+        },
+        detached: false,
+        timeout_ms: Some(1),
+        timeout_action: None,
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    assert!(
+        rt.block_on(server.launch_process(rmcp::handler::server::wrapper::Parameters(request)))
+            .is_err()
+    );
+    let events = rx.try_iter().map(|event| event.kind).collect::<Vec<_>>();
+    assert_eq!(events.len(), 2);
+    let debug = format!("{events:?}");
+    assert!(debug.contains("safe-process-name"));
+    for sensitive in [
+        "secret argument",
+        "SECRET_ENV_NAME",
+        "secret value",
+        "private stdout",
+        "private stderr",
+    ] {
+        assert!(!debug.contains(sensitive));
+    }
 }
 
 #[test]
@@ -2440,52 +2675,55 @@ fn launch_process_integration_test_over_duplex() {
         std::env::remove_var(inherited_name);
     }
 
-    // 7. Verify GUI event subsequence
+    // 7. Verify correlated GUI request lifecycles.
     let events: Vec<UiEventKind> = rx.try_iter().map(|e| e.kind).collect();
-    let expected_subsequence = &[
-        UiEventKind::ServerStarting,
-        UiEventKind::WaitingForClient,
-        UiEventKind::ClientConnected,
-        UiEventKind::LaunchProcessRequested {
-            process_name: make_helper_request().process_name,
-        },
-        UiEventKind::LaunchProcessResponded {
-            status: LaunchProcessStatus::Completed,
-            pid: None,
-        },
-        UiEventKind::LaunchProcessRejected {
-            error: "timeout_ms requires timeout_action".to_string(),
-        },
-        UiEventKind::PingRequested,
-        UiEventKind::PingResponded,
-        UiEventKind::ServerStopped,
-    ];
-
-    let mut event_iter = events.iter();
-    for expected in expected_subsequence {
-        loop {
-            match (event_iter.next(), expected) {
-                (
-                    Some(UiEventKind::LaunchProcessRequested { .. }),
-                    UiEventKind::LaunchProcessRequested { .. },
-                ) => break,
-                (
-                    Some(UiEventKind::LaunchProcessResponded { status: s1, .. }),
-                    UiEventKind::LaunchProcessResponded { status: s2, .. },
-                ) if s1 == s2 => break,
-                (
-                    Some(UiEventKind::LaunchProcessRejected { .. }),
-                    UiEventKind::LaunchProcessRejected { .. },
-                ) => break,
-                (Some(e), exp) if e == exp => break,
-                (Some(_), _) => continue,
-                (None, exp) => panic!(
-                    "Expected event {:?} not found in actual events {:?}",
-                    exp, events
-                ),
-            }
-        }
-    }
+    assert!(events.windows(2).any(|pair| matches!(
+        pair,
+        [
+            UiEventKind::RequestStarted {
+                id,
+                request: RequestData::LaunchProcess { .. },
+                ..
+            },
+            UiEventKind::RequestUpdated {
+                id: update_id,
+                update: RequestUpdate::LaunchProcessResponded {
+                    status: LaunchProcessStatus::Completed,
+                    exit_code: Some(0),
+                    ..
+                },
+            },
+        ] if id == update_id
+    )));
+    assert!(events.windows(2).any(|pair| matches!(
+        pair,
+        [
+            UiEventKind::RequestStarted {
+                id,
+                request: RequestData::LaunchProcess { .. },
+                ..
+            },
+            UiEventKind::RequestUpdated {
+                id: update_id,
+                update: RequestUpdate::Rejected { error },
+            },
+        ] if id == update_id && error == "timeout_ms requires timeout_action"
+    )));
+    assert!(events.windows(2).any(|pair| matches!(
+        pair,
+        [
+            UiEventKind::RequestStarted {
+                id,
+                request: RequestData::Ping,
+                ..
+            },
+            UiEventKind::RequestUpdated {
+                id: update_id,
+                update: RequestUpdate::PingCompleted,
+            },
+        ] if id == update_id
+    )));
+    assert!(matches!(events.last(), Some(UiEventKind::ServerStopped)));
 }
 
 #[test]
@@ -2495,7 +2733,7 @@ fn launch_process_mcp_summaries_cover_nonzero_detach_timeouts_and_failure() {
         Err(error) => error.into_inner(),
     };
     let helper = make_helper_request().process_name;
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel();
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2665,6 +2903,49 @@ fn launch_process_mcp_summaries_cover_nonzero_detach_timeouts_and_failure() {
         client.close().await.expect("close client");
         server_task.await.expect("server task");
     });
+
+    let events = rx.try_iter().map(|event| event.kind).collect::<Vec<_>>();
+    for status in [
+        LaunchProcessStatus::Completed,
+        LaunchProcessStatus::Detached,
+        LaunchProcessStatus::TimedOutDetached,
+        LaunchProcessStatus::TimedOutStopped,
+        LaunchProcessStatus::LaunchProcessFailed,
+    ] {
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                UiEventKind::RequestUpdated {
+                    update: RequestUpdate::LaunchProcessResponded {
+                        status: event_status,
+                        ..
+                    },
+                    ..
+                } if *event_status == status
+            )),
+            "missing GUI update for {status:?}: {events:?}"
+        );
+    }
+    assert!(events.iter().any(|event| matches!(
+        event,
+        UiEventKind::RequestUpdated {
+            update: RequestUpdate::LaunchProcessResponded {
+                status: LaunchProcessStatus::Completed,
+                exit_code: Some(7),
+                ..
+            },
+            ..
+        }
+    )));
+
+    for (index, event) in events.iter().enumerate() {
+        if let UiEventKind::RequestUpdated { id, .. } = event {
+            assert!(events[..index].iter().any(|prior| matches!(
+                prior,
+                UiEventKind::RequestStarted { id: started_id, .. } if started_id == id
+            )));
+        }
+    }
 }
 
 #[test]
@@ -2828,8 +3109,6 @@ fn read_file_integration_test_over_duplex() {
             ReadFileStatus::NotFound
         );
 
-        while rx.try_recv().is_ok() {}
-
         let excessive_arguments = rmcp::serde_json::json!({
             "path": relative_path.to_string_lossy(),
             "start_line": 1,
@@ -2856,15 +3135,42 @@ fn read_file_integration_test_over_duplex() {
         assert_eq!(only_text_content(&ping), "pong");
 
         let events: Vec<_> = rx.try_iter().map(|event| event.kind).collect();
+        let rejected_id = events.iter().find_map(|event| match event {
+            UiEventKind::RequestUpdated {
+                id,
+                update: RequestUpdate::Rejected { error },
+            } if error.contains("500") => Some(*id),
+            _ => None,
+        });
+        let rejected_id = rejected_id.expect("expected rejected read_file update");
         assert!(events.iter().any(|event| matches!(
             event,
-            UiEventKind::ReadFileRejected { error } if error.contains("500")
+            UiEventKind::RequestStarted {
+                id,
+                request: RequestData::ReadFile { .. },
+                ..
+            } if *id == rejected_id
         )));
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, UiEventKind::ReadFileRequested { .. }))
-        );
+        for status in [
+            ReadFileStatus::Completed,
+            ReadFileStatus::Truncated,
+            ReadFileStatus::NotFound,
+        ] {
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    UiEventKind::RequestUpdated {
+                        update: RequestUpdate::ReadFileResponded {
+                            status: event_status,
+                            ..
+                        },
+                        ..
+                    } if *event_status == status
+                )),
+                "missing read_file GUI update for {status:?}: {events:?}"
+            );
+        }
+        assert!(!format!("{events:?}").contains("beta\ngamma"));
 
         client.close().await.expect("close client");
         server_task.await.expect("server task");

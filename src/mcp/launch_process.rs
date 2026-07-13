@@ -1,6 +1,6 @@
 use crate::mcp::{
-    LaunchProcessRequest, LaunchProcessResult, LaunchProcessStatus, McpServer, TimeoutAction,
-    UiEvent, UiEventKind,
+    LaunchProcessRequest, LaunchProcessResult, LaunchProcessStatus, McpServer, RequestData,
+    RequestId, RequestUpdate, TimeoutAction, UiEvent, UiEventKind,
 };
 use std::sync::mpsc::Sender;
 use std::time::Instant;
@@ -220,13 +220,17 @@ pub(crate) enum MonitorOutcome {
 pub(crate) fn report_background_error(
     tx: &Sender<UiEvent>,
     start_time: Instant,
+    request_id: RequestId,
     pid: u32,
     error: String,
 ) {
     eprintln!("Background process handling failed for PID {pid}: {error}");
     let _ = tx.send(UiEvent {
         elapsed: start_time.elapsed(),
-        kind: UiEventKind::LaunchProcessBackgroundError { pid, error },
+        kind: UiEventKind::RequestUpdated {
+            id: request_id,
+            update: RequestUpdate::LaunchProcessBackgroundError { pid, error },
+        },
     });
 }
 
@@ -235,14 +239,23 @@ fn handle_background_wait_result(
     pid: u32,
     tx: &Sender<UiEvent>,
     start_time: Instant,
+    request_id: RequestId,
     context: &str,
 ) {
-    handle_background_wait_result_with_notifier(wait_result, pid, tx, start_time, context, |pid| {
-        #[cfg(test)]
-        test_hooks::notify_completion(pid);
-        #[cfg(not(test))]
-        let _ = pid;
-    });
+    handle_background_wait_result_with_notifier(
+        wait_result,
+        pid,
+        tx,
+        start_time,
+        request_id,
+        context,
+        |pid| {
+            #[cfg(test)]
+            test_hooks::notify_completion(pid);
+            #[cfg(not(test))]
+            let _ = pid;
+        },
+    );
 }
 
 pub(crate) fn handle_background_wait_result_with_notifier<F>(
@@ -250,6 +263,7 @@ pub(crate) fn handle_background_wait_result_with_notifier<F>(
     pid: u32,
     tx: &Sender<UiEvent>,
     start_time: Instant,
+    request_id: RequestId,
     context: &str,
     notify_success: F,
 ) where
@@ -261,6 +275,7 @@ pub(crate) fn handle_background_wait_result_with_notifier<F>(
         Err(error) => report_background_error(
             tx,
             start_time,
+            request_id,
             pid,
             format!(
                 "{context}: {error}. Successful reaping could not be confirmed; the process may remain running or unreaped"
@@ -274,6 +289,7 @@ fn spawn_background_reaper(
     pid: u32,
     tx: Sender<UiEvent>,
     start_time: Instant,
+    request_id: RequestId,
     thread_name: String,
     context: &'static str,
 ) -> std::io::Result<()> {
@@ -286,7 +302,14 @@ fn spawn_background_reaper(
                 .take();
             if let Some(mut child) = child {
                 let wait_result = child.wait();
-                handle_background_wait_result(wait_result, pid, &tx, start_time, context);
+                handle_background_wait_result(
+                    wait_result,
+                    pid,
+                    &tx,
+                    start_time,
+                    request_id,
+                    context,
+                );
             }
         })
         .map(|_| ())
@@ -296,6 +319,7 @@ fn spawn_background_reaper(
 struct BackgroundContext<'a> {
     tx: &'a Sender<UiEvent>,
     start_time: Instant,
+    request_id: RequestId,
 }
 
 pub(crate) fn perform_cleanup<C, F>(
@@ -524,6 +548,7 @@ fn cleanup_child(
 ) {
     let tx = background.tx.clone();
     let start_time = background.start_time;
+    let request_id = background.request_id;
     let (status, err, exit_code, stdout, stderr, _outcome) = perform_cleanup(
         child,
         pid,
@@ -537,6 +562,7 @@ fn cleanup_child(
                 pid,
                 tx,
                 start_time,
+                request_id,
                 format!("mcp-reaper-cleanup-{pid}"),
                 "Cleanup reaper failed",
             )
@@ -558,34 +584,47 @@ impl McpServer {
         params: rmcp::handler::server::wrapper::Parameters<LaunchProcessRequest>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let req = params.0;
-
-        if let Err(err_msg) = validate_request(&req) {
-            self.send_event(UiEventKind::LaunchProcessRejected {
-                error: err_msg.clone(),
-            });
-            return Err(rmcp::ErrorData::invalid_params(err_msg, None));
-        }
-
-        self.send_event(UiEventKind::LaunchProcessRequested {
+        let id = self.start_request(RequestData::LaunchProcess {
             process_name: req.process_name.clone(),
         });
 
-        let result = self.execute_launch_process(req).await;
+        if let Err(err_msg) = validate_request(&req) {
+            self.update_request(
+                id,
+                RequestUpdate::Rejected {
+                    error: err_msg.clone(),
+                },
+            );
+            return Err(rmcp::ErrorData::invalid_params(err_msg, None));
+        }
 
-        self.send_event(UiEventKind::LaunchProcessResponded {
+        let result = self.execute_launch_process_for_request(req, id).await;
+        let update = RequestUpdate::LaunchProcessResponded {
             status: result.status,
+            error: result.error.clone(),
             pid: result.pid,
-        });
+            exit_code: result.exit_code,
+        };
 
         let summary = launch_process_summary(&result);
-        Self::structured_success(summary, &result)
+        self.finish_structured_request(id, summary, &result, update)
     }
 
+    #[cfg(test)]
     pub async fn execute_launch_process(&self, req: LaunchProcessRequest) -> LaunchProcessResult {
+        self.execute_launch_process_for_request(req, RequestId(0))
+            .await
+    }
+
+    async fn execute_launch_process_for_request(
+        &self,
+        req: LaunchProcessRequest,
+        request_id: RequestId,
+    ) -> LaunchProcessResult {
         let tx = self.tx.clone();
         let start_time = self.start_time;
         let join_handle = tokio::task::spawn_blocking(move || {
-            execute_launch_process_blocking(req, tx, start_time)
+            execute_launch_process_blocking(req, tx, start_time, request_id)
         });
         match join_handle.await {
             Ok(res) => res,
@@ -652,6 +691,7 @@ fn execute_launch_process_blocking(
     req: LaunchProcessRequest,
     tx: Sender<UiEvent>,
     start_time: Instant,
+    request_id: RequestId,
 ) -> LaunchProcessResult {
     let (stdout_file, stderr_file, stdout_path, stderr_path) = match generate_output_files() {
         Ok(files) => files,
@@ -738,6 +778,7 @@ fn execute_launch_process_blocking(
                 pid,
                 tx.clone(),
                 start_time,
+                request_id,
                 format!("mcp-reaper-{pid}"),
                 "Detached reaper failed",
             );
@@ -768,6 +809,7 @@ fn execute_launch_process_blocking(
                             BackgroundContext {
                                 tx: &tx,
                                 start_time,
+                                request_id,
                             },
                         )
                     } else {
@@ -848,6 +890,7 @@ fn execute_launch_process_blocking(
                                     BackgroundContext {
                                         tx: &tx_clone,
                                         start_time,
+                                        request_id,
                                     },
                                 );
                                 if !matches!(
@@ -859,7 +902,9 @@ fn execute_launch_process_blocking(
                                         "Detached timeout cleanup failed without further details"
                                             .to_string()
                                     });
-                                    report_background_error(&tx_clone, start_time, pid, error);
+                                    report_background_error(
+                                        &tx_clone, start_time, request_id, pid, error,
+                                    );
                                 }
                             }
                             MonitorOutcome::WaitFailed(ref e) => {
@@ -877,10 +922,13 @@ fn execute_launch_process_blocking(
                                     BackgroundContext {
                                         tx: &tx_clone,
                                         start_time,
+                                        request_id,
                                     },
                                 );
                                 let error = cleanup_error.unwrap_or(original_error);
-                                report_background_error(&tx_clone, start_time, pid, error);
+                                report_background_error(
+                                    &tx_clone, start_time, request_id, pid, error,
+                                );
                             }
                         }
                     }
@@ -912,6 +960,7 @@ fn execute_launch_process_blocking(
                             BackgroundContext {
                                 tx: &tx,
                                 start_time,
+                                request_id,
                             },
                         )
                     } else {
@@ -973,6 +1022,7 @@ fn execute_launch_process_blocking(
                                         BackgroundContext {
                                             tx: &tx,
                                             start_time,
+                                            request_id,
                                         },
                                     )
                                 } else {
@@ -1023,6 +1073,7 @@ fn execute_launch_process_blocking(
                     pid,
                     tx.clone(),
                     start_time,
+                    request_id,
                     format!("mcp-reaper-{pid}"),
                     "Timeout-detach reaper failed",
                 );
@@ -1055,6 +1106,7 @@ fn execute_launch_process_blocking(
                                 BackgroundContext {
                                     tx: &tx,
                                     start_time,
+                                    request_id,
                                 },
                             )
                         } else {
@@ -1117,6 +1169,7 @@ fn execute_launch_process_blocking(
                                         BackgroundContext {
                                             tx: &tx,
                                             start_time,
+                                            request_id,
                                         },
                                     )
                                 } else {
@@ -1175,6 +1228,7 @@ fn execute_launch_process_blocking(
                         BackgroundContext {
                             tx: &tx,
                             start_time,
+                            request_id,
                         },
                     )
                 } else {
@@ -1234,6 +1288,7 @@ fn execute_launch_process_blocking(
                             BackgroundContext {
                                 tx: &tx,
                                 start_time,
+                                request_id,
                             },
                         );
                         LaunchProcessResult {
