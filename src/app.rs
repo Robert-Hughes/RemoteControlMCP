@@ -1,6 +1,6 @@
 use crate::mcp::{
-    LaunchProcessStatus, ReadFileStatus, RequestData, RequestId, RequestUpdate, UiEvent,
-    UiEventKind, WriteFileStatus,
+    LaunchProcessStatus, LocalInstructionsDiagnostic, ReadFileStatus, RequestData, RequestId,
+    RequestUpdate, UiEvent, UiEventKind, WriteFileStatus,
 };
 use chrono::{DateTime, Local, TimeZone};
 use eframe::egui;
@@ -498,6 +498,7 @@ pub struct RemoteControlApp {
     requests: Vec<RequestEntry>,
     status_text: String,
     fatal_error: Option<String>,
+    local_instructions_diagnostic: Option<LocalInstructionsDiagnostic>,
     start_time: Instant,
 }
 
@@ -508,6 +509,7 @@ impl RemoteControlApp {
             requests: Vec::new(),
             status_text: "Starting".to_string(),
             fatal_error: None,
+            local_instructions_diagnostic: None,
             start_time,
         }
     }
@@ -521,6 +523,9 @@ impl RemoteControlApp {
                     self.status_text = "Waiting for MCP client".to_string();
                 }
                 UiEventKind::ClientConnected => self.status_text = "Connected".to_string(),
+                UiEventKind::LocalInstructionsDiagnostic { diagnostic } => {
+                    self.local_instructions_diagnostic = Some(diagnostic.clone());
+                }
                 UiEventKind::ServerStopped => self.status_text = "Stopped".to_string(),
                 UiEventKind::ServerError { error } => {
                     self.status_text = "Error".to_string();
@@ -546,6 +551,25 @@ impl eframe::App for RemoteControlApp {
                 ui.label("Current Status:");
                 ui.strong(&self.status_text);
             });
+            if let Some(diagnostic) = &self.local_instructions_diagnostic {
+                ui.add_space(5.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Local instructions:");
+                    match diagnostic {
+                        LocalInstructionsDiagnostic::Loaded { path } => {
+                            let colour = state_colour(ui, RequestState::Completed);
+                            ui.colored_label(colour, format!("Loaded · {}", path.display()));
+                        }
+                        LocalInstructionsDiagnostic::Warning { path, message } => {
+                            let colour = state_colour(ui, RequestState::Warning);
+                            ui.colored_label(
+                                colour,
+                                format!("Warning · {} · {message}", path.display()),
+                            );
+                        }
+                    }
+                });
+            }
             if let Some(error) = &self.fatal_error {
                 ui.add_space(5.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -990,6 +1014,17 @@ mod tests {
             kind: UiEventKind::ClientConnected,
         })
         .unwrap();
+        let diagnostic = LocalInstructionsDiagnostic::Warning {
+            path: std::path::PathBuf::from("C:\\missing\\instructions\\LOCAL.md"),
+            message: "file not found".to_string(),
+        };
+        tx.send(UiEvent {
+            elapsed: Duration::ZERO,
+            kind: UiEventKind::LocalInstructionsDiagnostic {
+                diagnostic: diagnostic.clone(),
+            },
+        })
+        .unwrap();
         tx.send(UiEvent {
             elapsed: Duration::ZERO,
             kind: UiEventKind::ServerError {
@@ -1001,5 +1036,6 @@ mod tests {
         assert!(app.requests.is_empty());
         assert_eq!(app.status_text, "Error");
         assert_eq!(app.fatal_error.as_deref(), Some("fatal detail"));
+        assert_eq!(app.local_instructions_diagnostic, Some(diagnostic));
     }
 }

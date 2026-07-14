@@ -20,6 +20,17 @@ const GENERAL_INSTRUCTIONS: &str = include_str!("../instructions/GENERAL.md");
 const LOCAL_INSTRUCTIONS_RELATIVE_PATH: &str = "instructions/LOCAL.md";
 const MACHINE_INSTRUCTIONS_HEADING: &str = "# Machine-specific instructions";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalInstructionsDiagnostic {
+    Loaded { path: PathBuf },
+    Warning { path: PathBuf, message: String },
+}
+
+struct LoadedServerInstructions {
+    instructions: Arc<str>,
+    diagnostic: LocalInstructionsDiagnostic,
+}
+
 fn local_instructions_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(LOCAL_INSTRUCTIONS_RELATIVE_PATH)
 }
@@ -46,18 +57,42 @@ fn compose_instructions(local_instructions: Option<&str>) -> Arc<str> {
     ))
 }
 
-fn load_server_instructions() -> Arc<str> {
-    let path = local_instructions_path();
-    match read_local_instructions(&path) {
-        Ok(local_instructions) => compose_instructions(local_instructions.as_deref()),
-        Err(error) => {
+fn warning_instructions(path: &Path, message: String) -> LoadedServerInstructions {
+    eprintln!(
+        "Warning: failed to load machine-specific MCP instructions from {}: {message}",
+        path.display()
+    );
+    LoadedServerInstructions {
+        instructions: compose_instructions(None),
+        diagnostic: LocalInstructionsDiagnostic::Warning {
+            path: path.to_path_buf(),
+            message,
+        },
+    }
+}
+
+fn load_server_instructions_from_path(path: &Path) -> LoadedServerInstructions {
+    match read_local_instructions(path) {
+        Ok(Some(contents)) if !contents.trim().is_empty() => {
             eprintln!(
-                "Warning: failed to read machine-specific MCP instructions from {}: {error}",
+                "Loaded machine-specific MCP instructions from {}",
                 path.display()
             );
-            compose_instructions(None)
+            LoadedServerInstructions {
+                instructions: compose_instructions(Some(&contents)),
+                diagnostic: LocalInstructionsDiagnostic::Loaded {
+                    path: path.to_path_buf(),
+                },
+            }
         }
+        Ok(Some(_)) => warning_instructions(path, "file is empty".to_string()),
+        Ok(None) => warning_instructions(path, "file not found".to_string()),
+        Err(error) => warning_instructions(path, error.to_string()),
     }
+}
+
+fn load_server_instructions() -> LoadedServerInstructions {
+    load_server_instructions_from_path(&local_instructions_path())
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -330,6 +365,9 @@ pub enum UiEventKind {
     ServerStarting,
     WaitingForClient,
     ClientConnected,
+    LocalInstructionsDiagnostic {
+        diagnostic: LocalInstructionsDiagnostic,
+    },
     RequestStarted {
         id: RequestId,
         request: RequestData,
@@ -379,8 +417,10 @@ pub mod test_hooks {
 
 #[tool_router]
 impl McpServer {
+    #[cfg(test)]
     pub fn new(tx: Sender<UiEvent>, start_time: Instant) -> Self {
-        Self::new_with_instructions(tx, start_time, load_server_instructions())
+        let loaded = load_server_instructions();
+        Self::new_with_instructions(tx, start_time, loaded.instructions)
     }
 
     fn new_with_instructions(
@@ -597,7 +637,12 @@ where
 
     send_event(UiEventKind::ServerStarting);
 
-    let service = McpServer::new(tx.clone(), start_time);
+    let LoadedServerInstructions {
+        instructions,
+        diagnostic,
+    } = load_server_instructions();
+    send_event(UiEventKind::LocalInstructionsDiagnostic { diagnostic });
+    let service = McpServer::new_with_instructions(tx.clone(), start_time, instructions);
 
     send_event(UiEventKind::WaitingForClient);
 

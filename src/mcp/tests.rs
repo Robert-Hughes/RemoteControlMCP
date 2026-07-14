@@ -13,9 +13,10 @@ use crate::mcp::write_file::{
 };
 use crate::mcp::{
     EnvironmentConfig, GENERAL_INSTRUCTIONS, LaunchProcessRequest, LaunchProcessResult,
-    LaunchProcessStatus, MACHINE_INSTRUCTIONS_HEADING, McpServer, ReadFileRequest, ReadFileResult,
-    ReadFileStatus, RequestData, RequestId, RequestUpdate, TimeoutAction, UiEventKind,
-    WriteFileRequest, WriteFileResult, WriteFileStatus, build_mcp_runtime, compose_instructions,
+    LaunchProcessStatus, LocalInstructionsDiagnostic, MACHINE_INSTRUCTIONS_HEADING, McpServer,
+    ReadFileRequest, ReadFileResult, ReadFileStatus, RequestData, RequestId, RequestUpdate,
+    TimeoutAction, UiEventKind, WriteFileRequest, WriteFileResult, WriteFileStatus,
+    build_mcp_runtime, compose_instructions, load_server_instructions_from_path,
     read_local_instructions, run_mcp_server_loop, test_hooks,
 };
 use rmcp::ServerHandler;
@@ -70,6 +71,44 @@ fn local_instruction_loader_allows_missing_files_and_reads_present_files() {
         Some("machine-specific text\n")
     );
     std::fs::remove_file(present_path).unwrap();
+}
+
+#[test]
+fn server_instruction_loading_reports_success_and_missing_file_warnings() {
+    let present_path =
+        write_temp_test_file("loaded_local_instructions", b"# Local test instructions\n");
+    let loaded = load_server_instructions_from_path(&present_path);
+    assert!(loaded.instructions.contains("# Local test instructions"));
+    assert_eq!(
+        loaded.diagnostic,
+        LocalInstructionsDiagnostic::Loaded {
+            path: present_path.clone(),
+        }
+    );
+    std::fs::remove_file(&present_path).unwrap();
+
+    let missing_path = generate_temp_test_path("missing_local_instructions_diagnostic");
+    let missing = load_server_instructions_from_path(&missing_path);
+    assert_eq!(missing.instructions.as_ref(), GENERAL_INSTRUCTIONS.trim());
+    assert_eq!(
+        missing.diagnostic,
+        LocalInstructionsDiagnostic::Warning {
+            path: missing_path,
+            message: "file not found".to_string(),
+        }
+    );
+
+    let empty_path = write_temp_test_file("empty_local_instructions", b" \r\n\t");
+    let empty = load_server_instructions_from_path(&empty_path);
+    assert_eq!(empty.instructions.as_ref(), GENERAL_INSTRUCTIONS.trim());
+    assert_eq!(
+        empty.diagnostic,
+        LocalInstructionsDiagnostic::Warning {
+            path: empty_path.clone(),
+            message: "file is empty".to_string(),
+        }
+    );
+    std::fs::remove_file(empty_path).unwrap();
 }
 
 #[test]
@@ -1430,6 +1469,11 @@ fn ping_works_over_mcp_duplex_transport() {
 
     // 6. UI lifecycle and tool events
     let events: Vec<UiEventKind> = rx.try_iter().map(|e| e.kind).collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, UiEventKind::LocalInstructionsDiagnostic { .. }))
+    );
     assert!(events.windows(2).any(|pair| matches!(
         pair,
         [

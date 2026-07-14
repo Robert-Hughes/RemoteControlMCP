@@ -30,7 +30,7 @@ The effective instructions have two sources:
 * `instructions/GENERAL.md` is committed to the repository and embedded into the executable at compile time. It documents machine-independent use of the Remote Control MCP tools.
 * `instructions/LOCAL.md` is gitignored and loaded from the checkout at runtime. It can document programs, paths, and operational guidance specific to the host machine.
 
-The local file is resolved relative to `CARGO_MANIFEST_DIR`, so it does not depend on the process working directory. A missing local file is allowed and produces general-only instructions. Other read failures are reported to standard error and also fall back to general-only instructions.
+The local file is resolved relative to `CARGO_MANIFEST_DIR`, so it does not depend on the process working directory. A successful non-empty load is reported in the GUI and on standard error with the resolved path. A missing, empty, or unreadable local file falls back to general-only instructions and produces a non-fatal GUI warning as well as a standard-error warning.
 
 Changes to `GENERAL.md` require a rebuild. Changes to `LOCAL.md` require a server restart and a new MCP initialisation handshake, but no rebuild.
 
