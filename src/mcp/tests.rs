@@ -12,12 +12,15 @@ use crate::mcp::write_file::{
     validate_write_file_request, write_file_summary,
 };
 use crate::mcp::{
-    EnvironmentConfig, LaunchProcessRequest, LaunchProcessResult, LaunchProcessStatus, McpServer,
-    ReadFileRequest, ReadFileResult, ReadFileStatus, RequestData, RequestId, RequestUpdate,
-    TimeoutAction, UiEventKind, WriteFileRequest, WriteFileResult, WriteFileStatus,
-    build_mcp_runtime, run_mcp_server_loop, test_hooks,
+    EnvironmentConfig, GENERAL_INSTRUCTIONS, LaunchProcessRequest, LaunchProcessResult,
+    LaunchProcessStatus, MACHINE_INSTRUCTIONS_HEADING, McpServer, ReadFileRequest, ReadFileResult,
+    ReadFileStatus, RequestData, RequestId, RequestUpdate, TimeoutAction, UiEventKind,
+    WriteFileRequest, WriteFileResult, WriteFileStatus, build_mcp_runtime, compose_instructions,
+    read_local_instructions, run_mcp_server_loop, test_hooks,
 };
+use rmcp::ServerHandler;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -34,6 +37,53 @@ fn mcp_runtime_supports_tokio_timers() {
     });
 }
 
+#[test]
+fn composed_instructions_use_embedded_general_guidance_without_local_text() {
+    let expected = GENERAL_INSTRUCTIONS.trim();
+
+    assert_eq!(compose_instructions(None).as_ref(), expected);
+    assert_eq!(compose_instructions(Some(" \r\n\t ")).as_ref(), expected);
+}
+
+#[test]
+fn composed_instructions_append_trimmed_machine_specific_guidance() {
+    let local = "\n  ## Installed software\n\n- Example tool is available.  \n";
+    let instructions = compose_instructions(Some(local));
+    let expected = format!(
+        "{}\n\n---\n\n{}\n\n{}",
+        GENERAL_INSTRUCTIONS.trim(),
+        MACHINE_INSTRUCTIONS_HEADING,
+        local.trim()
+    );
+
+    assert_eq!(instructions.as_ref(), expected);
+}
+
+#[test]
+fn local_instruction_loader_allows_missing_files_and_reads_present_files() {
+    let missing_path = generate_temp_test_path("missing_local_instructions");
+    assert_eq!(read_local_instructions(&missing_path).unwrap(), None);
+
+    let present_path = write_temp_test_file("local_instructions", b"machine-specific text\n");
+    assert_eq!(
+        read_local_instructions(&present_path).unwrap().as_deref(),
+        Some("machine-specific text\n")
+    );
+    std::fs::remove_file(present_path).unwrap();
+}
+
+#[test]
+fn server_info_exposes_the_composed_instructions() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let instructions: Arc<str> = Arc::from("test server instructions");
+    let server = McpServer::new_with_instructions(tx, Instant::now(), instructions.clone());
+    let info = server.get_info();
+
+    assert_eq!(info.server_info.name, "remote-control-mcp");
+    assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(info.instructions.as_deref(), Some(instructions.as_ref()));
+    assert!(info.capabilities.tools.is_some());
+}
 #[test]
 fn test_background_monitor_error_event() {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1306,6 +1356,14 @@ fn ping_works_over_mcp_duplex_transport() {
         use rmcp::ServiceExt;
         let mut client = ().serve(client_transport).await.expect("Failed to serve client");
 
+        let server_info = client
+            .peer_info()
+            .expect("server initialise information should be available");
+        let transmitted_instructions = server_info
+            .instructions
+            .as_deref()
+            .expect("server instructions should be present");
+        assert!(transmitted_instructions.starts_with(GENERAL_INSTRUCTIONS.trim()));
         // 1. Tool discovery through tools/list
         let tools = client.list_all_tools().await.expect("Failed to list tools");
         assert_eq!(tools.len(), 4);

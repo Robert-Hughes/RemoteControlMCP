@@ -2,6 +2,9 @@ use rmcp::{ServerHandler, handler::server::tool::ToolRouter, tool, tool_handler,
 use rmcp::{schemars, serde};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
@@ -13,6 +16,49 @@ mod ping;
 mod read_file;
 mod write_file;
 
+const GENERAL_INSTRUCTIONS: &str = include_str!("../instructions/GENERAL.md");
+const LOCAL_INSTRUCTIONS_RELATIVE_PATH: &str = "instructions/LOCAL.md";
+const MACHINE_INSTRUCTIONS_HEADING: &str = "# Machine-specific instructions";
+
+fn local_instructions_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(LOCAL_INSTRUCTIONS_RELATIVE_PATH)
+}
+
+fn read_local_instructions(path: &Path) -> io::Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn compose_instructions(local_instructions: Option<&str>) -> Arc<str> {
+    let general = GENERAL_INSTRUCTIONS.trim();
+    let Some(local) = local_instructions
+        .map(str::trim)
+        .filter(|contents| !contents.is_empty())
+    else {
+        return Arc::from(general);
+    };
+
+    Arc::from(format!(
+        "{general}\n\n---\n\n{MACHINE_INSTRUCTIONS_HEADING}\n\n{local}"
+    ))
+}
+
+fn load_server_instructions() -> Arc<str> {
+    let path = local_instructions_path();
+    match read_local_instructions(&path) {
+        Ok(local_instructions) => compose_instructions(local_instructions.as_deref()),
+        Err(error) => {
+            eprintln!(
+                "Warning: failed to read machine-specific MCP instructions from {}: {error}",
+                path.display()
+            );
+            compose_instructions(None)
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LaunchProcessStatus {
@@ -311,6 +357,7 @@ pub struct McpServer {
     start_time: Instant,
     next_request_id: Arc<AtomicU64>,
     tool_router: ToolRouter<Self>,
+    instructions: Arc<str>,
 }
 
 #[cfg(test)]
@@ -333,11 +380,20 @@ pub mod test_hooks {
 #[tool_router]
 impl McpServer {
     pub fn new(tx: Sender<UiEvent>, start_time: Instant) -> Self {
+        Self::new_with_instructions(tx, start_time, load_server_instructions())
+    }
+
+    fn new_with_instructions(
+        tx: Sender<UiEvent>,
+        start_time: Instant,
+        instructions: Arc<str>,
+    ) -> Self {
         Self {
             tx,
             start_time,
             next_request_id: Arc::new(AtomicU64::new(1)),
             tool_router: Self::tool_router(),
+            instructions,
         }
     }
 
@@ -478,13 +534,21 @@ impl McpServer {
     }
 }
 
-#[tool_handler(
-    router = self.tool_router,
-    name = "remote-control-mcp",
-    version = "0.1.0",
-    instructions = "Remote Control MCP Server"
-)]
-impl ServerHandler for McpServer {}
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for McpServer {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
+        .with_server_info(rmcp::model::Implementation::new(
+            "remote-control-mcp",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(self.instructions.to_string())
+    }
+}
 
 fn build_mcp_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()

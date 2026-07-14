@@ -21,6 +21,19 @@ Rust MCP worker thread
 egui main thread
 ```
 
+## MCP instructions
+
+The server sends operating guidance to MCP clients in the `instructions` field of its initialisation response.
+
+The effective instructions have two sources:
+
+* `instructions/GENERAL.md` is committed to the repository and embedded into the executable at compile time. It documents machine-independent use of the Remote Control MCP tools.
+* `instructions/LOCAL.md` is gitignored and loaded from the checkout at runtime. It can document programs, paths, and operational guidance specific to the host machine.
+
+The local file is resolved relative to `CARGO_MANIFEST_DIR`, so it does not depend on the process working directory. A missing local file is allowed and produces general-only instructions. Other read failures are reported to standard error and also fall back to general-only instructions.
+
+Changes to `GENERAL.md` require a rebuild. Changes to `LOCAL.md` require a server restart and a new MCP initialisation handshake, but no rebuild.
+
 ## GUI request list
 
 The server lifecycle remains in the status area at the top of the window. A fatal server error is shown separately and is never represented as a tool request.
