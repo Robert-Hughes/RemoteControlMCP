@@ -1451,6 +1451,129 @@ fn ping_metadata_is_read_only_and_idempotent() {
 }
 
 #[test]
+fn tool_calls_work_before_initialize_and_initialize_restores_normal_peer_state() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let server_task = tokio::spawn(async move {
+            run_mcp_server_loop(tx, Instant::now(), server_transport).await;
+        });
+        let (client_read, mut client_write) = tokio::io::split(client_transport);
+        let mut client_read = tokio::io::BufReader::new(client_read);
+
+        async fn send_message(
+            writer: &mut (impl AsyncWriteExt + Unpin),
+            message: rmcp::serde_json::Value,
+        ) {
+            writer
+                .write_all(format!("{message}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        async fn read_message(
+            reader: &mut (impl AsyncBufReadExt + Unpin),
+        ) -> rmcp::serde_json::Value {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(!line.is_empty(), "server closed before sending a response");
+            rmcp::serde_json::from_str(&line).unwrap()
+        }
+
+        send_message(
+            &mut client_write,
+            rmcp::serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "get_instructions", "arguments": {} }
+            }),
+        )
+        .await;
+        let pre_initialize_result = read_message(&mut client_read).await;
+        assert!(pre_initialize_result.get("error").is_none());
+        assert!(
+            pre_initialize_result["result"]["structuredContent"]["instructions"]
+                .as_str()
+                .is_some_and(|instructions| !instructions.is_empty())
+        );
+        let pre_initialize_events: Vec<_> = rx.try_iter().map(|event| event.kind).collect();
+        assert!(pre_initialize_events.iter().any(|event| matches!(
+            event,
+            UiEventKind::RequestStarted {
+                request: RequestData::GetInstructions,
+                ..
+            }
+        )));
+        assert!(!pre_initialize_events.contains(&UiEventKind::ClientInitialized));
+
+        send_message(
+            &mut client_write,
+            rmcp::serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "lifecycle-test", "version": "1.0" }
+                }
+            }),
+        )
+        .await;
+        let initialize_result = read_message(&mut client_read).await;
+        assert_eq!(initialize_result["result"]["protocolVersion"], "2025-11-25");
+        assert!(
+            rx.try_iter()
+                .any(|event| event.kind == UiEventKind::ClientInitialized)
+        );
+
+        send_message(
+            &mut client_write,
+            rmcp::serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }),
+        )
+        .await;
+        send_message(
+            &mut client_write,
+            rmcp::serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": { "name": "ping", "arguments": {} }
+            }),
+        )
+        .await;
+        let post_initialize_result = read_message(&mut client_read).await;
+        assert_eq!(
+            post_initialize_result["result"]["structuredContent"],
+            rmcp::serde_json::json!({ "message": "pong" })
+        );
+
+        client_write.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    });
+
+    let final_events: Vec<_> = rx.try_iter().map(|event| event.kind).collect();
+    assert!(
+        !final_events
+            .iter()
+            .any(|event| matches!(event, UiEventKind::ServerError { .. })),
+        "unexpected server error during shutdown: {final_events:?}"
+    );
+    assert_eq!(final_events.last(), Some(&UiEventKind::ServerStopped));
+}
+
+#[test]
 fn ping_works_over_mcp_duplex_transport() {
     let (tx, rx) = std::sync::mpsc::channel();
     let start_time = Instant::now();

@@ -509,6 +509,7 @@ pub struct RemoteControlApp {
     rx: Receiver<UiEvent>,
     requests: Vec<RequestEntry>,
     status_text: String,
+    client_initialized: bool,
     fatal_error: Option<String>,
     local_instructions_diagnostic: Option<LocalInstructionsDiagnostic>,
     start_time: Instant,
@@ -520,6 +521,7 @@ impl RemoteControlApp {
             rx,
             requests: Vec::new(),
             status_text: "Starting".to_string(),
+            client_initialized: false,
             fatal_error: None,
             local_instructions_diagnostic: None,
             start_time,
@@ -530,11 +532,15 @@ impl RemoteControlApp {
         while let Ok(event) = self.rx.try_recv() {
             match &event.kind {
                 UiEventKind::WorkerStarted => self.status_text = "Worker started".to_string(),
-                UiEventKind::ServerStarting => self.status_text = "Server starting".to_string(),
+                UiEventKind::ServerStarting => {
+                    self.status_text = "Server starting".to_string();
+                    self.client_initialized = false;
+                }
                 UiEventKind::WaitingForClient => {
                     self.status_text = "Waiting for MCP client".to_string();
                 }
                 UiEventKind::ClientConnected => self.status_text = "Connected".to_string(),
+                UiEventKind::ClientInitialized => self.client_initialized = true,
                 UiEventKind::LocalInstructionsDiagnostic { diagnostic } => {
                     self.local_instructions_diagnostic = Some(diagnostic.clone());
                 }
@@ -562,6 +568,10 @@ impl eframe::App for RemoteControlApp {
             ui.horizontal(|ui| {
                 ui.label("Current Status:");
                 ui.strong(&self.status_text);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Client called initialize:");
+                ui.strong(if self.client_initialized { "yes" } else { "no" });
             });
             if let Some(diagnostic) = &self.local_instructions_diagnostic {
                 ui.add_space(5.0);
@@ -1026,6 +1036,11 @@ mod tests {
             kind: UiEventKind::ClientConnected,
         })
         .unwrap();
+        tx.send(UiEvent {
+            elapsed: Duration::ZERO,
+            kind: UiEventKind::ClientInitialized,
+        })
+        .unwrap();
         let diagnostic = LocalInstructionsDiagnostic::Warning {
             path: std::path::PathBuf::from("C:\\missing\\instructions\\LOCAL.md"),
             message: "file not found".to_string(),
@@ -1047,6 +1062,7 @@ mod tests {
         app.receive_events();
         assert!(app.requests.is_empty());
         assert_eq!(app.status_text, "Error");
+        assert!(app.client_initialized);
         assert_eq!(app.fatal_error.as_deref(), Some("fatal detail"));
         assert_eq!(app.local_instructions_diagnostic, Some(diagnostic));
     }

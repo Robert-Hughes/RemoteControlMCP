@@ -380,6 +380,7 @@ pub enum UiEventKind {
     ServerStarting,
     WaitingForClient,
     ClientConnected,
+    ClientInitialized,
     LocalInstructionsDiagnostic {
         diagnostic: LocalInstructionsDiagnostic,
     },
@@ -619,6 +620,28 @@ impl McpServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpServer {
+    fn initialize(
+        &self,
+        request: rmcp::model::InitializeRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::InitializeResult, rmcp::ErrorData>> + Send
+    {
+        let mut info = self.get_info();
+        if rmcp::model::ProtocolVersion::KNOWN_VERSIONS.contains(&request.protocol_version) {
+            info.protocol_version = request.protocol_version.clone();
+        }
+
+        // `serve()` normally performs this negotiated peer-info update around the handler.
+        // `serve_directly()` does not, so preserve the same state for every request after
+        // initialize while still permitting earlier requests with no client information.
+        let mut negotiated_peer_info = request;
+        negotiated_peer_info.protocol_version = info.protocol_version.clone();
+        context.peer.set_peer_info(negotiated_peer_info);
+        self.send_event(UiEventKind::ClientInitialized);
+
+        std::future::ready(Ok(info))
+    }
+
     fn get_info(&self) -> rmcp::model::ServerInfo {
         rmcp::model::ServerInfo::new(
             rmcp::model::ServerCapabilities::builder()
@@ -689,25 +712,22 @@ where
 
     send_event(UiEventKind::WaitingForClient);
 
-    use rmcp::ServiceExt;
-
-    match service.serve(transport).await {
-        Ok(server) => {
-            send_event(UiEventKind::ClientConnected);
-            match server.waiting().await {
-                Ok(_) => {
-                    send_event(UiEventKind::ServerStopped);
-                }
-                Err(e) => {
-                    send_event(UiEventKind::ServerError {
-                        error: format!("Server error: {}", e),
-                    });
-                }
-            }
+    // The OpenAI tunnel-client can keep its HTTP-side MCP session alive while restarting
+    // this stdio child. It may then forward a tool call before re-sending initialize. The
+    // spec-compliant `serve()` rejects that call and terminates the fresh server process.
+    // `serve_directly()` keeps the stdio transport usable in that situation. Our initialize
+    // handler still records and negotiates client information when initialize does arrive,
+    // so requests after it have the same peer state they would have had under `serve()`.
+    let server =
+        rmcp::service::serve_directly::<rmcp::RoleServer, _, _, _, _>(service, transport, None);
+    send_event(UiEventKind::ClientConnected);
+    match server.waiting().await {
+        Ok(_) => {
+            send_event(UiEventKind::ServerStopped);
         }
         Err(e) => {
             send_event(UiEventKind::ServerError {
-                error: format!("Server serve failed: {}", e),
+                error: format!("Server error: {}", e),
             });
         }
     }
