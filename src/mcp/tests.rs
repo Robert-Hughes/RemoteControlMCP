@@ -12,12 +12,12 @@ use crate::mcp::write_file::{
     validate_write_file_request, write_file_summary,
 };
 use crate::mcp::{
-    EnvironmentConfig, GENERAL_INSTRUCTIONS, LaunchProcessRequest, LaunchProcessResult,
-    LaunchProcessStatus, LocalInstructionsDiagnostic, MACHINE_INSTRUCTIONS_HEADING, McpServer,
-    ReadFileRequest, ReadFileResult, ReadFileStatus, RequestData, RequestId, RequestUpdate,
-    TimeoutAction, UiEventKind, WriteFileRequest, WriteFileResult, WriteFileStatus,
-    build_mcp_runtime, compose_instructions, load_server_instructions_from_path,
-    read_local_instructions, run_mcp_server_loop, test_hooks,
+    BOOTSTRAP_INSTRUCTIONS, EnvironmentConfig, GENERAL_INSTRUCTIONS, LaunchProcessRequest,
+    LaunchProcessResult, LaunchProcessStatus, LocalInstructionsDiagnostic,
+    MACHINE_INSTRUCTIONS_HEADING, McpServer, ReadFileRequest, ReadFileResult, ReadFileStatus,
+    RequestData, RequestId, RequestUpdate, TimeoutAction, UiEventKind, WriteFileRequest,
+    WriteFileResult, WriteFileStatus, build_mcp_runtime, compose_instructions,
+    load_server_instructions_from_path, read_local_instructions, run_mcp_server_loop, test_hooks,
 };
 use rmcp::ServerHandler;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,82 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct InstructionsToolExchange {
+    server_info: Arc<rmcp::model::ServerInfo>,
+    tool: rmcp::model::Tool,
+    call_result: rmcp::model::CallToolResult,
+    unexpected_arguments_result: rmcp::model::CallToolResult,
+}
+
+async fn call_get_instructions_over_duplex(instructions: Arc<str>) -> InstructionsToolExchange {
+    use rmcp::ServiceExt;
+
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    let server = McpServer::new_with_instructions(tx, Instant::now(), instructions);
+    let server_task = tokio::spawn(async move {
+        server
+            .serve(server_transport)
+            .await
+            .expect("Failed to serve MCP server")
+            .waiting()
+            .await
+            .expect("MCP server failed while waiting");
+    });
+    let mut client = ().serve(client_transport).await.expect("Failed to serve client");
+
+    let server_info = client
+        .peer_info()
+        .expect("server initialise information should be available")
+        .clone();
+    let tool = client
+        .list_all_tools()
+        .await
+        .expect("Failed to list tools")
+        .into_iter()
+        .find(|tool| tool.name == "get_instructions")
+        .expect("get_instructions tool not found");
+
+    let unexpected_arguments = rmcp::serde_json::json!({ "unexpected": true })
+        .as_object()
+        .expect("fixture should be an object")
+        .clone();
+    let unexpected_arguments_result = client
+        .call_tool(
+            rmcp::model::CallToolRequestParams::new("get_instructions")
+                .with_arguments(unexpected_arguments),
+        )
+        .await
+        .expect("unexpected parameters should produce an MCP tool error result");
+
+    let call_result = client
+        .call_tool(rmcp::model::CallToolRequestParams::new("get_instructions"))
+        .await
+        .expect("Failed to call get_instructions tool");
+
+    client.close().await.expect("Failed to close client");
+    server_task.await.expect("Server task panicked");
+
+    InstructionsToolExchange {
+        server_info,
+        tool,
+        call_result,
+        unexpected_arguments_result,
+    }
+}
+
+fn assert_get_instructions_result(call_result: &rmcp::model::CallToolResult, expected: &str) {
+    assert_eq!(call_result.content.len(), 1);
+    let rmcp::model::ContentBlock::Text(text) = &call_result.content[0] else {
+        panic!("Expected Text content block");
+    };
+    assert_eq!(text.text, expected);
+    assert_eq!(
+        call_result.structured_content.as_ref(),
+        Some(&rmcp::serde_json::json!({ "instructions": expected }))
+    );
+}
 
 #[test]
 fn mcp_runtime_supports_tokio_timers() {
@@ -112,7 +188,7 @@ fn server_instruction_loading_reports_success_and_missing_file_warnings() {
 }
 
 #[test]
-fn server_info_exposes_the_composed_instructions() {
+fn server_info_exposes_only_the_bootstrap_instructions() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let instructions: Arc<str> = Arc::from("test server instructions");
     let server = McpServer::new_with_instructions(tx, Instant::now(), instructions.clone());
@@ -120,12 +196,7 @@ fn server_info_exposes_the_composed_instructions() {
 
     assert_eq!(info.server_info.name, "remote-control-mcp");
     assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
-    assert_eq!(
-        info.instructions.as_deref(),
-        Some(
-            "Call the get_instructions tool to get full instructions on how to use this MCP server. DO THIS BEFORE calling any other tools"
-        )
-    );
+    assert_eq!(info.instructions.as_deref(), Some(BOOTSTRAP_INSTRUCTIONS));
     assert!(info.capabilities.tools.is_some());
 }
 #[test]
@@ -1407,10 +1478,7 @@ fn ping_works_over_mcp_duplex_transport() {
             .instructions
             .as_deref()
             .expect("server instructions should be present");
-        assert_eq!(
-            transmitted_instructions,
-            "Call the get_instructions tool to get full instructions on how to use this MCP server. DO THIS BEFORE calling any other tools"
-        );
+        assert_eq!(transmitted_instructions, BOOTSTRAP_INSTRUCTIONS);
         // 1. Tool discovery through tools/list
         let tools = client.list_all_tools().await.expect("Failed to list tools");
         assert_eq!(tools.len(), 5);
@@ -4306,84 +4374,74 @@ fn test_invalid_utf8_lossy() {
 }
 
 #[test]
-fn test_mcp_instructions_bootstrap_and_tool() {
-    let (tx, _rx) = std::sync::mpsc::channel();
-    let start_time = Instant::now();
+fn get_instructions_returns_the_stored_startup_snapshot_over_mcp_transport() {
+    let sentinel: Arc<str> = Arc::from(
+        "<<<UNIQUE TEST STARTUP SNAPSHOT 7bfc0d9e: never loaded from instruction files>>>",
+    );
+    let rt = build_mcp_runtime().expect("MCP runtime should build");
 
-    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    let exchange = rt.block_on(call_get_instructions_over_duplex(sentinel.clone()));
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    assert_eq!(
+        exchange.server_info.instructions.as_deref(),
+        Some(BOOTSTRAP_INSTRUCTIONS)
+    );
+    assert!(!BOOTSTRAP_INSTRUCTIONS.contains(GENERAL_INSTRUCTIONS.trim()));
+    assert_get_instructions_result(&exchange.call_result, sentinel.as_ref());
 
-    rt.block_on(async {
-        let tx_clone = tx.clone();
-        let server_task = tokio::spawn(async move {
-            run_mcp_server_loop(tx_clone, start_time, server_transport).await;
-        });
+    let input_schema = rmcp::serde_json::Value::Object((*exchange.tool.input_schema).clone());
+    assert_eq!(
+        input_schema,
+        rmcp::serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false,
+            "type": "object"
+        })
+    );
+    assert_eq!(
+        input_schema.get("type").and_then(|value| value.as_str()),
+        Some("object")
+    );
+    assert!(input_schema.get("properties").is_none());
+    assert!(input_schema.get("required").is_none());
+    assert_eq!(
+        input_schema
+            .get("additionalProperties")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(exchange.unexpected_arguments_result.is_error, Some(true));
+    assert!(
+        matches!(
+            &exchange.unexpected_arguments_result.content[..],
+            [rmcp::model::ContentBlock::Text(text)]
+                if text.text.contains("unknown field `unexpected`")
+        ),
+        "unexpected parameters should be rejected as an unknown field"
+    );
+}
 
-        use rmcp::ServiceExt;
-        let mut client = ().serve(client_transport).await.expect("Failed to serve client");
+#[test]
+fn get_instructions_returns_generic_instructions_without_local_text() {
+    let expected = compose_instructions(None);
+    let rt = build_mcp_runtime().expect("MCP runtime should build");
 
-        let server_info = client
-            .peer_info()
-            .expect("server initialise information should be available");
-        let transmitted_instructions = server_info
-            .instructions
-            .as_deref()
-            .expect("server instructions should be present");
+    let exchange = rt.block_on(call_get_instructions_over_duplex(expected.clone()));
 
-        // Test 1: InitializeResult.instructions is exactly the hardcoded bootstrap string.
-        assert_eq!(
-            transmitted_instructions,
-            "Call the get_instructions tool to get full instructions on how to use this MCP server. DO THIS BEFORE calling any other tools"
-        );
+    assert_eq!(expected.as_ref(), GENERAL_INSTRUCTIONS.trim());
+    assert_get_instructions_result(&exchange.call_result, GENERAL_INSTRUCTIONS.trim());
+}
 
-        // Test 2: The initialisation field does not contain the generic instruction body.
-        assert!(!transmitted_instructions.contains(GENERAL_INSTRUCTIONS.trim()));
+#[test]
+fn get_instructions_returns_composed_generic_and_local_instructions() {
+    let local = "## Test-only local fixture\n\n- frobnicator path: Z:/sentinel";
+    let expected = compose_instructions(Some(local));
+    let rt = build_mcp_runtime().expect("MCP runtime should build");
 
-        // Test 3: The initialisation field does not contain `# Manta Remote Control` or other `LOCAL.md` content.
-        assert!(!transmitted_instructions.contains("# Manta Remote Control"));
-        assert!(!transmitted_instructions.contains("Machine-specific instructions"));
+    let exchange = rt.block_on(call_get_instructions_over_duplex(expected.clone()));
 
-        // Test 4: Tool listing has get_instructions registered
-        let tools = client.list_all_tools().await.expect("Failed to list tools");
-        let tool = tools
-            .iter()
-            .find(|t| t.name == "get_instructions")
-            .expect("get_instructions tool not found");
-
-        // Test 5: Input schema accepts no parameters
-        assert_eq!(tool.input_schema.get("type").and_then(|v| v.as_str()), Some("object"));
-        if let Some(props) = tool.input_schema.get("properties") {
-            assert!(props.as_object().map(|o| o.is_empty()).unwrap_or(true));
-        }
-
-        // Test 8: The returned tool content matches the same effective combined instructions assembled during startup.
-        let call_params = rmcp::model::CallToolRequestParams::new("get_instructions");
-        let call_result = client
-            .call_tool(call_params)
-            .await
-            .expect("Failed to call get_instructions tool");
-
-        assert_eq!(call_result.content.len(), 1);
-        let returned_instructions_text = match &call_result.content[0] {
-            rmcp::model::ContentBlock::Text(tc) => tc.text.clone(),
-            _ => panic!("Expected Text content block"),
-        };
-
-        let expected_loaded = crate::mcp::load_server_instructions();
-        assert_eq!(returned_instructions_text, expected_loaded.instructions.as_ref());
-
-        // Test 7: The return text must start with the generic instructions.
-        assert!(returned_instructions_text.starts_with(GENERAL_INSTRUCTIONS.trim()));
-        // If there was a local instructions loaded, it should be at the end.
-        if let crate::mcp::LocalInstructionsDiagnostic::Loaded { .. } = expected_loaded.diagnostic {
-            assert!(returned_instructions_text.contains(MACHINE_INSTRUCTIONS_HEADING));
-        }
-
-        client.close().await.expect("Failed to close client");
-        server_task.await.expect("Server task panicked");
-    });
+    assert!(expected.starts_with(GENERAL_INSTRUCTIONS.trim()));
+    let suffix = format!("\n\n---\n\n{MACHINE_INSTRUCTIONS_HEADING}\n\n{local}");
+    assert!(expected.ends_with(&suffix));
+    assert_get_instructions_result(&exchange.call_result, expected.as_ref());
 }

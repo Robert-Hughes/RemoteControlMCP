@@ -19,6 +19,10 @@ mod write_file;
 const GENERAL_INSTRUCTIONS: &str = include_str!("../instructions/GENERAL.md");
 const LOCAL_INSTRUCTIONS_RELATIVE_PATH: &str = "instructions/LOCAL.md";
 const MACHINE_INSTRUCTIONS_HEADING: &str = "# Machine-specific instructions";
+// This intentionally stays short because the ChatGPT MCP connector has been observed silently
+// truncating longer MCP initialisation instruction strings, preventing later machine-specific
+// instructions from reaching the model.
+const BOOTSTRAP_INSTRUCTIONS: &str = "Call the get_instructions tool to get full instructions on how to use this MCP server. DO THIS BEFORE calling any other tools";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalInstructionsDiagnostic {
@@ -112,6 +116,10 @@ pub enum LaunchProcessStatus {
 pub struct GetInstructionsResult {
     pub instructions: String,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GetInstructionsRequest {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LaunchProcessResult {
@@ -517,7 +525,10 @@ impl McpServer {
             open_world_hint = false
         )
     )]
-    async fn get_instructions(&self) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    async fn get_instructions(
+        &self,
+        _params: rmcp::handler::server::wrapper::Parameters<GetInstructionsRequest>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let id = self.start_request(RequestData::GetInstructions);
         let instructions = self.instructions.to_string();
         let result = GetInstructionsResult {
@@ -609,10 +620,6 @@ impl McpServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
-        // This intentionally uses a short bootstrap because the ChatGPT MCP connector has been
-        // observed silently truncating longer MCP initialisation instruction strings,
-        // preventing later machine-specific instructions from reaching the model.
-        let bootstrap = "Call the get_instructions tool to get full instructions on how to use this MCP server. DO THIS BEFORE calling any other tools";
         rmcp::model::ServerInfo::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
@@ -622,7 +629,7 @@ impl ServerHandler for McpServer {
             "remote-control-mcp",
             env!("CARGO_PKG_VERSION"),
         ))
-        .with_instructions(bootstrap.to_string())
+        .with_instructions(BOOTSTRAP_INSTRUCTIONS.to_string())
     }
 }
 
