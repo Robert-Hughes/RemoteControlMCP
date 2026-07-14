@@ -120,7 +120,12 @@ fn server_info_exposes_the_composed_instructions() {
 
     assert_eq!(info.server_info.name, "remote-control-mcp");
     assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
-    assert_eq!(info.instructions.as_deref(), Some(instructions.as_ref()));
+    assert_eq!(
+        info.instructions.as_deref(),
+        Some(
+            "Call the get_instructions tool to get full instructions on how to use this MCP server. DO THIS BEFORE calling any other tools"
+        )
+    );
     assert!(info.capabilities.tools.is_some());
 }
 #[test]
@@ -1402,10 +1407,13 @@ fn ping_works_over_mcp_duplex_transport() {
             .instructions
             .as_deref()
             .expect("server instructions should be present");
-        assert!(transmitted_instructions.starts_with(GENERAL_INSTRUCTIONS.trim()));
+        assert_eq!(
+            transmitted_instructions,
+            "Call the get_instructions tool to get full instructions on how to use this MCP server. DO THIS BEFORE calling any other tools"
+        );
         // 1. Tool discovery through tools/list
         let tools = client.list_all_tools().await.expect("Failed to list tools");
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
         let tool = tools
             .iter()
             .find(|t| t.name == "ping")
@@ -2756,7 +2764,7 @@ fn launch_process_integration_test_over_duplex() {
 
         // 1. Tool discovery integration test
         let tools = client.list_all_tools().await.expect("Failed to list tools");
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
 
         let launch_tool = tools
             .iter()
@@ -3338,7 +3346,7 @@ fn write_file_integration_test_over_duplex() {
         use rmcp::ServiceExt;
         let mut client = ().serve(client_transport).await.expect("serve client");
         let tools = client.list_all_tools().await.expect("list tools");
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
         let tool = tools
             .iter()
             .find(|tool| tool.name == "write_file")
@@ -3576,7 +3584,7 @@ fn read_file_integration_test_over_duplex() {
         use rmcp::ServiceExt;
         let mut client = ().serve(client_transport).await.expect("serve client");
         let tools = client.list_all_tools().await.expect("list tools");
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
         let tool = tools
             .iter()
             .find(|tool| tool.name == "read_file")
@@ -4295,4 +4303,87 @@ fn test_invalid_utf8_lossy() {
     let res = rt.block_on(async { server.execute_launch_process(req).await });
     assert!(matches!(res.status, LaunchProcessStatus::Completed));
     assert_eq!(res.stdout.unwrap(), "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}");
+}
+
+#[test]
+fn test_mcp_instructions_bootstrap_and_tool() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let start_time = Instant::now();
+
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let tx_clone = tx.clone();
+        let server_task = tokio::spawn(async move {
+            run_mcp_server_loop(tx_clone, start_time, server_transport).await;
+        });
+
+        use rmcp::ServiceExt;
+        let mut client = ().serve(client_transport).await.expect("Failed to serve client");
+
+        let server_info = client
+            .peer_info()
+            .expect("server initialise information should be available");
+        let transmitted_instructions = server_info
+            .instructions
+            .as_deref()
+            .expect("server instructions should be present");
+
+        // Test 1: InitializeResult.instructions is exactly the hardcoded bootstrap string.
+        assert_eq!(
+            transmitted_instructions,
+            "Call the get_instructions tool to get full instructions on how to use this MCP server. DO THIS BEFORE calling any other tools"
+        );
+
+        // Test 2: The initialisation field does not contain the generic instruction body.
+        assert!(!transmitted_instructions.contains(GENERAL_INSTRUCTIONS.trim()));
+
+        // Test 3: The initialisation field does not contain `# Manta Remote Control` or other `LOCAL.md` content.
+        assert!(!transmitted_instructions.contains("# Manta Remote Control"));
+        assert!(!transmitted_instructions.contains("Machine-specific instructions"));
+
+        // Test 4: Tool listing has get_instructions registered
+        let tools = client.list_all_tools().await.expect("Failed to list tools");
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "get_instructions")
+            .expect("get_instructions tool not found");
+
+        // Test 5: Input schema accepts no parameters
+        assert_eq!(tool.input_schema.get("type").and_then(|v| v.as_str()), Some("object"));
+        if let Some(props) = tool.input_schema.get("properties") {
+            assert!(props.as_object().map(|o| o.is_empty()).unwrap_or(true));
+        }
+
+        // Test 8: The returned tool content matches the same effective combined instructions assembled during startup.
+        let call_params = rmcp::model::CallToolRequestParams::new("get_instructions");
+        let call_result = client
+            .call_tool(call_params)
+            .await
+            .expect("Failed to call get_instructions tool");
+
+        assert_eq!(call_result.content.len(), 1);
+        let returned_instructions_text = match &call_result.content[0] {
+            rmcp::model::ContentBlock::Text(tc) => tc.text.clone(),
+            _ => panic!("Expected Text content block"),
+        };
+
+        let expected_loaded = crate::mcp::load_server_instructions();
+        assert_eq!(returned_instructions_text, expected_loaded.instructions.as_ref());
+
+        // Test 7: The return text must start with the generic instructions.
+        assert!(returned_instructions_text.starts_with(GENERAL_INSTRUCTIONS.trim()));
+        // If there was a local instructions loaded, it should be at the end.
+        if let crate::mcp::LocalInstructionsDiagnostic::Loaded { .. } = expected_loaded.diagnostic {
+            assert!(returned_instructions_text.contains(MACHINE_INSTRUCTIONS_HEADING));
+        }
+
+        client.close().await.expect("Failed to close client");
+        server_task.await.expect("Server task panicked");
+    });
 }

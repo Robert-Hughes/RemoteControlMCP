@@ -109,6 +109,11 @@ pub enum LaunchProcessStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GetInstructionsResult {
+    pub instructions: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LaunchProcessResult {
     pub status: LaunchProcessStatus,
     pub error: Option<String>,
@@ -307,6 +312,7 @@ impl RequestId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestData {
     Ping,
+    GetInstructions,
     LaunchProcess {
         command_line: String,
     },
@@ -327,6 +333,7 @@ pub enum RequestData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestUpdate {
     PingCompleted,
+    GetInstructionsCompleted,
     LaunchProcessResponded {
         status: LaunchProcessStatus,
         error: Option<String>,
@@ -500,6 +507,31 @@ impl McpServer {
     }
 
     #[tool(
+        description = "Get the full instructions on how to use this MCP server. Call this tool before calling any other tools.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<GetInstructionsResult>()
+            .expect("GetInstructionsResult should generate a valid output schema"),
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn get_instructions(&self) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let id = self.start_request(RequestData::GetInstructions);
+        let instructions = self.instructions.to_string();
+        let result = GetInstructionsResult {
+            instructions: instructions.clone(),
+        };
+        self.finish_structured_request(
+            id,
+            instructions,
+            &result,
+            RequestUpdate::GetInstructionsCompleted,
+        )
+    }
+
+    #[tool(
         description = "Check whether the local Remote Control MCP server is running and responding.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ping::PingResult>()
             .expect("PingResult should generate a valid output schema"),
@@ -577,6 +609,10 @@ impl McpServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
+        // This intentionally uses a short bootstrap because the ChatGPT MCP connector has been
+        // observed silently truncating longer MCP initialisation instruction strings,
+        // preventing later machine-specific instructions from reaching the model.
+        let bootstrap = "Call the get_instructions tool to get full instructions on how to use this MCP server. DO THIS BEFORE calling any other tools";
         rmcp::model::ServerInfo::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
@@ -586,7 +622,7 @@ impl ServerHandler for McpServer {
             "remote-control-mcp",
             env!("CARGO_PKG_VERSION"),
         ))
-        .with_instructions(self.instructions.to_string())
+        .with_instructions(bootstrap.to_string())
     }
 }
 

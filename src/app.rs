@@ -201,6 +201,12 @@ fn presentation_for_update(update: RequestUpdate) -> RequestPresentation {
             detail_text: None,
             pid: None,
         },
+        RequestUpdate::GetInstructionsCompleted => RequestPresentation {
+            state: RequestState::Completed,
+            status_text: "Completed".to_string(),
+            detail_text: None,
+            pid: None,
+        },
         RequestUpdate::LaunchProcessResponded {
             status,
             error,
@@ -284,6 +290,7 @@ fn apply_request_event(requests: &mut Vec<RequestEntry>, event: UiEvent) {
                 let is_primary_terminal = matches!(
                     &update,
                     RequestUpdate::PingCompleted
+                        | RequestUpdate::GetInstructionsCompleted
                         | RequestUpdate::LaunchProcessResponded { .. }
                         | RequestUpdate::ReadFileResponded { .. }
                         | RequestUpdate::WriteFileResponded { .. }
@@ -341,6 +348,7 @@ fn format_duration(duration: Duration) -> String {
 fn request_tool_name(request: &RequestData) -> &'static str {
     match request {
         RequestData::Ping => "ping",
+        RequestData::GetInstructions => "get_instructions",
         RequestData::LaunchProcess { .. } => "launch_process",
         RequestData::ReadFile { .. } => "read_file",
         RequestData::WriteFile { .. } => "write_file",
@@ -350,6 +358,7 @@ fn request_tool_name(request: &RequestData) -> &'static str {
 fn request_summary(request: &RequestEntry) -> String {
     match &request.request {
         RequestData::Ping => "Server health check".to_string(),
+        RequestData::GetInstructions => "Get server instructions".to_string(),
         RequestData::LaunchProcess { command_line } => {
             let command_line = truncate_with_ellipsis(command_line, MAX_COMMAND_LINE_CHARACTERS);
             request.pid.map_or(command_line.clone(), |pid| {
@@ -395,7 +404,10 @@ fn truncate_with_ellipsis(text: &str, maximum_characters: usize) -> String {
 fn request_summary_tooltip(request: &RequestEntry) -> Option<&str> {
     match &request.request {
         RequestData::LaunchProcess { command_line } => Some(command_line),
-        RequestData::Ping | RequestData::ReadFile { .. } | RequestData::WriteFile { .. } => None,
+        RequestData::Ping
+        | RequestData::GetInstructions
+        | RequestData::ReadFile { .. }
+        | RequestData::WriteFile { .. } => None,
     }
 }
 
