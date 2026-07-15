@@ -11,5 +11,13 @@ tokio = { version = "1", features = ["rt", "io-std", "io-util", "time"] }
 serde = { version = "1.0", features = ["derive"] }
 schemars = { version = "1.0" }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 rmcp = { version = "2.2", default-features = false, features = ["client"] }

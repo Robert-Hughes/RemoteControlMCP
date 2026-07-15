@@ -2,14 +2,22 @@ use crate::mcp::{
     LaunchProcessStatus, LocalInstructionsDiagnostic, ReadFileStatus, RequestData, RequestId,
     RequestUpdate, UiEvent, UiEventKind, WriteFileStatus,
 };
+use crate::tunnel::{self, TunnelLaunch, TunnelLaunchEvent};
 use chrono::{DateTime, Local, TimeZone};
 use eframe::egui;
 use std::fmt::Display;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 const MAX_REQUESTS: usize = 500;
 const MAX_COMMAND_LINE_CHARACTERS: usize = 80;
+
+#[derive(Debug)]
+enum TunnelUiState {
+    Idle,
+    Starting { log_path: String },
+    Failed { error: String },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestState {
@@ -509,6 +517,9 @@ pub struct RemoteControlApp {
     rx: Receiver<UiEvent>,
     requests: Vec<RequestEntry>,
     status_text: String,
+    standalone: bool,
+    tunnel_launch: Option<TunnelLaunch>,
+    tunnel_state: TunnelUiState,
     client_initialized: bool,
     fatal_error: Option<String>,
     local_instructions_diagnostic: Option<LocalInstructionsDiagnostic>,
@@ -521,6 +532,25 @@ impl RemoteControlApp {
             rx,
             requests: Vec::new(),
             status_text: "Starting".to_string(),
+            standalone: false,
+            tunnel_launch: None,
+            tunnel_state: TunnelUiState::Idle,
+            client_initialized: false,
+            fatal_error: None,
+            local_instructions_diagnostic: None,
+            start_time,
+        }
+    }
+
+    pub fn new_standalone(start_time: Instant) -> Self {
+        let (_tx, rx) = mpsc::channel();
+        Self {
+            rx,
+            requests: Vec::new(),
+            status_text: "Not connected".to_string(),
+            standalone: true,
+            tunnel_launch: None,
+            tunnel_state: TunnelUiState::Idle,
             client_initialized: false,
             fatal_error: None,
             local_instructions_diagnostic: None,
@@ -555,66 +585,170 @@ impl RemoteControlApp {
             }
         }
     }
+
+    fn start_tunnel(&mut self) {
+        match tunnel::start_tunnel() {
+            Ok(launch) => {
+                let log_path = launch.log_path().display().to_string();
+                self.status_text = "Starting Secure MCP Tunnel".to_string();
+                self.tunnel_state = TunnelUiState::Starting { log_path };
+                self.tunnel_launch = Some(launch);
+            }
+            Err(error) => {
+                self.status_text = "Tunnel launch failed".to_string();
+                self.tunnel_state = TunnelUiState::Failed { error };
+            }
+        }
+    }
+
+    fn receive_tunnel_event(&mut self) -> bool {
+        let event = self.tunnel_launch.as_ref().map(TunnelLaunch::try_recv);
+        match event {
+            Some(Ok(TunnelLaunchEvent::Ready)) => {
+                self.tunnel_launch.take();
+                true
+            }
+            Some(Ok(TunnelLaunchEvent::Failed(error))) => {
+                self.tunnel_launch.take();
+                self.status_text = "Tunnel launch failed".to_string();
+                self.tunnel_state = TunnelUiState::Failed { error };
+                false
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.tunnel_launch.take();
+                self.status_text = "Tunnel launch failed".to_string();
+                self.tunnel_state = TunnelUiState::Failed {
+                    error: "The tunnel launcher stopped without reporting a result.".to_string(),
+                };
+                false
+            }
+            Some(Err(TryRecvError::Empty)) | None => false,
+        }
+    }
+
+    fn render_standalone(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Current Status:");
+            ui.strong(&self.status_text);
+        });
+        ui.add_space(8.0);
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                "Remote Control MCP was started without an MCP stdio host",
+            );
+            ui.label(
+                "This process has no stdin/stdout pipe connection, so it cannot receive MCP requests.",
+            );
+            ui.label(
+                "Start it through the configured OpenAI Secure MCP Tunnel to connect it correctly.",
+            );
+
+            ui.add_space(8.0);
+            match &self.tunnel_state {
+                TunnelUiState::Idle => {}
+                TunnelUiState::Starting { log_path } => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Waiting for tunnel-client and its MCP child to become ready…");
+                    });
+                    ui.weak(format!("Tunnel log: {log_path}"));
+                }
+                TunnelUiState::Failed { error } => {
+                    ui.colored_label(ui.visuals().error_fg_color, "Tunnel launch failed");
+                    ui.label(error);
+                }
+            }
+
+            ui.add_space(8.0);
+            let starting = matches!(self.tunnel_state, TunnelUiState::Starting { .. });
+            let button_text = if matches!(self.tunnel_state, TunnelUiState::Failed { .. }) {
+                "Retry through Secure MCP Tunnel"
+            } else {
+                "Start through Secure MCP Tunnel"
+            };
+            if ui
+                .add_enabled(!starting, egui::Button::new(button_text))
+                .clicked()
+            {
+                self.start_tunnel();
+            }
+        });
+    }
+
+    fn render_hosted(&self, ui: &mut egui::Ui, current_elapsed: Duration) {
+        ui.horizontal(|ui| {
+            ui.label("Current Status:");
+            ui.strong(&self.status_text);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Client called initialize:");
+            ui.strong(if self.client_initialized { "yes" } else { "no" });
+        });
+        if let Some(diagnostic) = &self.local_instructions_diagnostic {
+            ui.add_space(5.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Local instructions:");
+                match diagnostic {
+                    LocalInstructionsDiagnostic::Loaded { path } => {
+                        let colour = state_colour(ui, RequestState::Completed);
+                        ui.colored_label(colour, format!("Loaded · {}", path.display()));
+                    }
+                    LocalInstructionsDiagnostic::Warning { path, message } => {
+                        let colour = state_colour(ui, RequestState::Warning);
+                        ui.colored_label(
+                            colour,
+                            format!("Warning · {} · {message}", path.display()),
+                        );
+                    }
+                }
+            });
+        }
+        if let Some(error) = &self.fatal_error {
+            ui.add_space(5.0);
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.colored_label(ui.visuals().error_fg_color, "Fatal server error");
+                ui.label(error);
+            });
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(5.0);
+        ui.label("Requests:");
+        ui.add_space(5.0);
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                for request in self.requests.iter().rev() {
+                    render_request_row(ui, request, current_elapsed);
+                    ui.add_space(4.0);
+                }
+            });
+    }
 }
 
 impl eframe::App for RemoteControlApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.receive_events();
+        let close_after_tunnel_handoff = self.receive_tunnel_event();
         let current_elapsed = self.start_time.elapsed();
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Remote Control MCP");
             ui.add_space(5.0);
-            ui.horizontal(|ui| {
-                ui.label("Current Status:");
-                ui.strong(&self.status_text);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Client called initialize:");
-                ui.strong(if self.client_initialized { "yes" } else { "no" });
-            });
-            if let Some(diagnostic) = &self.local_instructions_diagnostic {
-                ui.add_space(5.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Local instructions:");
-                    match diagnostic {
-                        LocalInstructionsDiagnostic::Loaded { path } => {
-                            let colour = state_colour(ui, RequestState::Completed);
-                            ui.colored_label(colour, format!("Loaded · {}", path.display()));
-                        }
-                        LocalInstructionsDiagnostic::Warning { path, message } => {
-                            let colour = state_colour(ui, RequestState::Warning);
-                            ui.colored_label(
-                                colour,
-                                format!("Warning · {} · {message}", path.display()),
-                            );
-                        }
-                    }
-                });
+            if self.standalone {
+                self.render_standalone(ui);
+            } else {
+                self.render_hosted(ui, current_elapsed);
             }
-            if let Some(error) = &self.fatal_error {
-                ui.add_space(5.0);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.colored_label(ui.visuals().error_fg_color, "Fatal server error");
-                    ui.label(error);
-                });
-            }
-
-            ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(5.0);
-            ui.label("Requests:");
-            ui.add_space(5.0);
-
-            egui::ScrollArea::vertical()
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    for request in self.requests.iter().rev() {
-                        render_request_row(ui, request, current_elapsed);
-                        ui.add_space(4.0);
-                    }
-                });
         });
+
+        if close_after_tunnel_handoff {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
@@ -644,6 +778,17 @@ mod tests {
                 update,
             },
         }
+    }
+
+    #[test]
+    fn standalone_mode_starts_without_an_mcp_worker_or_requests() {
+        let app = RemoteControlApp::new_standalone(Instant::now());
+
+        assert!(app.standalone);
+        assert_eq!(app.status_text, "Not connected");
+        assert!(app.requests.is_empty());
+        assert!(app.tunnel_launch.is_none());
+        assert!(matches!(app.tunnel_state, TunnelUiState::Idle));
     }
 
     #[test]

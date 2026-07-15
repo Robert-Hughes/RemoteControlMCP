@@ -221,13 +221,15 @@ To build the application, run:
 cargo build
 ```
 
-## Running directly
+## Starting from the executable
 
 ```powershell
 .\target\debug\remote-control-mcp.exe
 ```
 
-When run directly from a normal terminal, there is no MCP client feeding `stdin`, so the GUI will remain waiting for a client.
+When started directly, the application detects that no MCP host supplied stdin/stdout pipes and does not start its MCP worker. The GUI explains the problem and offers **Start through Secure MCP Tunnel**. That button launches the configured `tunnel-client`, waits for its `/readyz` endpoint, and closes the original window only after the tunnel and the replacement MCP process are ready.
+
+The button requires the one-time launcher path and runtime-key file configuration documented in [DEVELOPER_SETUP.md](docs/DEVELOPER_SETUP.md). MCP Inspector continues to work normally because it launches the executable with a valid stdio pipe transport.
 
 ## Automated tests
 

@@ -86,7 +86,7 @@ First, compile and validate the Rust GUI application locally:
    This command must return `True`.
 
 > [!IMPORTANT]
-> Do not manually run the compiled `remote-control-mcp.exe` binary. The `tunnel-client` daemon will launch it automatically as a child process and manage its standard input and output streams.
+> Normally, let `tunnel-client` launch `remote-control-mcp.exe` so it can manage the application's standard input and output streams. If the application is started directly, it now reports that no MCP stdio host is connected and can launch the configured tunnel client for you after the remaining setup steps are complete.
 
 ---
 
@@ -123,41 +123,73 @@ To set up the tunnel in the OpenAI control plane:
 > **Security Requirement:** Runtime API keys are secrets.
 > * They must never be committed to source control or pasted into documentation, screenshots, issue reports, or shared logs.
 > * If a key is ever exposed in terminal transcripts or shell histories, revoke and replace it immediately.
-> * The generated profile references `env:CONTROL_PLANE_API_KEY` rather than storing the literal key.
-> * Remove the environment variable from your session once testing is complete.
+> * The key is stored in a separate access-controlled file, not in the generated profile, application configuration, command line, or repository.
+> * The setup below removes inherited file permissions and grants access only to the current Windows account.
 
 ---
 
 ## 6. Configure the PowerShell Session Securely
 
-In your open PowerShell session, define path and identifier variables to make your commands portable:
+In your open PowerShell session, define path and identifier variables to make your commands portable. Use an absolute path to the downloaded tunnel client:
 
 ```powershell
-$TunnelClient = "C:\path\to\tunnel-client.exe"
+$TunnelClient = (Resolve-Path -LiteralPath "C:\path\to\tunnel-client.exe").Path
 $TunnelId = "tunnel_<your-tunnel-id>"
 $McpExe = (Resolve-Path ".\target\debug\remote-control-mcp.exe").Path
 ```
 
-Next, prompt for the runtime API key securely without exposing it in your PowerShell command history:
+Record the tunnel-client executable path for the GUI relaunch button:
 
 ```powershell
-$secureRuntimeKey = Read-Host "OpenAI tunnel runtime API key" -AsSecureString
-$env:CONTROL_PLANE_API_KEY = [System.Net.NetworkCredential]::new("", $secureRuntimeKey).Password
-Remove-Variable secureRuntimeKey
+$LauncherConfigDirectory = Join-Path $env:APPDATA "RemoteControlMCP"
+$TunnelClientPathFile = Join-Path $LauncherConfigDirectory "tunnel-client-path.txt"
+New-Item -ItemType Directory -Path $LauncherConfigDirectory -Force | Out-Null
+[System.IO.File]::WriteAllText(
+    $TunnelClientPathFile,
+    $TunnelClient,
+    [System.Text.UTF8Encoding]::new($false)
+)
 ```
 
-Verify that the environment variable is set without printing its value to the terminal:
+Next, prompt for the runtime API key, write it without a trailing newline or UTF-8 BOM, and restrict the file to the current Windows account:
 
 ```powershell
-if ($env:CONTROL_PLANE_API_KEY) {
-    "Runtime API key is set"
-} else {
-    throw "CONTROL_PLANE_API_KEY is not set"
+$KeyDirectory = Join-Path $env:APPDATA "tunnel-client"
+$KeyFile = Join-Path $KeyDirectory "remote-control-mcp.key"
+New-Item -ItemType Directory -Path $KeyDirectory -Force | Out-Null
+
+$secureRuntimeKey = Read-Host "OpenAI tunnel runtime API key" -AsSecureString
+$runtimeKey = [System.Net.NetworkCredential]::new("", $secureRuntimeKey).Password
+try {
+    [System.IO.File]::WriteAllText(
+        $KeyFile,
+        $runtimeKey,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+} finally {
+    Remove-Variable runtimeKey -ErrorAction SilentlyContinue
+    Remove-Variable secureRuntimeKey -ErrorAction SilentlyContinue
 }
+
+$keyAcl = Get-Acl -LiteralPath $KeyFile
+$keyAcl.SetAccessRuleProtection($true, $false)
+foreach ($accessRule in @($keyAcl.Access)) {
+    [void]$keyAcl.RemoveAccessRuleSpecific($accessRule)
+}
+$currentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$keyRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+    $currentUserSid,
+    [System.Security.AccessControl.FileSystemRights]::FullControl,
+    [System.Security.AccessControl.AccessControlType]::Allow
+)
+[void]$keyAcl.AddAccessRule($keyRule)
+Set-Acl -LiteralPath $KeyFile -AclObject $keyAcl
+
+$KeyReference = "file:$KeyFile"
 ```
 
 > [!NOTE]
-> The `$env:CONTROL_PLANE_API_KEY` environment variable is scoped strictly to the current PowerShell process and its child processes. The validation (`doctor`) and daemon (`run`) commands must be run within this same PowerShell session.
+> The key remains plaintext at rest so that `tunnel-client` can read it non-interactively, but the file's Windows ACL is restricted to your account. The application checks that this exact non-empty file exists but never reads its contents. `tunnel-client` resolves the `file:` reference itself.
 
 ---
 
@@ -181,7 +213,8 @@ $McpCommand = $McpExe.Replace("\", "\\")
     --sample sample_mcp_stdio_local `
     --profile remote-control-mcp `
     --tunnel-id $TunnelId `
-    --mcp-command $McpCommand
+    --mcp-command $McpCommand `
+    --control-plane-api-key-ref $KeyReference
 ```
 
 The generated configuration profile will be saved to:
@@ -195,6 +228,7 @@ If you need to overwrite an existing profile to update the tunnel ID or command 
     --profile remote-control-mcp `
     --tunnel-id $TunnelId `
     --mcp-command $McpCommand `
+    --control-plane-api-key-ref $KeyReference `
     --force
 ```
 
@@ -210,6 +244,7 @@ Verify that the profile is fully operational before connecting:
 ```powershell
 & $TunnelClient doctor `
     --profile remote-control-mcp `
+    --control-plane.api-key $KeyReference `
     --explain
 ```
 
@@ -233,10 +268,12 @@ The output should show pass results for configuration checks, including profile 
 
 ## 9. Start the Tunnel Client
 
-Start the tunnel client daemon in the active PowerShell session (where `$env:CONTROL_PLANE_API_KEY` is set):
+Start the tunnel client daemon manually with the protected key-file reference:
 
 ```powershell
-& $TunnelClient run --profile remote-control-mcp
+& $TunnelClient run `
+    --profile remote-control-mcp `
+    --control-plane.api-key $KeyReference
 ```
 
 For longer development sessions, increase the maximum lifetime of the local MCP transport connection from the tunnel client's 10-minute default:
@@ -244,20 +281,24 @@ For longer development sessions, increase the maximum lifetime of the local MCP 
 ```powershell
 & $TunnelClient run `
     --profile remote-control-mcp `
+    --control-plane.api-key $KeyReference `
     --mcp.connection-max-ttl 24h
 ```
 
 This reduces stdio child-process rotation during a typical development session. It does not repair an already stale MCP session; after restarting the tunnel or local MCP process, start a new ChatGPT conversation so that the new connection receives a fresh MCP `initialize` handshake.
 
-* **Keep Running:** Leave this terminal pane open. The process must remain active to handle connection dispatches.
-* **Structured Logs:** A large volume of structured tunnel-client startup and lifecycle logs may appear in the terminal.
+Alternatively, start `remote-control-mcp.exe` directly and select **Start through Secure MCP Tunnel**. The application uses the recorded tunnel-client path, the fixed `remote-control-mcp` profile, and `%APPDATA%\tunnel-client\remote-control-mcp.key`. It starts the tunnel on an ephemeral loopback health port, waits for `/readyz`, then closes the original standalone window. Tunnel logs are written beneath `%TEMP%\RemoteControlMCP`.
+
+* **Manual launch:** Leave the terminal pane open. The process must remain active to handle connection dispatches.
+* **GUI-button launch:** The tunnel client runs without a console window. Stop `tunnel-client.exe` from Task Manager when the session is finished; stopping it also ends the stdio connection to the GUI application.
+* **Structured Logs:** Manual launches write structured logs to the terminal. GUI-button launches write them beneath `%TEMP%\RemoteControlMCP`.
 * **Automatic UI Launch:** The local Rust GUI application will launch automatically.
 * **Initialisation Handshake:** The status label in the Rust GUI will transition to `Connected` once the MCP handshake completes.
-* **Admin Interface:** The local tunnel client exposes a browser-based admin UI. By default, this is available at:
+* **Admin Interface:** A manually launched tunnel client exposes its browser-based admin UI at the profile's configured health address. By default, this is:
   ```text
   http://127.0.0.1:8080/ui
   ```
-  *(If your profile health listener configuration differs, use the exact admin UI URL reported by `doctor`)*
+  The GUI button deliberately uses an ephemeral loopback health port so it cannot collide with another local service.
 
 ---
 
@@ -324,13 +365,9 @@ This confirms the complete path of execution:
 
 When you are finished testing:
 
-1. Stop the `tunnel-client` daemon by pressing `Ctrl+C` in the PowerShell window.
-2. Remove the runtime key from the active PowerShell environment variables:
-   ```powershell
-   Remove-Item Env:CONTROL_PLANE_API_KEY -ErrorAction SilentlyContinue
-   ```
-3. Close the Rust GUI application window if it does not shut down automatically when the parent process exits.
-4. Revoke the API key in the OpenAI Platform Dashboard if you do not plan to reuse it immediately or suspect it was exposed.
+1. Stop the `tunnel-client` daemon by pressing `Ctrl+C` in its PowerShell window, or stop `tunnel-client.exe` from Task Manager if it was launched by the GUI button.
+2. Close the Rust GUI application window if it does not shut down automatically when the parent process exits.
+3. The protected runtime key file remains available for the next launch. If you are decommissioning the setup, revoke the key in the OpenAI Platform Dashboard and then delete `%APPDATA%\tunnel-client\remote-control-mcp.key`.
 
 ---
 
@@ -341,9 +378,13 @@ When you are finished testing:
 * **Cause:** The tunnel-client parser stripped the single backslashes in the command path.
 * **Fix:** Use double backslashes in your command during initialization (`--mcp-command $McpCommand` with path replacements).
 
-### `CONTROL_PLANE_API_KEY` is not set
-* **Symptom:** `invalid control_plane.api_key reference "env:CONTROL_PLANE_API_KEY"`
-* **Fix:** Make sure you set the environment variable in the *same* PowerShell session you are running `doctor` or `run` in. If you open a new window, you must set the variable again.
+### Runtime API key file is missing
+* **Symptom:** The GUI reports that `%APPDATA%\tunnel-client\remote-control-mcp.key` is missing or `tunnel-client` reports an invalid `file:` API-key reference.
+* **Fix:** Repeat the key-file creation and ACL commands in section 6, then run `doctor` with `--control-plane.api-key $KeyReference`.
+
+### Tunnel-client executable path is missing
+* **Symptom:** The GUI cannot launch `tunnel-client.exe` or reports that `tunnel-client-path.txt` is invalid.
+* **Fix:** Repeat the launcher-path commands in section 6. The file must contain one existing absolute path to `tunnel-client.exe`.
 
 ### Profile already exists
 * **Symptom:** `profile "remote-control-mcp" already exists`
