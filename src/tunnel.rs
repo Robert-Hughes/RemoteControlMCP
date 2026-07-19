@@ -96,6 +96,9 @@ pub fn start_tunnel() -> Result<TunnelLaunch, String> {
     validate_key_file(&key_path)?;
 
     let tunnel_client = resolve_tunnel_client(&app_data)?;
+    let mcp_executable = std::env::current_exe().map_err(|error| {
+        format!("Could not determine the currently running MCP executable: {error}")
+    })?;
     let runtime_directory = std::env::temp_dir().join("RemoteControlMCP");
     fs::create_dir_all(&runtime_directory).map_err(|error| {
         format!(
@@ -117,6 +120,7 @@ pub fn start_tunnel() -> Result<TunnelLaunch, String> {
         .spawn(move || {
             run_tunnel_launcher(
                 tunnel_client,
+                mcp_executable,
                 key_path,
                 health_url_path,
                 worker_log_path,
@@ -206,8 +210,14 @@ fn prefixed_path_argument(prefix: &str, path: &Path) -> OsString {
     argument
 }
 
+fn mcp_command_argument(path: &Path) -> OsString {
+    let escaped_path = path.to_string_lossy().replace('\\', "\\\\");
+    OsString::from(format!("command={escaped_path},channel=main"))
+}
+
 fn run_tunnel_launcher(
     tunnel_client: PathBuf,
+    mcp_executable: PathBuf,
     key_path: PathBuf,
     health_url_path: PathBuf,
     log_path: PathBuf,
@@ -216,6 +226,7 @@ fn run_tunnel_launcher(
 ) {
     let result = run_tunnel_launcher_inner(
         &tunnel_client,
+        &mcp_executable,
         &key_path,
         &health_url_path,
         &log_path,
@@ -234,6 +245,7 @@ fn run_tunnel_launcher(
 
 fn run_tunnel_launcher_inner(
     tunnel_client: &Path,
+    mcp_executable: &Path,
     key_path: &Path,
     health_url_path: &Path,
     log_path: &Path,
@@ -249,6 +261,8 @@ fn run_tunnel_launcher_inner(
         .arg("run")
         .arg("--profile")
         .arg(PROFILE_NAME)
+        .arg("--mcp.command")
+        .arg(mcp_command_argument(mcp_executable))
         .arg(prefixed_path_argument(
             "--control-plane.api-key=file:",
             key_path,
@@ -452,6 +466,19 @@ mod tests {
         assert_eq!(
             argument,
             OsStr::new(r"--health.url-file=C:\Temp\Remote Control\health.url")
+        );
+    }
+
+    #[test]
+    fn mcp_command_override_uses_the_running_executable_path() {
+        let argument = mcp_command_argument(Path::new(
+            r"D:\Programming\Remote Control MCP\remote-control-mcp.exe",
+        ));
+        assert_eq!(
+            argument,
+            OsStr::new(
+                r"command=D:\\Programming\\Remote Control MCP\\remote-control-mcp.exe,channel=main"
+            )
         );
     }
 }

@@ -13,7 +13,7 @@ This setup allows a ChatGPT client to securely invoke the local `remote-control-
 * **Exclusive Stdout:** Standard output (`stdout`) of the Rust application is strictly reserved for MCP JSON-RPC messages; diagnostic logs are redirected to `stderr` or the GUI.
 * **Continuous Operation:** The tunnel client must remain running continuously for ChatGPT application discovery and for executing all incoming MCP tool calls.
 
-This guide is written specifically for developers using **Windows PowerShell** and targeting the **Debug executable**.
+This guide is written specifically for developers using **Windows PowerShell** and targeting the **release executable**.
 
 ### Architecture
 
@@ -76,12 +76,12 @@ First, compile and validate the Rust GUI application locally:
    cargo check
    cargo test
    cargo clippy --all-targets -- -D warnings
-   cargo build
+   cargo build --release
    ```
 
-3. Confirm that the debug executable was built successfully:
+3. Confirm that the release executable was built successfully:
    ```powershell
-   Test-Path .\target\debug\remote-control-mcp.exe
+   Test-Path .\target\release\remote-control-mcp.exe
    ```
    This command must return `True`.
 
@@ -135,7 +135,7 @@ In your open PowerShell session, define path and identifier variables to make yo
 ```powershell
 $TunnelClient = (Resolve-Path -LiteralPath "C:\path\to\tunnel-client.exe").Path
 $TunnelId = "tunnel_<your-tunnel-id>"
-$McpExe = (Resolve-Path ".\target\debug\remote-control-mcp.exe").Path
+$McpExe = (Resolve-Path ".\target\release\remote-control-mcp.exe").Path
 ```
 
 Record the tunnel-client executable path for the GUI relaunch button:
@@ -200,9 +200,9 @@ Initialize a local profile named `remote-control-mcp` to tell the tunnel client 
 ### Windows Path Escaping Pitfall
 
 Windows single backslashes in paths can be consumed as escape characters by the tunnel-client command parser. For instance:
-`C:\path\to\RemoteControlMCP\target\debug\remote-control-mcp.exe`
+`C:\path\to\RemoteControlMCP\target\release\remote-control-mcp.exe`
 can be incorrectly parsed as:
-`C:pathtoRemoteControlMCPtargetdebugremote-control-mcp.exe`
+`C:pathtoRemoteControlMCPtargetreleaseremote-control-mcp.exe`
 
 To avoid this, use the following PowerShell script to double all backslashes inside the command argument:
 

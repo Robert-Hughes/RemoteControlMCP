@@ -524,6 +524,11 @@ fn state_colour(ui: &egui::Ui, state: RequestState) -> egui::Color32 {
     }
 }
 
+fn paint_status_dot(ui: &mut egui::Ui, colour: egui::Color32) {
+    let (response, painter) = ui.allocate_painter(egui::vec2(12.0, 16.0), egui::Sense::hover());
+    painter.circle_filled(response.rect.center(), 4.0, colour);
+}
+
 fn render_request_row(ui: &mut egui::Ui, request: &RequestEntry, current_elapsed: Duration) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -765,7 +770,7 @@ impl RemoteControlApp {
 
     fn render_hosted(&self, ui: &mut egui::Ui, current_elapsed: Duration) {
         ui.horizontal_wrapped(|ui| {
-            ui.label("●");
+            paint_status_dot(ui, ui.visuals().strong_text_color());
             ui.strong(&self.status_text);
             ui.separator();
             ui.weak("Initialized");
