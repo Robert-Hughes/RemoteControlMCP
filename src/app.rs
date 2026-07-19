@@ -7,10 +7,46 @@ use chrono::{DateTime, Local, TimeZone};
 use eframe::egui;
 use std::fmt::Display;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const MAX_REQUESTS: usize = 500;
 const MAX_COMMAND_LINE_CHARACTERS: usize = 80;
+const BUSY_ICON_COOLDOWN: Duration = Duration::from_secs(5);
+
+pub fn normal_icon() -> Arc<egui::IconData> {
+    static ICON: OnceLock<Arc<egui::IconData>> = OnceLock::new();
+    Arc::clone(ICON.get_or_init(|| {
+        Arc::new(
+            eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon.png"))
+                .expect("embedded application icon should be a valid PNG"),
+        )
+    }))
+}
+
+fn busy_icon() -> Arc<egui::IconData> {
+    static ICON: OnceLock<Arc<egui::IconData>> = OnceLock::new();
+    Arc::clone(ICON.get_or_init(|| {
+        Arc::new(
+            eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon-busy.png"))
+                .expect("embedded busy application icon should be a valid PNG"),
+        )
+    }))
+}
+
+struct AppIcons {
+    normal: Arc<egui::IconData>,
+    busy: Arc<egui::IconData>,
+}
+
+impl AppIcons {
+    fn load() -> Self {
+        Self {
+            normal: normal_icon(),
+            busy: busy_icon(),
+        }
+    }
+}
 
 #[derive(Debug)]
 enum TunnelUiState {
@@ -275,6 +311,19 @@ fn prune_requests(requests: &mut Vec<RequestEntry>) {
     }
 }
 
+fn should_show_busy_icon(
+    requests: &[RequestEntry],
+    last_request_activity: Option<Duration>,
+    current_elapsed: Duration,
+) -> bool {
+    requests
+        .iter()
+        .any(|request| request.state == RequestState::InProgress)
+        || last_request_activity.is_some_and(|last_activity| {
+            current_elapsed.saturating_sub(last_activity) < BUSY_ICON_COOLDOWN
+        })
+}
+
 fn apply_request_event(requests: &mut Vec<RequestEntry>, event: UiEvent) {
     match event.kind {
         UiEventKind::RequestStarted {
@@ -516,6 +565,9 @@ fn render_request_row(ui: &mut egui::Ui, request: &RequestEntry, current_elapsed
 pub struct RemoteControlApp {
     rx: Receiver<UiEvent>,
     requests: Vec<RequestEntry>,
+    icons: AppIcons,
+    busy_icon_active: bool,
+    last_request_activity: Option<Duration>,
     status_text: String,
     standalone: bool,
     tunnel_launch: Option<TunnelLaunch>,
@@ -531,6 +583,9 @@ impl RemoteControlApp {
         Self {
             rx,
             requests: Vec::new(),
+            icons: AppIcons::load(),
+            busy_icon_active: false,
+            last_request_activity: None,
             status_text: "Starting".to_string(),
             standalone: false,
             tunnel_launch: None,
@@ -547,6 +602,9 @@ impl RemoteControlApp {
         Self {
             rx,
             requests: Vec::new(),
+            icons: AppIcons::load(),
+            busy_icon_active: false,
+            last_request_activity: None,
             status_text: "Not connected".to_string(),
             standalone: true,
             tunnel_launch: None,
@@ -560,6 +618,13 @@ impl RemoteControlApp {
 
     fn receive_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
+            if matches!(
+                &event.kind,
+                UiEventKind::RequestStarted { .. } | UiEventKind::RequestUpdated { .. }
+            ) {
+                self.last_request_activity = Some(event.elapsed);
+            }
+
             match &event.kind {
                 UiEventKind::WorkerStarted => self.status_text = "Worker started".to_string(),
                 UiEventKind::ServerStarting => {
@@ -584,6 +649,22 @@ impl RemoteControlApp {
                 }
             }
         }
+    }
+
+    fn update_window_icon(&mut self, context: &egui::Context, current_elapsed: Duration) {
+        let should_be_busy =
+            should_show_busy_icon(&self.requests, self.last_request_activity, current_elapsed);
+        if should_be_busy == self.busy_icon_active {
+            return;
+        }
+
+        self.busy_icon_active = should_be_busy;
+        let icon = if should_be_busy {
+            Arc::clone(&self.icons.busy)
+        } else {
+            Arc::clone(&self.icons.normal)
+        };
+        context.send_viewport_cmd(egui::ViewportCommand::Icon(Some(icon)));
     }
 
     fn start_tunnel(&mut self) {
@@ -735,6 +816,7 @@ impl eframe::App for RemoteControlApp {
         self.receive_events();
         let close_after_tunnel_handoff = self.receive_tunnel_event();
         let current_elapsed = self.start_time.elapsed();
+        self.update_window_icon(ui.ctx(), current_elapsed);
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Remote Control MCP");
@@ -807,6 +889,65 @@ mod tests {
         assert_eq!(format_duration(Duration::from_millis(321)), "0.321s");
         assert_eq!(format_duration(Duration::from_millis(2_100)), "2.1s");
         assert_eq!(format_duration(Duration::from_secs(65)), "1m 05s");
+    }
+
+    #[test]
+    fn busy_icon_stays_active_while_a_request_is_running_and_during_cooldown() {
+        let mut requests = Vec::new();
+        assert!(!should_show_busy_icon(
+            &requests,
+            None,
+            Duration::from_secs(20)
+        ));
+
+        apply_request_event(&mut requests, started_event(1, Duration::from_secs(1)));
+        assert!(should_show_busy_icon(
+            &requests,
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(20)
+        ));
+
+        apply_request_event(
+            &mut requests,
+            updated_event(1, Duration::from_secs(20), RequestUpdate::PingCompleted),
+        );
+        assert!(should_show_busy_icon(
+            &requests,
+            Some(Duration::from_secs(20)),
+            Duration::from_millis(24_999)
+        ));
+        assert!(!should_show_busy_icon(
+            &requests,
+            Some(Duration::from_secs(20)),
+            Duration::from_secs(25)
+        ));
+    }
+
+    #[test]
+    fn busy_icon_remains_active_until_overlapping_requests_finish() {
+        let mut requests = Vec::new();
+        apply_request_event(&mut requests, started_event(1, Duration::from_secs(1)));
+        apply_request_event(&mut requests, started_event(2, Duration::from_secs(2)));
+        apply_request_event(
+            &mut requests,
+            updated_event(1, Duration::from_secs(3), RequestUpdate::PingCompleted),
+        );
+
+        assert!(should_show_busy_icon(
+            &requests,
+            Some(Duration::from_secs(3)),
+            Duration::from_secs(30)
+        ));
+
+        apply_request_event(
+            &mut requests,
+            updated_event(2, Duration::from_secs(30), RequestUpdate::PingCompleted),
+        );
+        assert!(!should_show_busy_icon(
+            &requests,
+            Some(Duration::from_secs(30)),
+            Duration::from_secs(35)
+        ));
     }
 
     #[test]

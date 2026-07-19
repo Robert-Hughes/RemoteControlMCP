@@ -27,10 +27,8 @@ fn main() -> eframe::Result {
         app::RemoteControlApp::new_standalone(start_time)
     };
 
-    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon.png"))
-        .expect("embedded application icon should be a valid PNG");
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default().with_icon(icon),
+        viewport: eframe::egui::ViewportBuilder::default().with_icon(app::normal_icon()),
         ..Default::default()
     };
 
