@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-const MAX_REQUESTS: usize = 500;
+const MAX_RECENT_REQUESTS: usize = 100;
 const MAX_COMMAND_LINE_CHARACTERS: usize = 80;
 const BUSY_ICON_COOLDOWN: Duration = Duration::from_secs(5);
 
@@ -300,15 +300,20 @@ fn presentation_for_update(update: RequestUpdate) -> RequestPresentation {
 }
 
 fn prune_requests(requests: &mut Vec<RequestEntry>) {
-    while requests.len() > MAX_REQUESTS {
-        let Some(index) = requests
-            .iter()
-            .position(|request| request.state != RequestState::InProgress)
-        else {
-            break;
-        };
-        requests.remove(index);
+    let mut excess = requests
+        .iter()
+        .filter(|request| request.state != RequestState::InProgress)
+        .count()
+        .saturating_sub(MAX_RECENT_REQUESTS);
+    if excess == 0 {
+        return;
     }
+
+    requests.retain(|request| {
+        let remove = excess != 0 && request.state != RequestState::InProgress;
+        excess -= usize::from(remove);
+        !remove
+    });
 }
 
 fn should_show_busy_icon(
@@ -759,12 +764,11 @@ impl RemoteControlApp {
     }
 
     fn render_hosted(&self, ui: &mut egui::Ui, current_elapsed: Duration) {
-        ui.horizontal(|ui| {
-            ui.label("Current Status:");
+        ui.horizontal_wrapped(|ui| {
+            ui.label("●");
             ui.strong(&self.status_text);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Client called initialize:");
+            ui.separator();
+            ui.weak("Initialized");
             ui.strong(if self.client_initialized { "yes" } else { "no" });
         });
         if let Some(diagnostic) = &self.local_instructions_diagnostic {
@@ -794,11 +798,11 @@ impl RemoteControlApp {
             });
         }
 
-        ui.add_space(10.0);
+        ui.add_space(6.0);
         ui.separator();
-        ui.add_space(5.0);
-        ui.label("Requests:");
-        ui.add_space(5.0);
+        ui.add_space(3.0);
+        ui.strong("Recent requests");
+        ui.add_space(3.0);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
@@ -819,8 +823,6 @@ impl eframe::App for RemoteControlApp {
         self.update_window_icon(ui.ctx(), current_elapsed);
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("Remote Control MCP");
-            ui.add_space(5.0);
             if self.standalone {
                 self.render_standalone(ui);
             } else {
@@ -1073,38 +1075,42 @@ mod tests {
     }
 
     #[test]
-    fn retention_removes_oldest_finished_and_preserves_active_requests() {
+    fn active_requests_are_retained_beyond_the_recent_history_limit() {
         let mut requests = Vec::new();
-        for id in 1..=(MAX_REQUESTS as u64 + 1) {
+        for id in 1..=(MAX_RECENT_REQUESTS as u64 + 2) {
             apply_request_event(&mut requests, started_event(id, Duration::from_secs(id)));
         }
-        assert_eq!(requests.len(), MAX_REQUESTS + 1);
-
-        apply_request_event(
-            &mut requests,
-            updated_event(1, Duration::from_secs(700), RequestUpdate::PingCompleted),
-        );
-        assert_eq!(requests.len(), MAX_REQUESTS);
-        assert!(!requests.iter().any(|request| request.id == RequestId(1)));
+        assert_eq!(requests.len(), MAX_RECENT_REQUESTS + 2);
         assert!(
             requests
                 .iter()
                 .all(|request| request.state == RequestState::InProgress)
         );
 
-        apply_request_event(&mut requests, started_event(700, Duration::from_secs(701)));
-        apply_request_event(
-            &mut requests,
-            updated_event(2, Duration::from_secs(702), RequestUpdate::PingCompleted),
+        for id in 1..=(MAX_RECENT_REQUESTS as u64 + 1) {
+            apply_request_event(
+                &mut requests,
+                updated_event(
+                    id,
+                    Duration::from_secs(700 + id),
+                    RequestUpdate::PingCompleted,
+                ),
+            );
+        }
+
+        assert_eq!(requests.len(), MAX_RECENT_REQUESTS + 1);
+        assert!(!requests.iter().any(|request| request.id == RequestId(1)));
+        assert_eq!(
+            requests.last().unwrap().id,
+            RequestId(MAX_RECENT_REQUESTS as u64 + 2)
         );
-        assert_eq!(requests.len(), MAX_REQUESTS);
-        assert!(!requests.iter().any(|request| request.id == RequestId(2)));
+        assert_eq!(requests.last().unwrap().state, RequestState::InProgress);
     }
 
     #[test]
     fn finished_requests_are_capped_and_oldest_is_removed_first() {
         let mut requests = Vec::new();
-        for id in 1..=(MAX_REQUESTS as u64 + 1) {
+        for id in 1..=(MAX_RECENT_REQUESTS as u64 + 1) {
             apply_request_event(&mut requests, started_event(id, Duration::from_secs(id)));
             apply_request_event(
                 &mut requests,
@@ -1115,9 +1121,12 @@ mod tests {
                 ),
             );
         }
-        assert_eq!(requests.len(), MAX_REQUESTS);
+        assert_eq!(requests.len(), MAX_RECENT_REQUESTS);
         assert_eq!(requests.first().unwrap().id, RequestId(2));
-        assert_eq!(requests.last().unwrap().id, RequestId(501));
+        assert_eq!(
+            requests.last().unwrap().id,
+            RequestId(MAX_RECENT_REQUESTS as u64 + 1)
+        );
         assert!(
             requests
                 .iter()
