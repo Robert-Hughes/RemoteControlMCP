@@ -661,7 +661,12 @@ impl RemoteControlApp {
         }
     }
 
-    fn update_window_icon(&mut self, context: &egui::Context, current_elapsed: Duration) {
+    fn update_window_icon(
+        &mut self,
+        context: &egui::Context,
+        frame: &eframe::Frame,
+        current_elapsed: Duration,
+    ) {
         let should_be_busy =
             should_show_busy_icon(&self.requests, self.last_request_activity, current_elapsed);
         if should_be_busy == self.busy_icon_active {
@@ -675,6 +680,24 @@ impl RemoteControlApp {
             Arc::clone(&self.icons.normal)
         };
         context.send_viewport_cmd(egui::ViewportCommand::Icon(Some(icon)));
+
+        #[cfg(target_os = "windows")]
+        if let Some(window) = frame.winit_window() {
+            use winit::platform::windows::WindowExtWindows as _;
+
+            let taskbar_icon = if should_be_busy {
+                &self.icons.busy
+            } else {
+                &self.icons.normal
+            };
+            let taskbar_icon = winit::window::Icon::from_rgba(
+                taskbar_icon.rgba.clone(),
+                taskbar_icon.width,
+                taskbar_icon.height,
+            )
+            .expect("embedded application icon should have valid RGBA dimensions");
+            window.set_taskbar_icon(Some(taskbar_icon));
+        }
     }
 
     fn start_tunnel(&mut self) {
@@ -821,11 +844,11 @@ impl RemoteControlApp {
 }
 
 impl eframe::App for RemoteControlApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.receive_events();
         let close_after_tunnel_handoff = self.receive_tunnel_event();
         let current_elapsed = self.start_time.elapsed();
-        self.update_window_icon(ui.ctx(), current_elapsed);
+        self.update_window_icon(ui.ctx(), frame, current_elapsed);
 
         egui::CentralPanel::default().show(ui, |ui| {
             if self.standalone {
