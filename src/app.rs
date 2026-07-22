@@ -796,28 +796,37 @@ impl RemoteControlApp {
             paint_status_dot(ui, ui.visuals().strong_text_color());
             ui.strong(&self.status_text);
             ui.separator();
-            ui.weak("Initialized");
+            ui.weak("Client called initialize():");
             ui.strong(if self.client_initialized { "yes" } else { "no" });
-        });
-        if let Some(diagnostic) = &self.local_instructions_diagnostic {
-            ui.add_space(5.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Local instructions:");
-                match diagnostic {
-                    LocalInstructionsDiagnostic::Loaded { path } => {
-                        let colour = state_colour(ui, RequestState::Completed);
-                        ui.colored_label(colour, format!("Loaded · {}", path.display()));
-                    }
-                    LocalInstructionsDiagnostic::Warning { path, message } => {
-                        let colour = state_colour(ui, RequestState::Warning);
-                        ui.colored_label(
-                            colour,
-                            format!("Warning · {} · {message}", path.display()),
-                        );
-                    }
+            if let Some(diagnostic) = &self.local_instructions_diagnostic {
+                ui.separator();
+                let path = match diagnostic {
+                    LocalInstructionsDiagnostic::Loaded { path }
+                    | LocalInstructionsDiagnostic::Warning { path, .. } => path,
+                };
+                let link = ui
+                    .link("Local instructions:")
+                    .on_hover_text(path.display().to_string());
+                if link.clicked()
+                    && let Some(folder) = path.parent()
+                    && let Err(error) = std::process::Command::new("explorer.exe")
+                        .arg(folder)
+                        .spawn()
+                {
+                    eprintln!(
+                        "Failed to open local instructions folder {}: {error}",
+                        folder.display()
+                    );
                 }
-            });
-        }
+                ui.strong(
+                    if matches!(diagnostic, LocalInstructionsDiagnostic::Loaded { .. }) {
+                        "yes"
+                    } else {
+                        "no"
+                    },
+                );
+            }
+        });
         if let Some(error) = &self.fatal_error {
             ui.add_space(5.0);
             egui::Frame::group(ui.style()).show(ui, |ui| {
