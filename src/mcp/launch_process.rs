@@ -7,6 +7,8 @@ use std::time::Instant;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -747,6 +749,9 @@ fn execute_launch_process_blocking(
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(stdout_file);
     cmd.stderr(stderr_file);
+
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
 
     if !req.environment.inherit {
         cmd.env_clear();
