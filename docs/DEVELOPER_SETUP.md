@@ -288,7 +288,7 @@ Alternatively, select **Start Secure MCP Tunnel** in the already-running applica
 * **GUI-button launch:** The tunnel client runs without a console window and stops when the GUI closes.
 * **Structured Logs:** Manual launches write structured logs to the terminal. GUI-button launches write them beneath `%TEMP%\RemoteControlMCP`.
 * **Independent UI:** The local Rust GUI remains open whether the tunnel is connected or not.
-* **Connection Status:** The compact GUI panel independently shows whether its supervised tunnel client is running, how many HTTP connections are open, and how many MCP sessions are active. The tunnel can be started, cancelled, or stopped without restarting the local MCP server.
+* **Connection Status:** The compact GUI panel groups the HTTP server state with its endpoint and the supervised tunnel state with its action button, followed by independent HTTP connection and MCP session counts. The tunnel can be started, cancelled, or stopped without restarting the local MCP server.
 * **Admin Interface:** A manually launched tunnel client exposes its browser-based admin UI at the profile's configured health address. By default, this is:
   ```text
   http://127.0.0.1:8080/ui

@@ -765,6 +765,13 @@ impl RemoteControlApp {
 
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
+                paint_status_dot(ui, ui.visuals().strong_text_color());
+                ui.strong(&self.status_text);
+                if let Some(endpoint) = &self.mcp_endpoint {
+                    ui.weak(endpoint);
+                }
+
+                ui.separator();
                 if tunnel_starting {
                     ui.spinner();
                 }
@@ -777,15 +784,6 @@ impl RemoteControlApp {
                     TunnelUiState::Idle | TunnelUiState::Failed { .. } => {}
                 }
 
-                ui.separator();
-                ui.strong("HTTP connections:");
-                ui.label(self.active_http_connections.to_string());
-
-                ui.separator();
-                ui.strong("MCP sessions:");
-                ui.label(self.active_mcp_sessions.to_string());
-
-                ui.separator();
                 if tunnel_starting {
                     stop_clicked = ui.button("Cancel tunnel launch").clicked();
                 } else if tunnel_running {
@@ -797,13 +795,48 @@ impl RemoteControlApp {
                         "Start Secure MCP Tunnel"
                     };
                     start_clicked = ui
-                        .add_enabled(self.mcp_endpoint.is_some(), egui::Button::new(button_text))
+                        .add_enabled(
+                            self.mcp_endpoint.is_some() && self.fatal_error.is_none(),
+                            egui::Button::new(button_text),
+                        )
                         .clicked();
                 }
 
-                if let Some(endpoint) = &self.mcp_endpoint {
+                ui.separator();
+                ui.strong("HTTP connections:");
+                ui.label(self.active_http_connections.to_string());
+
+                ui.separator();
+                ui.strong("MCP sessions:");
+                ui.label(self.active_mcp_sessions.to_string());
+
+                if let Some(diagnostic) = &self.local_instructions_diagnostic {
                     ui.separator();
-                    ui.weak(endpoint);
+                    let path = match diagnostic {
+                        LocalInstructionsDiagnostic::Loaded { path }
+                        | LocalInstructionsDiagnostic::Warning { path, .. } => path,
+                    };
+                    let link = ui
+                        .link("Local instructions:")
+                        .on_hover_text(path.display().to_string());
+                    if link.clicked()
+                        && let Some(folder) = path.parent()
+                        && let Err(error) = std::process::Command::new("explorer.exe")
+                            .arg(folder)
+                            .spawn()
+                    {
+                        eprintln!(
+                            "Failed to open local instructions folder {}: {error}",
+                            folder.display()
+                        );
+                    }
+                    ui.strong(
+                        if matches!(diagnostic, LocalInstructionsDiagnostic::Loaded { .. }) {
+                            "yes"
+                        } else {
+                            "no"
+                        },
+                    );
                 }
             });
 
@@ -821,49 +854,14 @@ impl RemoteControlApp {
     }
 
     fn render_hosted(&mut self, ui: &mut egui::Ui, current_elapsed: Duration) {
-        ui.horizontal_wrapped(|ui| {
-            paint_status_dot(ui, ui.visuals().strong_text_color());
-            ui.strong(&self.status_text);
-            if let Some(diagnostic) = &self.local_instructions_diagnostic {
-                ui.separator();
-                let path = match diagnostic {
-                    LocalInstructionsDiagnostic::Loaded { path }
-                    | LocalInstructionsDiagnostic::Warning { path, .. } => path,
-                };
-                let link = ui
-                    .link("Local instructions:")
-                    .on_hover_text(path.display().to_string());
-                if link.clicked()
-                    && let Some(folder) = path.parent()
-                    && let Err(error) = std::process::Command::new("explorer.exe")
-                        .arg(folder)
-                        .spawn()
-                {
-                    eprintln!(
-                        "Failed to open local instructions folder {}: {error}",
-                        folder.display()
-                    );
-                }
-                ui.strong(
-                    if matches!(diagnostic, LocalInstructionsDiagnostic::Loaded { .. }) {
-                        "yes"
-                    } else {
-                        "no"
-                    },
-                );
-            }
-        });
+        self.render_connection_panel(ui);
+
         if let Some(error) = &self.fatal_error {
             ui.add_space(5.0);
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.colored_label(ui.visuals().error_fg_color, "Fatal server error");
                 ui.label(error);
             });
-        }
-
-        if self.fatal_error.is_none() {
-            ui.add_space(6.0);
-            self.render_connection_panel(ui);
         }
 
         ui.add_space(6.0);
