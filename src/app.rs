@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 const MAX_RECENT_REQUESTS: usize = 100;
 const MAX_COMMAND_LINE_CHARACTERS: usize = 80;
-const BUSY_ICON_COOLDOWN: Duration = Duration::from_secs(5);
+const BUSY_ICON_COOLDOWN: Duration = Duration::from_secs(30);
 
 pub fn normal_icon() -> Arc<egui::IconData> {
     static ICON: OnceLock<Arc<egui::IconData>> = OnceLock::new();
@@ -953,12 +953,12 @@ mod tests {
         assert!(should_show_busy_icon(
             &requests,
             Some(Duration::from_secs(20)),
-            Duration::from_millis(24_999)
+            Duration::from_millis(49_999)
         ));
         assert!(!should_show_busy_icon(
             &requests,
             Some(Duration::from_secs(20)),
-            Duration::from_secs(25)
+            Duration::from_secs(50)
         ));
     }
 
@@ -985,7 +985,7 @@ mod tests {
         assert!(!should_show_busy_icon(
             &requests,
             Some(Duration::from_secs(30)),
-            Duration::from_secs(35)
+            Duration::from_secs(60)
         ));
     }
 
