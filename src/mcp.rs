@@ -5,10 +5,13 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 mod file_path;
 mod launch_process;
@@ -381,6 +384,8 @@ pub enum UiEventKind {
     ServerListening {
         endpoint: String,
     },
+    HttpConnectionOpened,
+    HttpConnectionClosed,
     ClientConnected,
     ClientDisconnected,
     ClientInitialized,
@@ -421,6 +426,86 @@ pub struct McpServer {
 struct ConnectionGuard {
     tx: Sender<UiEvent>,
     start_time: Instant,
+}
+
+struct TrackedHttpIo<T> {
+    inner: T,
+    tx: Sender<UiEvent>,
+    start_time: Instant,
+}
+
+impl<T> TrackedHttpIo<T> {
+    fn new(inner: T, tx: Sender<UiEvent>, start_time: Instant) -> Self {
+        let _ = tx.send(UiEvent {
+            elapsed: start_time.elapsed(),
+            kind: UiEventKind::HttpConnectionOpened,
+        });
+        Self {
+            inner,
+            tx,
+            start_time,
+        }
+    }
+}
+
+impl<T> Drop for TrackedHttpIo<T> {
+    fn drop(&mut self) {
+        let _ = self.tx.send(UiEvent {
+            elapsed: self.start_time.elapsed(),
+            kind: UiEventKind::HttpConnectionClosed,
+        });
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for TrackedHttpIo<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for TrackedHttpIo<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+struct TrackedHttpListener {
+    inner: tokio::net::TcpListener,
+    tx: Sender<UiEvent>,
+    start_time: Instant,
+}
+
+impl axum::serve::Listener for TrackedHttpListener {
+    type Io = TrackedHttpIo<tokio::net::TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        let (stream, address) = axum::serve::Listener::accept(&mut self.inner).await;
+        (
+            TrackedHttpIo::new(stream, self.tx.clone(), self.start_time),
+            address,
+        )
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
 }
 
 impl Drop for ConnectionGuard {
@@ -771,6 +856,11 @@ async fn run_http_mcp_server(tx: Sender<UiEvent>, start_time: Instant) {
         }
     };
 
+    let listener = TrackedHttpListener {
+        inner: listener,
+        tx: tx.clone(),
+        start_time,
+    };
     let http_service = build_http_mcp_service(tx.clone(), start_time, instructions);
     let router = axum::Router::new().nest_service("/mcp", http_service);
 

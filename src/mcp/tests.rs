@@ -15,8 +15,8 @@ use crate::mcp::{
     BOOTSTRAP_INSTRUCTIONS, EnvironmentConfig, GENERAL_INSTRUCTIONS, LaunchProcessRequest,
     LaunchProcessResult, LaunchProcessStatus, LocalInstructionsDiagnostic,
     MACHINE_INSTRUCTIONS_HEADING, McpServer, ReadFileRequest, ReadFileResult, ReadFileStatus,
-    RequestData, RequestId, RequestUpdate, TimeoutAction, UiEventKind, WriteFileRequest,
-    WriteFileResult, WriteFileStatus, build_http_mcp_service, build_mcp_runtime,
+    RequestData, RequestId, RequestUpdate, TimeoutAction, TrackedHttpIo, UiEventKind,
+    WriteFileRequest, WriteFileResult, WriteFileStatus, build_http_mcp_service, build_mcp_runtime,
     compose_instructions, load_server_instructions_from_path, read_local_instructions,
     run_mcp_server_loop, test_hooks,
 };
@@ -26,6 +26,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn tracked_http_io_reports_connection_lifecycle() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (io, _peer) = tokio::io::duplex(8);
+    let tracked = TrackedHttpIo::new(io, tx, Instant::now());
+
+    assert_eq!(rx.recv().unwrap().kind, UiEventKind::HttpConnectionOpened);
+    drop(tracked);
+    assert_eq!(rx.recv().unwrap().kind, UiEventKind::HttpConnectionClosed);
+}
 
 struct InstructionsToolExchange {
     server_info: Arc<rmcp::model::ServerInfo>,
