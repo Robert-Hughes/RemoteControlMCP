@@ -633,17 +633,22 @@ impl RemoteControlApp {
                 }
                 UiEventKind::ClientConnected => {
                     self.active_connections = self.active_connections.saturating_add(1);
-                    self.status_text = "Connected".to_string();
+                    self.status_text = "MCP client connected; initializing".to_string();
                 }
                 UiEventKind::ClientDisconnected => {
                     self.active_connections = self.active_connections.saturating_sub(1);
                     if self.active_connections == 0 {
                         self.client_initialized = false;
-                        self.status_text = "Waiting for MCP client".to_string();
+                        self.status_text =
+                            if matches!(self.tunnel_state, TunnelUiState::Running { .. }) {
+                                "Tunnel ready; waiting for MCP client".to_string()
+                            } else {
+                                "Waiting for MCP client".to_string()
+                            };
                     }
                 }
                 UiEventKind::ClientInitialized => {
-                    self.status_text = "Connected".to_string();
+                    self.status_text = "MCP client connected".to_string();
                     self.client_initialized = true;
                 }
                 UiEventKind::LocalInstructionsDiagnostic { diagnostic } => {
@@ -720,6 +725,22 @@ impl RemoteControlApp {
         }
     }
 
+    fn stop_tunnel(&mut self) {
+        let was_running = matches!(self.tunnel_state, TunnelUiState::Running { .. });
+        let status = match self.tunnel_state {
+            TunnelUiState::Starting { .. } => "Tunnel launch cancelled",
+            TunnelUiState::Running { .. } => "Tunnel stopped",
+            TunnelUiState::Idle | TunnelUiState::Failed { .. } => return,
+        };
+
+        self.tunnel_launch.take();
+        self.tunnel_state = TunnelUiState::Idle;
+        if was_running {
+            self.client_initialized = false;
+        }
+        self.status_text = status.to_string();
+    }
+
     fn receive_tunnel_event(&mut self) {
         let event = self.tunnel_launch.as_ref().map(TunnelLaunch::try_recv);
         match event {
@@ -787,23 +808,29 @@ impl RemoteControlApp {
             }
 
             ui.add_space(8.0);
-            let tunnel_active = matches!(
-                self.tunnel_state,
-                TunnelUiState::Starting { .. } | TunnelUiState::Running { .. }
-            );
-            let button_text = if matches!(self.tunnel_state, TunnelUiState::Failed { .. }) {
-                "Retry Secure MCP Tunnel"
+            if matches!(self.tunnel_state, TunnelUiState::Starting { .. }) {
+                if ui.button("Cancel tunnel launch").clicked() {
+                    self.stop_tunnel();
+                }
+            } else if matches!(self.tunnel_state, TunnelUiState::Running { .. }) {
+                if ui.button("Stop Secure MCP Tunnel").clicked() {
+                    self.stop_tunnel();
+                }
             } else {
-                "Start Secure MCP Tunnel"
-            };
-            if ui
-                .add_enabled(
-                    !tunnel_active && self.mcp_endpoint.is_some(),
-                    egui::Button::new(button_text),
-                )
-                .clicked()
-            {
-                self.start_tunnel();
+                let button_text = if matches!(self.tunnel_state, TunnelUiState::Failed { .. }) {
+                    "Retry Secure MCP Tunnel"
+                } else {
+                    "Start Secure MCP Tunnel"
+                };
+                if ui
+                    .add_enabled(
+                        self.mcp_endpoint.is_some(),
+                        egui::Button::new(button_text),
+                    )
+                    .clicked()
+                {
+                    self.start_tunnel();
+                }
             }
         });
     }
@@ -812,9 +839,6 @@ impl RemoteControlApp {
         ui.horizontal_wrapped(|ui| {
             paint_status_dot(ui, ui.visuals().strong_text_color());
             ui.strong(&self.status_text);
-            ui.separator();
-            ui.weak("MCP client connected:");
-            ui.strong(if self.client_initialized { "yes" } else { "no" });
             if let Some(diagnostic) = &self.local_instructions_diagnostic {
                 ui.separator();
                 let path = match diagnostic {
@@ -856,8 +880,16 @@ impl RemoteControlApp {
             ui.add_space(6.0);
             self.render_connection_panel(ui);
         } else if let TunnelUiState::Running { log_path } = &self.tunnel_state {
+            let log_path = log_path.clone();
+            let mut stop_tunnel = false;
             ui.add_space(4.0);
-            ui.weak(format!("Secure MCP Tunnel running · Log: {log_path}"));
+            ui.horizontal_wrapped(|ui| {
+                ui.weak(format!("Secure MCP Tunnel running · Log: {log_path}"));
+                stop_tunnel = ui.button("Stop Secure MCP Tunnel").clicked();
+            });
+            if stop_tunnel {
+                self.stop_tunnel();
+            }
         }
 
         ui.add_space(6.0);
@@ -929,6 +961,40 @@ mod tests {
         assert!(app.tunnel_launch.is_none());
         assert!(matches!(app.tunnel_state, TunnelUiState::Idle));
         assert_eq!(app.active_connections, 0);
+    }
+
+    #[test]
+    fn cancelling_tunnel_launch_returns_to_idle_state() {
+        let (_tx, rx) = mpsc::channel();
+        let mut app = RemoteControlApp::new(rx, Instant::now());
+        app.status_text = "Starting Secure MCP Tunnel".to_string();
+        app.tunnel_state = TunnelUiState::Starting {
+            log_path: "tunnel.log".to_string(),
+        };
+
+        app.stop_tunnel();
+
+        assert!(matches!(app.tunnel_state, TunnelUiState::Idle));
+        assert!(app.tunnel_launch.is_none());
+        assert_eq!(app.status_text, "Tunnel launch cancelled");
+    }
+
+    #[test]
+    fn stopping_running_tunnel_returns_to_idle_state() {
+        let (_tx, rx) = mpsc::channel();
+        let mut app = RemoteControlApp::new(rx, Instant::now());
+        app.status_text = "MCP client connected".to_string();
+        app.client_initialized = true;
+        app.tunnel_state = TunnelUiState::Running {
+            log_path: "tunnel.log".to_string(),
+        };
+
+        app.stop_tunnel();
+
+        assert!(matches!(app.tunnel_state, TunnelUiState::Idle));
+        assert!(app.tunnel_launch.is_none());
+        assert!(!app.client_initialized);
+        assert_eq!(app.status_text, "Tunnel stopped");
     }
 
     #[test]

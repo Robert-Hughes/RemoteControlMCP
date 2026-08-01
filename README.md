@@ -225,7 +225,7 @@ cargo build
 .\target\debug\remote-control-mcp.exe
 ```
 
-The application immediately starts its loopback-only Streamable HTTP endpoint at `http://127.0.0.1:61337/mcp`. When no MCP client has initialized a session, the GUI offers **Start Secure MCP Tunnel**. That button starts the configured `tunnel-client` against the already-running application and keeps both processes monitored for the lifetime of the GUI.
+The application immediately starts its loopback-only Streamable HTTP endpoint at `http://127.0.0.1:61337/mcp`. When no MCP client has initialized a session, the GUI offers **Start Secure MCP Tunnel**. While the tunnel is starting, **Cancel tunnel launch** terminates that supervised subprocess. Once ready, **Stop Secure MCP Tunnel** disconnects it without closing the application; the tunnel can then be started again from the GUI.
 
 The button requires the one-time launcher path, HTTP profile, and runtime-key file configuration documented in [DEVELOPER_SETUP.md](docs/DEVELOPER_SETUP.md). The fixed port allows the same profile to reconnect after application restarts without relaunching the application as a child process.
 

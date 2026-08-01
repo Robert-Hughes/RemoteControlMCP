@@ -256,7 +256,7 @@ The application must be running while `doctor` probes the MCP endpoint. The outp
 > [!NOTE]
 > The following status indicators are expected for this local HTTP tunnel:
 > * `mcp_server_reachable   PASS` while `remote-control-mcp.exe` is running
-> * `oauth_metadata         SKIP` because this local server does not implement OAuth
+> * `oauth_metadata         PASS` with a message that OAuth metadata is not advertised
 > * `codex_plugin           SKIP` (Optional check, not required for basic ChatGPT tunnel operation)
 
 ---
@@ -282,13 +282,13 @@ For longer development sessions, increase the maximum lifetime of the local MCP 
 
 This reduces HTTP session rotation during a typical development session. It does not repair an already stale MCP session; after restarting the tunnel or local MCP process, start a new ChatGPT conversation so that the new connection receives a fresh MCP `initialize` handshake.
 
-Alternatively, select **Start Secure MCP Tunnel** in the already-running application. It uses the recorded tunnel-client path, the fixed `remote-control-mcp` profile, `%APPDATA%\tunnel-client\remote-control-mcp.key`, and its own displayed HTTP endpoint. It starts the tunnel on an ephemeral loopback health port, waits for `/readyz`, and continues monitoring the tunnel process. Logs are written beneath `%TEMP%\RemoteControlMCP`.
+Alternatively, select **Start Secure MCP Tunnel** in the already-running application. It uses the recorded tunnel-client path, the fixed `remote-control-mcp` profile, `%APPDATA%\tunnel-client\remote-control-mcp.key`, and its own displayed HTTP endpoint. It starts the tunnel on an ephemeral loopback health port, waits for `/readyz`, and continues monitoring the tunnel process. While it is waiting, **Cancel tunnel launch** terminates the supervised tunnel-client process. Once connected, **Stop Secure MCP Tunnel** terminates it without closing the local MCP application and leaves the tunnel ready to be started again. Logs are written beneath `%TEMP%\RemoteControlMCP`.
 
 * **Manual launch:** Leave the terminal pane open. The process must remain active to handle connection dispatches.
 * **GUI-button launch:** The tunnel client runs without a console window and stops when the GUI closes.
 * **Structured Logs:** Manual launches write structured logs to the terminal. GUI-button launches write them beneath `%TEMP%\RemoteControlMCP`.
 * **Independent UI:** The local Rust GUI remains open whether the tunnel is connected or not.
-* **Initialisation Handshake:** The status label in the Rust GUI will transition to `Connected` once the MCP handshake completes.
+* **Initialisation Handshake:** The single status label in the Rust GUI transitions to `MCP client connected` once the MCP handshake completes.
 * **Admin Interface:** A manually launched tunnel client exposes its browser-based admin UI at the profile's configured health address. By default, this is:
   ```text
   http://127.0.0.1:8080/ui

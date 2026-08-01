@@ -366,6 +366,27 @@ mod tests {
     use std::ffi::OsStr;
 
     #[test]
+    fn dropping_launch_signals_cancellation_and_joins_worker() {
+        let (_event_tx, event_rx) = mpsc::channel();
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            cancel_rx.recv().expect("launch should signal cancellation");
+            finished_tx.send(()).unwrap();
+        });
+        let launch = TunnelLaunch {
+            event_rx,
+            cancel_tx,
+            worker: Some(worker),
+            log_path: PathBuf::from("tunnel.log"),
+        };
+
+        drop(launch);
+
+        finished_rx.try_recv().expect("worker should be joined");
+    }
+
+    #[test]
     fn health_url_parser_accepts_only_loopback_http_addresses() {
         assert_eq!(
             parse_loopback_http_address("http://127.0.0.1:43123/").unwrap(),
