@@ -378,8 +378,11 @@ pub enum RequestUpdate {
 pub enum UiEventKind {
     WorkerStarted,
     ServerStarting,
-    WaitingForClient,
+    ServerListening {
+        endpoint: String,
+    },
     ClientConnected,
+    ClientDisconnected,
     ClientInitialized,
     LocalInstructionsDiagnostic {
         diagnostic: LocalInstructionsDiagnostic,
@@ -412,6 +415,21 @@ pub struct McpServer {
     next_request_id: Arc<AtomicU64>,
     tool_router: ToolRouter<Self>,
     instructions: Arc<str>,
+    connection_guard: Option<Arc<ConnectionGuard>>,
+}
+
+struct ConnectionGuard {
+    tx: Sender<UiEvent>,
+    start_time: Instant,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send(UiEvent {
+            elapsed: self.start_time.elapsed(),
+            kind: UiEventKind::ClientDisconnected,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -450,7 +468,18 @@ impl McpServer {
             next_request_id: Arc::new(AtomicU64::new(1)),
             tool_router: Self::tool_router(),
             instructions,
+            connection_guard: None,
         }
+    }
+
+    fn for_http_session(&self) -> Self {
+        self.send_event(UiEventKind::ClientConnected);
+        let mut service = self.clone();
+        service.connection_guard = Some(Arc::new(ConnectionGuard {
+            tx: self.tx.clone(),
+            start_time: self.start_time,
+        }));
+        service
     }
 
     fn send_event(&self, kind: UiEventKind) {
@@ -658,8 +687,36 @@ impl ServerHandler for McpServer {
 
 fn build_mcp_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
+        .enable_io()
         .enable_time()
         .build()
+}
+
+pub const MCP_HTTP_BIND_ADDRESS: &str = "127.0.0.1:61337";
+pub const MCP_HTTP_ENDPOINT: &str = "http://127.0.0.1:61337/mcp";
+
+type HttpMcpService = rmcp::transport::streamable_http_server::StreamableHttpService<
+    McpServer,
+    rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+>;
+
+fn build_http_mcp_service(
+    tx: Sender<UiEvent>,
+    start_time: Instant,
+    instructions: Arc<str>,
+) -> HttpMcpService {
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+    };
+
+    let service = McpServer::new_with_instructions(tx.clone(), start_time, instructions);
+    let service_factory = move || Ok(service.for_http_session());
+
+    StreamableHttpService::new(
+        service_factory,
+        Default::default(),
+        StreamableHttpServerConfig::default().with_sse_keep_alive(None),
+    )
 }
 
 pub fn run_mcp_server(tx: Sender<UiEvent>, start_time: Instant) {
@@ -681,14 +738,55 @@ pub fn run_mcp_server(tx: Sender<UiEvent>, start_time: Instant) {
         kind: UiEventKind::WorkerStarted,
     });
 
-    use tokio::io::{stdin, stdout};
-    let transport = (stdin(), stdout());
-
     rt.block_on(async move {
-        run_mcp_server_loop(tx, start_time, transport).await;
+        run_http_mcp_server(tx, start_time).await;
     });
 }
 
+async fn run_http_mcp_server(tx: Sender<UiEvent>, start_time: Instant) {
+    let send_event = |kind| {
+        let _ = tx.send(UiEvent {
+            elapsed: start_time.elapsed(),
+            kind,
+        });
+    };
+
+    send_event(UiEventKind::ServerStarting);
+
+    let LoadedServerInstructions {
+        instructions,
+        diagnostic,
+    } = load_server_instructions();
+    send_event(UiEventKind::LocalInstructionsDiagnostic { diagnostic });
+
+    let listener = match tokio::net::TcpListener::bind(MCP_HTTP_BIND_ADDRESS).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            send_event(UiEventKind::ServerError {
+                error: format!(
+                    "Could not bind the loopback MCP endpoint {MCP_HTTP_ENDPOINT}: {error}"
+                ),
+            });
+            return;
+        }
+    };
+
+    let http_service = build_http_mcp_service(tx.clone(), start_time, instructions);
+    let router = axum::Router::new().nest_service("/mcp", http_service);
+
+    send_event(UiEventKind::ServerListening {
+        endpoint: MCP_HTTP_ENDPOINT.to_string(),
+    });
+
+    match axum::serve(listener, router).await {
+        Ok(()) => send_event(UiEventKind::ServerStopped),
+        Err(error) => send_event(UiEventKind::ServerError {
+            error: format!("HTTP MCP server error: {error}"),
+        }),
+    }
+}
+
+#[cfg(test)]
 async fn run_mcp_server_loop<T, A>(tx: Sender<UiEvent>, start_time: Instant, transport: T)
 where
     T: rmcp::transport::IntoTransport<rmcp::RoleServer, std::io::Error, A> + Send + 'static,
@@ -710,14 +808,9 @@ where
     send_event(UiEventKind::LocalInstructionsDiagnostic { diagnostic });
     let service = McpServer::new_with_instructions(tx.clone(), start_time, instructions);
 
-    send_event(UiEventKind::WaitingForClient);
-
-    // The OpenAI tunnel-client can keep its HTTP-side MCP session alive while restarting
-    // this stdio child. It may then forward a tool call before re-sending initialize. The
-    // spec-compliant `serve()` rejects that call and terminates the fresh server process.
-    // `serve_directly()` keeps the stdio transport usable in that situation. Our initialize
-    // handler still records and negotiates client information when initialize does arrive,
-    // so requests after it have the same peer state they would have had under `serve()`.
+    // This direct-service helper keeps the in-memory transport tests focused on tool behavior,
+    // including cases that intentionally send requests before initialize. Production HTTP
+    // sessions use the stateful Streamable HTTP service above.
     let server =
         rmcp::service::serve_directly::<rmcp::RoleServer, _, _, _, _>(service, transport, None);
     send_event(UiEventKind::ClientConnected);

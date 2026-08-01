@@ -10,22 +10,18 @@ use std::time::Instant;
 
 fn main() -> eframe::Result {
     let start_time = Instant::now();
-    let app = if tunnel::has_mcp_stdio_transport() {
-        let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
 
-        // Spawn named background thread for MCP worker only when an MCP host
-        // supplied the required stdin/stdout pipes.
-        thread::Builder::new()
-            .name("mcp_worker".to_string())
-            .spawn(move || {
-                mcp::run_mcp_server(tx, start_time);
-            })
-            .expect("Failed to spawn background MCP worker thread");
+    // The GUI stays on the main thread while the loopback HTTP MCP server owns
+    // its single-threaded Tokio runtime on this dedicated worker thread.
+    thread::Builder::new()
+        .name("mcp_worker".to_string())
+        .spawn(move || {
+            mcp::run_mcp_server(tx, start_time);
+        })
+        .expect("Failed to spawn background MCP worker thread");
 
-        app::RemoteControlApp::new(rx, start_time)
-    } else {
-        app::RemoteControlApp::new_standalone(start_time)
-    };
+    let app = app::RemoteControlApp::new(rx, start_time);
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default().with_icon(app::normal_icon()),

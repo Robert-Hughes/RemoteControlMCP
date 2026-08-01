@@ -16,8 +16,9 @@ use crate::mcp::{
     LaunchProcessResult, LaunchProcessStatus, LocalInstructionsDiagnostic,
     MACHINE_INSTRUCTIONS_HEADING, McpServer, ReadFileRequest, ReadFileResult, ReadFileStatus,
     RequestData, RequestId, RequestUpdate, TimeoutAction, UiEventKind, WriteFileRequest,
-    WriteFileResult, WriteFileStatus, build_mcp_runtime, compose_instructions,
-    load_server_instructions_from_path, read_local_instructions, run_mcp_server_loop, test_hooks,
+    WriteFileResult, WriteFileStatus, build_http_mcp_service, build_mcp_runtime,
+    compose_instructions, load_server_instructions_from_path, read_local_instructions,
+    run_mcp_server_loop, test_hooks,
 };
 use rmcp::ServerHandler;
 use std::path::{Path, PathBuf};
@@ -1700,6 +1701,87 @@ fn ping_works_over_mcp_duplex_transport() {
         Some(&UiEventKind::ServerStopped),
         "expected graceful shutdown to end with ServerStopped; events: {events:?}"
     );
+}
+
+#[test]
+fn ping_works_over_streamable_http_transport() {
+    use rmcp::ServiceExt;
+    use rmcp::transport::{
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let start_time = Instant::now();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let service = build_http_mcp_service(
+            tx,
+            start_time,
+            Arc::from("HTTP transport test instructions"),
+        );
+        let router = axum::Router::new().nest_service("/mcp", service);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral HTTP MCP listener");
+        let endpoint = format!(
+            "http://{}/mcp",
+            listener.local_addr().expect("HTTP MCP listener address")
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve HTTP MCP transport");
+        });
+
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(endpoint),
+        );
+        let mut client = ().serve(transport).await.expect("connect HTTP MCP client");
+        let ping = client
+            .call_tool(rmcp::model::CallToolRequestParams::new("ping"))
+            .await
+            .expect("call ping over HTTP");
+        assert_eq!(only_text_content(&ping), "pong");
+
+        client.close().await.expect("close HTTP MCP client");
+        server_task.abort();
+        let _ = server_task.await;
+    });
+
+    let events: Vec<UiEventKind> = rx.try_iter().map(|event| event.kind).collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, UiEventKind::ClientConnected))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, UiEventKind::ClientInitialized))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, UiEventKind::ClientDisconnected))
+    );
+    assert!(events.windows(2).any(|pair| matches!(
+        pair,
+        [
+            UiEventKind::RequestStarted {
+                id,
+                request: RequestData::Ping,
+                ..
+            },
+            UiEventKind::RequestUpdated {
+                id: update_id,
+                update: RequestUpdate::PingCompleted,
+            },
+        ] if id == update_id
+    )));
 }
 
 #[test]

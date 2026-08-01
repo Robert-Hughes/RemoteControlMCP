@@ -11,12 +11,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-#[cfg(target_os = "windows")]
-use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
-#[cfg(target_os = "windows")]
-use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
-#[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 const PROFILE_NAME: &str = "remote-control-mcp";
@@ -58,47 +52,12 @@ impl Drop for TunnelLaunch {
     }
 }
 
-#[cfg(target_os = "windows")]
-pub fn has_mcp_stdio_transport() -> bool {
-    let input_type = std_handle_file_type(STD_INPUT_HANDLE);
-    let output_type = std_handle_file_type(STD_OUTPUT_HANDLE);
-    stdio_types_are_pipes(input_type, output_type)
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn has_mcp_stdio_transport() -> bool {
-    true
-}
-
-#[cfg(target_os = "windows")]
-fn std_handle_file_type(handle_id: u32) -> Option<u32> {
-    // SAFETY: GetStdHandle only reads the calling process's standard-handle
-    // table. The returned borrowed handle is checked before GetFileType and is
-    // not closed by this function.
-    let handle = unsafe { GetStdHandle(handle_id) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return None;
-    }
-
-    // SAFETY: `handle` is a non-null, non-INVALID_HANDLE_VALUE process handle
-    // obtained from GetStdHandle. GetFileType does not take ownership of it.
-    Some(unsafe { GetFileType(handle) })
-}
-
-#[cfg(target_os = "windows")]
-fn stdio_types_are_pipes(input_type: Option<u32>, output_type: Option<u32>) -> bool {
-    input_type == Some(FILE_TYPE_PIPE) && output_type == Some(FILE_TYPE_PIPE)
-}
-
-pub fn start_tunnel() -> Result<TunnelLaunch, String> {
+pub fn start_tunnel(mcp_endpoint: &str) -> Result<TunnelLaunch, String> {
     let app_data = app_data_directory()?;
     let key_path = app_data.join("tunnel-client").join(KEY_FILE_NAME);
     validate_key_file(&key_path)?;
 
     let tunnel_client = resolve_tunnel_client(&app_data)?;
-    let mcp_executable = std::env::current_exe().map_err(|error| {
-        format!("Could not determine the currently running MCP executable: {error}")
-    })?;
     let runtime_directory = std::env::temp_dir().join("RemoteControlMCP");
     fs::create_dir_all(&runtime_directory).map_err(|error| {
         format!(
@@ -115,12 +74,13 @@ pub fn start_tunnel() -> Result<TunnelLaunch, String> {
     let (event_tx, event_rx) = mpsc::channel();
     let (cancel_tx, cancel_rx) = mpsc::channel();
     let worker_log_path = log_path.clone();
+    let worker_mcp_endpoint = mcp_endpoint.to_string();
     let worker = thread::Builder::new()
         .name("tunnel_launcher".to_string())
         .spawn(move || {
             run_tunnel_launcher(
                 tunnel_client,
-                mcp_executable,
+                worker_mcp_endpoint,
                 key_path,
                 health_url_path,
                 worker_log_path,
@@ -210,14 +170,9 @@ fn prefixed_path_argument(prefix: &str, path: &Path) -> OsString {
     argument
 }
 
-fn mcp_command_argument(path: &Path) -> OsString {
-    let escaped_path = path.to_string_lossy().replace('\\', "\\\\");
-    OsString::from(format!("command={escaped_path},channel=main"))
-}
-
 fn run_tunnel_launcher(
     tunnel_client: PathBuf,
-    mcp_executable: PathBuf,
+    mcp_endpoint: String,
     key_path: PathBuf,
     health_url_path: PathBuf,
     log_path: PathBuf,
@@ -226,10 +181,11 @@ fn run_tunnel_launcher(
 ) {
     let result = run_tunnel_launcher_inner(
         &tunnel_client,
-        &mcp_executable,
+        &mcp_endpoint,
         &key_path,
         &health_url_path,
         &log_path,
+        &event_tx,
         &cancel_rx,
     );
     let _ = fs::remove_file(&health_url_path);
@@ -238,17 +194,16 @@ fn run_tunnel_launcher(
             "{error} Tunnel log: {}",
             log_path.display()
         )));
-    } else {
-        let _ = event_tx.send(TunnelLaunchEvent::Ready);
     }
 }
 
 fn run_tunnel_launcher_inner(
     tunnel_client: &Path,
-    mcp_executable: &Path,
+    mcp_endpoint: &str,
     key_path: &Path,
     health_url_path: &Path,
     log_path: &Path,
+    event_tx: &Sender<TunnelLaunchEvent>,
     cancel_rx: &Receiver<()>,
 ) -> Result<(), String> {
     let log = create_log_file(log_path)?;
@@ -261,8 +216,8 @@ fn run_tunnel_launcher_inner(
         .arg("run")
         .arg("--profile")
         .arg(PROFILE_NAME)
-        .arg("--mcp.command")
-        .arg(mcp_command_argument(mcp_executable))
+        .arg("--mcp.server-url")
+        .arg(mcp_endpoint)
         .arg(prefixed_path_argument(
             "--control-plane.api-key=file:",
             key_path,
@@ -291,7 +246,7 @@ fn run_tunnel_launcher_inner(
     loop {
         if cancel_rx.try_recv().is_ok() {
             stop_child(&mut child);
-            return Err("Tunnel startup was cancelled.".to_string());
+            return Ok(());
         }
 
         if let Some(status) = child
@@ -306,10 +261,8 @@ fn run_tunnel_launcher_inner(
         if let Some(base_url) = read_health_base_url(health_url_path)
             && probe_ready(&base_url)
         {
-            // Dropping Child does not terminate the process. Ownership is
-            // intentionally handed off after the complete runtime is ready.
-            drop(child);
-            return Ok(());
+            let _ = event_tx.send(TunnelLaunchEvent::Ready);
+            break;
         }
 
         if Instant::now() >= deadline {
@@ -318,6 +271,22 @@ fn run_tunnel_launcher_inner(
                 "Tunnel client did not become ready within {} seconds.",
                 READY_TIMEOUT.as_secs()
             ));
+        }
+
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    loop {
+        if cancel_rx.try_recv().is_ok() {
+            stop_child(&mut child);
+            return Ok(());
+        }
+
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("Could not query tunnel-client status: {error}"))?
+        {
+            return Err(format!("Tunnel client stopped ({status})."));
         }
 
         thread::sleep(POLL_INTERVAL);
@@ -396,26 +365,6 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
 
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn stdio_transport_requires_input_and_output_pipes() {
-        use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_DISK};
-
-        assert!(stdio_types_are_pipes(
-            Some(FILE_TYPE_PIPE),
-            Some(FILE_TYPE_PIPE)
-        ));
-        assert!(!stdio_types_are_pipes(
-            Some(FILE_TYPE_CHAR),
-            Some(FILE_TYPE_PIPE)
-        ));
-        assert!(!stdio_types_are_pipes(
-            Some(FILE_TYPE_PIPE),
-            Some(FILE_TYPE_DISK)
-        ));
-        assert!(!stdio_types_are_pipes(None, Some(FILE_TYPE_PIPE)));
-    }
-
     #[test]
     fn health_url_parser_accepts_only_loopback_http_addresses() {
         assert_eq!(
@@ -466,19 +415,6 @@ mod tests {
         assert_eq!(
             argument,
             OsStr::new(r"--health.url-file=C:\Temp\Remote Control\health.url")
-        );
-    }
-
-    #[test]
-    fn mcp_command_override_uses_the_running_executable_path() {
-        let argument = mcp_command_argument(Path::new(
-            r"D:\Programming\Remote Control MCP\remote-control-mcp.exe",
-        ));
-        assert_eq!(
-            argument,
-            OsStr::new(
-                r"command=D:\\Programming\\Remote Control MCP\\remote-control-mcp.exe,channel=main"
-            )
         );
     }
 }

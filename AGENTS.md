@@ -7,8 +7,8 @@ Instructions for future coding agents working in this repository.
 * This is a lightweight Rust Windows GUI application.
 * The GUI runs on the main thread using eframe/egui.
 * The MCP server runs on a dedicated background thread using a single-threaded Tokio runtime.
-* MCP transport uses stdin/stdout.
-* Stdout is exclusively reserved for MCP protocol messages.
+* MCP transport uses Streamable HTTP on the fixed loopback endpoint `http://127.0.0.1:61337/mcp`.
+* The HTTP listener must remain loopback-only.
 * Diagnostics must go to stderr or the GUI event channel.
 * Avoid unnecessary dependencies and abstractions.
 
@@ -73,10 +73,11 @@ cargo build
 To run an interactive external smoke test:
 
 ```powershell
-npx -y @modelcontextprotocol/inspector .\target\debug\remote-control-mcp.exe
+.\target\debug\remote-control-mcp.exe
+npx -y @modelcontextprotocol/inspector
 ```
 
-The Inspector connects over stdio. No diagnostic output may be written to stdout.
+In the Inspector, select Streamable HTTP and connect to `http://127.0.0.1:61337/mcp`.
 
 ## Change discipline
 

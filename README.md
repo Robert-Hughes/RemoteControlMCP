@@ -1,18 +1,18 @@
 # Remote Control MCP
 
-A lightweight, Windows GUI application that also acts as a Model Context Protocol (MCP) server over stdin/stdout.
+A lightweight Windows GUI application that also hosts a Model Context Protocol (MCP) server over loopback Streamable HTTP.
 
 ## Architecture
 
 This application uses a multi-threaded architecture to separate the user interface from the MCP communication protocol:
 * **Main Thread:** Runs an `egui`/`eframe` native Windows GUI that displays server state and a scrolling list of tool requests.
-* **Background Thread:** Spawns a dedicated Tokio runtime and runs the `rmcp` MCP server over `stdin`/`stdout`.
+* **Background Thread:** Spawns a dedicated Tokio runtime and serves the `rmcp` MCP endpoint at `http://127.0.0.1:61337/mcp`.
 * **Communication:** The background worker sends structured events to the UI thread using a standard library channel (`std::sync::mpsc::channel`).
 
 ```text
 MCP client
     │
-    │ stdin/stdout
+    │ Streamable HTTP over loopback TCP
     ▼
 Rust MCP worker thread
     │
@@ -42,11 +42,9 @@ Every invocation that reaches a typed tool handler creates one request row. Rows
 
 The GUI retains at most 500 requests under normal conditions, pruning the oldest finished request first. In-progress requests are never removed to enforce that limit, so the list may temporarily exceed 500 while more than 500 calls overlap. Protocol requests rejected by `rmcp` before typed-handler entry, such as malformed JSON or schema-invalid arguments, cannot receive an application request ID and may not appear in this first version.
 
-## Critical Stdout Rule
+## Diagnostics
 
-Standard output (`stdout`) is strictly reserved for MCP protocol messages.
-* **Never** print diagnostic, debug, or application output to `stdout` (e.g. using `println!`). Doing so will corrupt the protocol stream and cause the MCP client to disconnect.
-* Diagnostics must be sent to the GUI event channel or written to standard error (`stderr`) using `eprintln!`.
+MCP protocol traffic no longer uses standard input or output. Application lifecycle diagnostics are sent to the GUI event channel or written to standard error (`stderr`).
 
 ## Exposed Tools
 
@@ -227,9 +225,9 @@ cargo build
 .\target\debug\remote-control-mcp.exe
 ```
 
-When started directly, the application detects that no MCP host supplied stdin/stdout pipes and does not start its MCP worker. The GUI explains the problem and offers **Start through Secure MCP Tunnel**. That button launches the configured `tunnel-client`, waits for its `/readyz` endpoint, and closes the original window only after the tunnel and the replacement MCP process are ready.
+The application immediately starts its loopback-only Streamable HTTP endpoint at `http://127.0.0.1:61337/mcp`. When no MCP client has initialized a session, the GUI offers **Start Secure MCP Tunnel**. That button starts the configured `tunnel-client` against the already-running application and keeps both processes monitored for the lifetime of the GUI.
 
-The button requires the one-time launcher path and runtime-key file configuration documented in [DEVELOPER_SETUP.md](docs/DEVELOPER_SETUP.md). MCP Inspector continues to work normally because it launches the executable with a valid stdio pipe transport.
+The button requires the one-time launcher path, HTTP profile, and runtime-key file configuration documented in [DEVELOPER_SETUP.md](docs/DEVELOPER_SETUP.md). The fixed port allows the same profile to reconnect after application restarts without relaunching the application as a child process.
 
 ## Automated tests
 
@@ -248,7 +246,7 @@ The suite covers:
 * Cleanup, best-effort reaping, and classification policies.
 * Incremental `read_file` line selection, path handling, encoding, complete-line limits, continuation, response schemas, and GUI events.
 * Strict staged `write_file` replacement, explicit creation, line-ending preservation, failure atomicity, schemas, privacy, GUI events, and runtime responsiveness.
-* A real MCP initialisation and tool-call sequence over an in-memory duplex connection.
+* Real MCP initialisation and tool-call sequences over both an in-memory duplex connection and loopback Streamable HTTP.
 * Concurrency checks verifying that long-running process and file operations do not block other requests like `ping`.
 
 ## Testing with MCP Inspector
@@ -258,13 +256,14 @@ The suite covers:
 You can test the application interactively using the Model Context Protocol Inspector:
 
 ```powershell
-npx -y @modelcontextprotocol/inspector .\target\debug\remote-control-mcp.exe
+.\target\debug\remote-control-mcp.exe
+npx -y @modelcontextprotocol/inspector
 ```
 
 When you run this command:
 1. The Inspector web UI launches.
-2. The `Remote Control MCP` GUI window appears.
-3. The Inspector connects to the application over stdio.
+2. In the Inspector, choose **Streamable HTTP**, enter `http://127.0.0.1:61337/mcp`, and connect.
+3. The Inspector connects to the already-running application over loopback TCP.
 4. The Inspector UI shows the `ping`, `launch_process`, `read_file`, and `write_file` tools.
 5. You can invoke any tool and inspect outputs.
 
@@ -274,31 +273,31 @@ You can also run the Inspector in non-interactive CLI mode:
 
 **List available tools:**
 ```powershell
-npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.exe --method tools/list
+npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transport http --method tools/list
 ```
 
 **Call the `ping` tool:**
 ```powershell
-npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.exe --method tools/call --tool-name ping
+npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transport http --method tools/call --tool-name ping
 ```
 
 **Call the `launch_process` tool:**
 ```powershell
-npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.exe --method tools/call --tool-name launch_process --tool-arg process_name=whoami.exe --tool-arg 'environment={"inherit":true,"variables":{}}' --tool-arg detached=false
+npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transport http --method tools/call --tool-name launch_process --tool-arg process_name=whoami.exe --tool-arg 'environment={"inherit":true,"variables":{}}' --tool-arg detached=false
 ```
 
 This no-argument example is suitable for a typical Windows installation; executable availability differs between systems.
 
 **Call the `read_file` tool:**
 ```powershell
-npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.exe --method tools/call --tool-name read_file --tool-arg path=RemoteControlMCP\example.stdout.log --tool-arg start_line=1 --tool-arg end_line=100
+npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transport http --method tools/call --tool-name read_file --tool-arg path=RemoteControlMCP\example.stdout.log --tool-arg start_line=1 --tool-arg end_line=100
 ```
 
 **Call the `write_file` tool:**
 ```powershell
-npx -y @modelcontextprotocol/inspector --cli .\target\debug\remote-control-mcp.exe --method tools/call --tool-name write_file --tool-arg path=RemoteControlMCP\example.txt --tool-arg start_line=1 --tool-arg end_line=1 --tool-arg text=updated --tool-arg create_if_missing=true
+npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transport http --method tools/call --tool-name write_file --tool-arg path=RemoteControlMCP\example.txt --tool-arg start_line=1 --tool-arg end_line=1 --tool-arg text=updated --tool-arg create_if_missing=true
 ```
 
 ## Connect to ChatGPT
 
-The local stdio MCP server can be connected to ChatGPT through an OpenAI Secure MCP Tunnel. For a detailed step-by-step walkthrough of the tunnel setup, see [DEVELOPER_SETUP.md](docs/DEVELOPER_SETUP.md).
+The loopback HTTP MCP server can be connected to ChatGPT through an OpenAI Secure MCP Tunnel. For a detailed step-by-step walkthrough and migration instructions, see [DEVELOPER_SETUP.md](docs/DEVELOPER_SETUP.md).
