@@ -764,51 +764,12 @@ impl RemoteControlApp {
         let mut start_clicked = false;
 
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
+            ui.horizontal(|ui| {
                 paint_status_dot(ui, ui.visuals().strong_text_color());
                 ui.strong(&self.status_text);
                 if let Some(endpoint) = &self.mcp_endpoint {
                     ui.weak(endpoint);
                 }
-
-                ui.separator();
-                if tunnel_starting {
-                    ui.spinner();
-                }
-                ui.strong("Tunnel client running:");
-                let tunnel_status = ui.label(if tunnel_process_active { "yes" } else { "no" });
-                match &self.tunnel_state {
-                    TunnelUiState::Starting { log_path } | TunnelUiState::Running { log_path } => {
-                        tunnel_status.on_hover_text(format!("Tunnel log: {log_path}"));
-                    }
-                    TunnelUiState::Idle | TunnelUiState::Failed { .. } => {}
-                }
-
-                if tunnel_starting {
-                    stop_clicked = ui.button("Cancel tunnel launch").clicked();
-                } else if tunnel_running {
-                    stop_clicked = ui.button("Stop Secure MCP Tunnel").clicked();
-                } else {
-                    let button_text = if tunnel_failed {
-                        "Retry Secure MCP Tunnel"
-                    } else {
-                        "Start Secure MCP Tunnel"
-                    };
-                    start_clicked = ui
-                        .add_enabled(
-                            self.mcp_endpoint.is_some() && self.fatal_error.is_none(),
-                            egui::Button::new(button_text),
-                        )
-                        .clicked();
-                }
-
-                ui.separator();
-                ui.strong("HTTP connections:");
-                ui.label(self.active_http_connections.to_string());
-
-                ui.separator();
-                ui.strong("MCP sessions:");
-                ui.label(self.active_mcp_sessions.to_string());
 
                 if let Some(diagnostic) = &self.local_instructions_diagnostic {
                     ui.separator();
@@ -840,10 +801,51 @@ impl RemoteControlApp {
                 }
             });
 
-            if let TunnelUiState::Failed { error } = &self.tunnel_state {
-                ui.colored_label(ui.visuals().error_fg_color, "Tunnel launch failed");
-                ui.label(error);
-            }
+            ui.horizontal(|ui| {
+                ui.strong("HTTP connections:");
+                ui.label(self.active_http_connections.to_string());
+
+                ui.separator();
+                ui.strong("MCP sessions:");
+                ui.label(self.active_mcp_sessions.to_string());
+            });
+
+            ui.horizontal(|ui| {
+                if tunnel_starting {
+                    ui.spinner();
+                }
+                ui.strong("Tunnel client running:");
+                let tunnel_status = ui.label(if tunnel_process_active { "yes" } else { "no" });
+                match &self.tunnel_state {
+                    TunnelUiState::Starting { log_path } | TunnelUiState::Running { log_path } => {
+                        tunnel_status.on_hover_text(format!("Tunnel log: {log_path}"));
+                    }
+                    TunnelUiState::Idle | TunnelUiState::Failed { .. } => {}
+                }
+
+                if tunnel_starting {
+                    stop_clicked = ui.button("Cancel tunnel launch").clicked();
+                } else if tunnel_running {
+                    stop_clicked = ui.button("Stop Secure MCP Tunnel").clicked();
+                } else {
+                    let button_text = if tunnel_failed {
+                        "Retry Secure MCP Tunnel"
+                    } else {
+                        "Start Secure MCP Tunnel"
+                    };
+                    start_clicked = ui
+                        .add_enabled(
+                            self.mcp_endpoint.is_some() && self.fatal_error.is_none(),
+                            egui::Button::new(button_text),
+                        )
+                        .clicked();
+                }
+
+                if let TunnelUiState::Failed { error } = &self.tunnel_state {
+                    ui.colored_label(ui.visuals().error_fg_color, "Tunnel launch failed")
+                        .on_hover_text(error);
+                }
+            });
         });
 
         if stop_clicked {
@@ -865,19 +867,20 @@ impl RemoteControlApp {
         }
 
         ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(3.0);
-        ui.strong("Recent requests");
-        ui.add_space(3.0);
-
-        egui::ScrollArea::vertical()
-            .auto_shrink([false; 2])
-            .show(ui, |ui| {
-                for request in self.requests.iter().rev() {
-                    render_request_row(ui, request, current_elapsed);
-                    ui.add_space(4.0);
-                }
+        if self.requests.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.weak("MCP requests will show here");
             });
+        } else {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    for request in self.requests.iter().rev() {
+                        render_request_row(ui, request, current_elapsed);
+                        ui.add_space(4.0);
+                    }
+                });
+        }
     }
 }
 
