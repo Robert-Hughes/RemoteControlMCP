@@ -616,6 +616,7 @@ impl McpServer {
         let req = params.0;
         let id = self.start_request(RequestData::LaunchProcess {
             command_line: command_line_for_display(&req),
+            working_directory: req.working_directory.clone(),
             detached: req.detached,
         });
 

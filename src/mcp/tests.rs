@@ -2914,6 +2914,7 @@ fn test_gui_events_launch_process() {
             RequestData::LaunchProcess {
                 ref command_line,
                 detached,
+                ..
             },
         ..
     } = events[0]

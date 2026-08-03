@@ -325,6 +325,7 @@ pub enum RequestData {
     GetInstructions,
     LaunchProcess {
         command_line: String,
+        working_directory: Option<String>,
         detached: bool,
     },
     ReadFile {

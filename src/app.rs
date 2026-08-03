@@ -442,6 +442,7 @@ fn request_summary(request: &RequestEntry) -> String {
         RequestData::LaunchProcess {
             command_line,
             detached,
+            ..
         } => {
             let command_line = truncate_with_ellipsis(command_line, MAX_COMMAND_LINE_CHARACTERS);
             let mut summary = request.pid.map_or(command_line.clone(), |pid| {
@@ -488,14 +489,37 @@ fn truncate_with_ellipsis(text: &str, maximum_characters: usize) -> String {
         .collect()
 }
 
-fn request_summary_tooltip(request: &RequestEntry) -> Option<&str> {
-    match &request.request {
-        RequestData::LaunchProcess { command_line, .. } => Some(command_line),
-        RequestData::Ping
-        | RequestData::GetInstructions
-        | RequestData::ReadFile { .. }
-        | RequestData::WriteFile { .. } => None,
+fn request_summary_tooltip(request: &RequestEntry) -> Option<String> {
+    let RequestData::LaunchProcess {
+        command_line,
+        working_directory,
+        detached,
+    } = &request.request
+    else {
+        return None;
+    };
+
+    let mut lines = vec![
+        format!("Request {}", request.id.get()),
+        format!("Command: {command_line}"),
+        format!(
+            "Working directory: {}",
+            working_directory
+                .as_deref()
+                .unwrap_or("<default temporary directory>")
+        ),
+        format!(
+            "Launch mode: {}",
+            if *detached { "detached" } else { "foreground" }
+        ),
+    ];
+    if let Some(stdout_file) = &request.stdout_file {
+        lines.push(format!("stdout file: {stdout_file}"));
     }
+    if let Some(stderr_file) = &request.stderr_file {
+        lines.push(format!("stderr file: {stderr_file}"));
+    }
+    Some(lines.join("\n"))
 }
 
 fn paint_state_icon(ui: &mut egui::Ui, state: RequestState, colour: egui::Color32) {
@@ -581,23 +605,16 @@ fn render_request_row(ui: &mut egui::Ui, request: &RequestEntry, current_elapsed
                     });
                 });
                 let summary = ui.label(request_summary(request));
-                if let Some(command_line) = request_summary_tooltip(request) {
-                    summary.on_hover_text(command_line);
+                if let Some(tooltip) = request_summary_tooltip(request) {
+                    summary.on_hover_text(tooltip);
                 }
                 ui.weak(format!(
-                    "Request {} · Started {} · Duration {}",
-                    request.id.get(),
+                    "Started {} · Duration {}",
                     format_start_time(&request.started_at),
                     format_duration(request.duration(current_elapsed))
                 ));
                 if let Some(detail) = &request.detail_text {
                     ui.label(detail);
-                }
-                if let Some(stdout_file) = &request.stdout_file {
-                    ui.weak(format!("stdout file: {stdout_file}"));
-                }
-                if let Some(stderr_file) = &request.stderr_file {
-                    ui.weak(format!("stderr file: {stderr_file}"));
                 }
             });
         });
@@ -1135,6 +1152,7 @@ mod tests {
                     id: RequestId(1),
                     request: RequestData::LaunchProcess {
                         command_line: "test.exe --background".to_string(),
+                        working_directory: Some(r"C:\work".to_string()),
                         detached: true,
                     },
                     started_at: Local::now(),
@@ -1355,6 +1373,7 @@ mod tests {
             id: RequestId(1),
             request: RequestData::LaunchProcess {
                 command_line: "safe.exe visible argument".to_string(),
+                working_directory: Some(r"C:\work".to_string()),
                 detached: false,
             },
             started_at: Local::now(),
@@ -1373,13 +1392,16 @@ mod tests {
             "safe.exe visible argument · PID 42"
         );
         assert_eq!(
-            request_summary_tooltip(&launch),
-            Some("safe.exe visible argument")
+            request_summary_tooltip(&launch).as_deref(),
+            Some(
+                "Request 1\nCommand: safe.exe visible argument\nWorking directory: C:\\work\nLaunch mode: foreground"
+            )
         );
 
         let detached_launch = RequestEntry {
             request: RequestData::LaunchProcess {
                 command_line: "worker.exe".to_string(),
+                working_directory: None,
                 detached: true,
             },
             pid: Some(84),
