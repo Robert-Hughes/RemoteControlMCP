@@ -327,6 +327,8 @@ pub enum RequestData {
         command_line: String,
         working_directory: Option<String>,
         detached: bool,
+        timeout_ms: Option<u64>,
+        timeout_action: Option<TimeoutAction>,
     },
     ReadFile {
         path: String,

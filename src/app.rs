@@ -494,6 +494,8 @@ fn request_summary_tooltip(request: &RequestEntry) -> Option<String> {
         command_line,
         working_directory,
         detached,
+        timeout_ms,
+        timeout_action,
     } = &request.request
     else {
         return None;
@@ -511,6 +513,20 @@ fn request_summary_tooltip(request: &RequestEntry) -> Option<String> {
         format!(
             "Launch mode: {}",
             if *detached { "detached" } else { "foreground" }
+        ),
+        format!(
+            "Timeout: {}",
+            match timeout_ms {
+                Some(ms) => format!(
+                    "{ms} ms ({})",
+                    match timeout_action {
+                        Some(crate::mcp::TimeoutAction::Detach) => "detach",
+                        Some(crate::mcp::TimeoutAction::Stop) => "stop",
+                        None => "no action specified",
+                    }
+                ),
+                None => "none".to_string(),
+            }
         ),
     ];
     if let Some(stdout_file) = &request.stdout_file {
@@ -1154,6 +1170,8 @@ mod tests {
                         command_line: "test.exe --background".to_string(),
                         working_directory: Some(r"C:\work".to_string()),
                         detached: true,
+                        timeout_ms: None,
+                        timeout_action: None,
                     },
                     started_at: Local::now(),
                 },
@@ -1375,6 +1393,8 @@ mod tests {
                 command_line: "safe.exe visible argument".to_string(),
                 working_directory: Some(r"C:\work".to_string()),
                 detached: false,
+                timeout_ms: Some(5000),
+                timeout_action: Some(crate::mcp::TimeoutAction::Stop),
             },
             started_at: Local::now(),
             started_elapsed: Duration::ZERO,
@@ -1394,7 +1414,7 @@ mod tests {
         assert_eq!(
             request_summary_tooltip(&launch).as_deref(),
             Some(
-                "Request 1\nCommand: safe.exe visible argument\nWorking directory: C:\\work\nLaunch mode: foreground"
+                "Request 1\nCommand: safe.exe visible argument\nWorking directory: C:\\work\nLaunch mode: foreground\nTimeout: 5000 ms (stop)"
             )
         );
 
@@ -1403,6 +1423,8 @@ mod tests {
                 command_line: "worker.exe".to_string(),
                 working_directory: None,
                 detached: true,
+                timeout_ms: None,
+                timeout_action: None,
             },
             pid: Some(84),
             ..launch

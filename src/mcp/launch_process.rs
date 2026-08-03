@@ -618,6 +618,8 @@ impl McpServer {
             command_line: command_line_for_display(&req),
             working_directory: req.working_directory.clone(),
             detached: req.detached,
+            timeout_ms: req.timeout_ms,
+            timeout_action: req.timeout_action,
         });
 
         if let Err(err_msg) = validate_request(&req) {
