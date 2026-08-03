@@ -1,3 +1,4 @@
+use crate::disk_log::DiskLog;
 use crate::mcp::{
     LaunchProcessStatus, LocalInstructionsDiagnostic, ReadFileStatus, RequestData, RequestId,
     RequestUpdate, UiEvent, UiEventKind, WriteFileStatus,
@@ -652,6 +653,7 @@ pub struct RemoteControlApp {
     fatal_error: Option<String>,
     local_instructions_diagnostic: Option<LocalInstructionsDiagnostic>,
     start_time: Instant,
+    disk_log: DiskLog,
 }
 
 impl RemoteControlApp {
@@ -671,11 +673,13 @@ impl RemoteControlApp {
             fatal_error: None,
             local_instructions_diagnostic: None,
             start_time,
+            disk_log: DiskLog::open(),
         }
     }
 
     fn receive_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
+            self.disk_log.log_ui_event(&event);
             if matches!(
                 &event.kind,
                 UiEventKind::RequestStarted { .. } | UiEventKind::RequestUpdated { .. }
@@ -762,18 +766,26 @@ impl RemoteControlApp {
     }
 
     fn start_tunnel(&mut self) {
-        let Some(endpoint) = self.mcp_endpoint.as_deref() else {
-            self.status_text = "MCP server is not ready".to_string();
-            return;
-        };
-
-        match tunnel::start_tunnel(endpoint) {
+        self.disk_log.log_tunnel(
+            "tunnel_launch_requested",
+            format!(
+                "endpoint={}",
+                self.mcp_endpoint.as_deref().unwrap_or("<unavailable>")
+            ),
+        );
+        let endpoint = self.mcp_endpoint.clone().unwrap_or_default();
+        match tunnel::start_tunnel(&endpoint) {
             Ok(launch) => {
+                self.disk_log.log_tunnel(
+                    "tunnel_process_launched",
+                    format!("log_path={}", launch.log_path().display()),
+                );
                 let log_path = launch.log_path().display().to_string();
-                self.tunnel_state = TunnelUiState::Starting { log_path };
                 self.tunnel_launch = Some(launch);
+                self.tunnel_state = TunnelUiState::Starting { log_path };
             }
             Err(error) => {
+                self.disk_log.log_tunnel("tunnel_launch_failed", &error);
                 self.tunnel_state = TunnelUiState::Failed { error };
             }
         }
@@ -785,6 +797,7 @@ impl RemoteControlApp {
             TunnelUiState::Idle | TunnelUiState::Failed { .. } => return,
         }
 
+        self.disk_log.log_tunnel("tunnel_stop_requested", "");
         self.tunnel_launch.take();
         self.tunnel_state = TunnelUiState::Idle;
     }
@@ -793,6 +806,7 @@ impl RemoteControlApp {
         let event = self.tunnel_launch.as_ref().map(TunnelLaunch::try_recv);
         match event {
             Some(Ok(TunnelLaunchEvent::Ready)) => {
+                self.disk_log.log_tunnel("tunnel_ready", "");
                 let log_path = self
                     .tunnel_launch
                     .as_ref()
@@ -801,16 +815,17 @@ impl RemoteControlApp {
                 self.tunnel_state = TunnelUiState::Running { log_path };
             }
             Some(Ok(TunnelLaunchEvent::Failed(error))) => {
+                self.disk_log.log_tunnel("tunnel_failed", &error);
                 self.tunnel_launch.take();
                 self.tunnel_state = TunnelUiState::Failed { error };
             }
             Some(Err(TryRecvError::Disconnected)) => {
                 if !matches!(self.tunnel_state, TunnelUiState::Failed { .. }) {
+                    let error =
+                        "The tunnel launcher stopped without reporting a result.".to_string();
+                    self.disk_log.log_tunnel("tunnel_disconnected", &error);
                     self.tunnel_launch.take();
-                    self.tunnel_state = TunnelUiState::Failed {
-                        error: "The tunnel launcher stopped without reporting a result."
-                            .to_string(),
-                    };
+                    self.tunnel_state = TunnelUiState::Failed { error };
                 }
             }
             Some(Err(TryRecvError::Empty)) | None => {}
