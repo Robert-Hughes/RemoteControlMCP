@@ -78,6 +78,8 @@ struct RequestEntry {
     status_text: String,
     detail_text: Option<String>,
     pid: Option<u32>,
+    stdout_file: Option<String>,
+    stderr_file: Option<String>,
     background_failure: bool,
 }
 
@@ -259,6 +261,8 @@ fn presentation_for_update(update: RequestUpdate) -> RequestPresentation {
             error,
             pid,
             exit_code,
+            stdout_file: _,
+            stderr_file: _,
         } => launch_process_presentation(status, error, pid, exit_code),
         RequestUpdate::ReadFileResponded {
             status,
@@ -348,10 +352,21 @@ fn apply_request_event(requests: &mut Vec<RequestEntry>, event: UiEvent) {
             status_text: "In progress".to_string(),
             detail_text: None,
             pid: None,
+            stdout_file: None,
+            stderr_file: None,
             background_failure: false,
         }),
         UiEventKind::RequestUpdated { id, update } => {
             if let Some(request) = requests.iter_mut().rev().find(|request| request.id == id) {
+                if let RequestUpdate::LaunchProcessResponded {
+                    stdout_file,
+                    stderr_file,
+                    ..
+                } = &update
+                {
+                    request.stdout_file.clone_from(stdout_file);
+                    request.stderr_file.clone_from(stderr_file);
+                }
                 let is_primary_terminal = matches!(
                     &update,
                     RequestUpdate::PingCompleted
@@ -424,11 +439,18 @@ fn request_summary(request: &RequestEntry) -> String {
     match &request.request {
         RequestData::Ping => "Server health check".to_string(),
         RequestData::GetInstructions => "Get server instructions".to_string(),
-        RequestData::LaunchProcess { command_line } => {
+        RequestData::LaunchProcess {
+            command_line,
+            detached,
+        } => {
             let command_line = truncate_with_ellipsis(command_line, MAX_COMMAND_LINE_CHARACTERS);
-            request.pid.map_or(command_line.clone(), |pid| {
+            let mut summary = request.pid.map_or(command_line.clone(), |pid| {
                 format!("{command_line} · PID {pid}")
-            })
+            });
+            if *detached {
+                summary.push_str(" · detached requested");
+            }
+            summary
         }
         RequestData::ReadFile {
             path,
@@ -468,7 +490,7 @@ fn truncate_with_ellipsis(text: &str, maximum_characters: usize) -> String {
 
 fn request_summary_tooltip(request: &RequestEntry) -> Option<&str> {
     match &request.request {
-        RequestData::LaunchProcess { command_line } => Some(command_line),
+        RequestData::LaunchProcess { command_line, .. } => Some(command_line),
         RequestData::Ping
         | RequestData::GetInstructions
         | RequestData::ReadFile { .. }
@@ -563,12 +585,19 @@ fn render_request_row(ui: &mut egui::Ui, request: &RequestEntry, current_elapsed
                     summary.on_hover_text(command_line);
                 }
                 ui.weak(format!(
-                    "Started {} · Duration {}",
+                    "Request {} · Started {} · Duration {}",
+                    request.id.get(),
                     format_start_time(&request.started_at),
                     format_duration(request.duration(current_elapsed))
                 ));
                 if let Some(detail) = &request.detail_text {
                     ui.label(detail);
+                }
+                if let Some(stdout_file) = &request.stdout_file {
+                    ui.weak(format!("stdout file: {stdout_file}"));
+                }
+                if let Some(stderr_file) = &request.stderr_file {
+                    ui.weak(format!("stderr file: {stderr_file}"));
                 }
             });
         });
@@ -1106,6 +1135,7 @@ mod tests {
                     id: RequestId(1),
                     request: RequestData::LaunchProcess {
                         command_line: "test.exe --background".to_string(),
+                        detached: true,
                     },
                     started_at: Local::now(),
                 },
@@ -1144,6 +1174,8 @@ mod tests {
                     error: None,
                     pid: Some(42),
                     exit_code: None,
+                    stdout_file: Some("stdout.log".to_string()),
+                    stderr_file: Some("stderr.log".to_string()),
                 },
             ),
         );
@@ -1158,6 +1190,8 @@ mod tests {
             Some("injected wait failure")
         );
         assert_eq!(requests[0].pid, Some(42));
+        assert_eq!(requests[0].stdout_file.as_deref(), Some("stdout.log"));
+        assert_eq!(requests[0].stderr_file.as_deref(), Some("stderr.log"));
         assert_eq!(
             requests[0].duration(Duration::from_secs(20)),
             Duration::from_secs(5)
@@ -1321,6 +1355,7 @@ mod tests {
             id: RequestId(1),
             request: RequestData::LaunchProcess {
                 command_line: "safe.exe visible argument".to_string(),
+                detached: false,
             },
             started_at: Local::now(),
             started_elapsed: Duration::ZERO,
@@ -1329,6 +1364,8 @@ mod tests {
             status_text: "In progress".to_string(),
             detail_text: None,
             pid: Some(42),
+            stdout_file: None,
+            stderr_file: None,
             background_failure: false,
         };
         assert_eq!(
@@ -1338,6 +1375,19 @@ mod tests {
         assert_eq!(
             request_summary_tooltip(&launch),
             Some("safe.exe visible argument")
+        );
+
+        let detached_launch = RequestEntry {
+            request: RequestData::LaunchProcess {
+                command_line: "worker.exe".to_string(),
+                detached: true,
+            },
+            pid: Some(84),
+            ..launch
+        };
+        assert_eq!(
+            request_summary(&detached_launch),
+            "worker.exe · PID 84 · detached requested"
         );
     }
 

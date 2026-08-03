@@ -616,6 +616,7 @@ impl McpServer {
         let req = params.0;
         let id = self.start_request(RequestData::LaunchProcess {
             command_line: command_line_for_display(&req),
+            detached: req.detached,
         });
 
         if let Err(err_msg) = validate_request(&req) {
@@ -634,6 +635,8 @@ impl McpServer {
             error: result.error.clone(),
             pid: result.pid,
             exit_code: result.exit_code,
+            stdout_file: result.stdout_file.clone(),
+            stderr_file: result.stderr_file.clone(),
         };
 
         let summary = launch_process_summary(&result);

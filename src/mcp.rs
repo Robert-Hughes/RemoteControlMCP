@@ -314,8 +314,7 @@ pub struct LaunchProcessRequest {
 pub struct RequestId(pub(crate) u64);
 
 impl RequestId {
-    #[cfg(test)]
-    pub fn get(self) -> u64 {
+    pub(crate) fn get(self) -> u64 {
         self.0
     }
 }
@@ -326,6 +325,7 @@ pub enum RequestData {
     GetInstructions,
     LaunchProcess {
         command_line: String,
+        detached: bool,
     },
     ReadFile {
         path: String,
@@ -350,6 +350,8 @@ pub enum RequestUpdate {
         error: Option<String>,
         pid: Option<u32>,
         exit_code: Option<i32>,
+        stdout_file: Option<String>,
+        stderr_file: Option<String>,
     },
     ReadFileResponded {
         status: ReadFileStatus,

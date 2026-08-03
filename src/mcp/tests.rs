@@ -2910,13 +2910,18 @@ fn test_gui_events_launch_process() {
     assert_eq!(events.len(), 2);
     let UiEventKind::RequestStarted {
         id,
-        request: RequestData::LaunchProcess { ref command_line },
+        request:
+            RequestData::LaunchProcess {
+                ref command_line,
+                detached,
+            },
         ..
     } = events[0]
     else {
         panic!("expected launch_process request start");
     };
     assert_eq!(command_line, &make_helper_request().process_name);
+    assert!(!detached);
     assert!(matches!(
         events[1],
         UiEventKind::RequestUpdated {
@@ -2925,9 +2930,14 @@ fn test_gui_events_launch_process() {
                 status: LaunchProcessStatus::Completed,
                 pid,
                 exit_code: Some(0),
+                ref stdout_file,
+                ref stderr_file,
                 ..
             },
-        } if update_id == id && pid == structured.pid
+        } if update_id == id
+            && pid == structured.pid
+            && stdout_file == &structured.stdout_file
+            && stderr_file == &structured.stderr_file
     ));
 
     let (tx2, rx2) = std::sync::mpsc::channel();
