@@ -377,6 +377,7 @@ impl McpServer {
             actual_end_line: result.actual_end_line,
             next_start_line: result.next_start_line,
             eof: result.eof,
+            text: result.text.clone(),
         };
 
         let summary = read_file_summary(&result);

@@ -832,7 +832,13 @@ fn read_file_preserves_logical_lines_and_newline_semantics() {
             },
         } if update_id == id
     ));
-    assert!(!format!("{events:?}").contains("third"));
+    assert!(matches!(
+        &events[1],
+        UiEventKind::RequestUpdated {
+            update: RequestUpdate::ReadFileResponded { text, .. },
+            ..
+        } if text == "first\n\nthird\nlast"
+    ));
 
     let (single_call, _) = call_read_file_direct(make_read_file_request(&path, 2, 2));
     let single = read_file_structured_result(&single_call);

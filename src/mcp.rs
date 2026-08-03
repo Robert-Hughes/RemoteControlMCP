@@ -353,6 +353,8 @@ pub enum RequestUpdate {
         error: Option<String>,
         pid: Option<u32>,
         exit_code: Option<i32>,
+        stdout: Option<String>,
+        stderr: Option<String>,
         stdout_file: Option<String>,
         stderr_file: Option<String>,
     },
@@ -363,6 +365,7 @@ pub enum RequestUpdate {
         actual_end_line: Option<u64>,
         next_start_line: Option<u64>,
         eof: Option<bool>,
+        text: String,
     },
     WriteFileResponded {
         status: WriteFileStatus,

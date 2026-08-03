@@ -638,6 +638,8 @@ impl McpServer {
             error: result.error.clone(),
             pid: result.pid,
             exit_code: result.exit_code,
+            stdout: result.stdout.clone(),
+            stderr: result.stderr.clone(),
             stdout_file: result.stdout_file.clone(),
             stderr_file: result.stderr_file.clone(),
         };

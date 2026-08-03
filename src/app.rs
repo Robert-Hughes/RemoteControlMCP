@@ -262,8 +262,7 @@ fn presentation_for_update(update: RequestUpdate) -> RequestPresentation {
             error,
             pid,
             exit_code,
-            stdout_file: _,
-            stderr_file: _,
+            ..
         } => launch_process_presentation(status, error, pid, exit_code),
         RequestUpdate::ReadFileResponded {
             status,
@@ -272,6 +271,7 @@ fn presentation_for_update(update: RequestUpdate) -> RequestPresentation {
             actual_end_line,
             next_start_line,
             eof,
+            ..
         } => read_file_presentation(
             status,
             error,
@@ -1225,6 +1225,8 @@ mod tests {
                     error: None,
                     pid: Some(42),
                     exit_code: None,
+                    stdout: None,
+                    stderr: None,
                     stdout_file: Some("stdout.log".to_string()),
                     stderr_file: Some("stderr.log".to_string()),
                 },

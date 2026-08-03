@@ -104,7 +104,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("rmcp-disk-log-test-{}.log", std::process::id()));
         let mut log = DiskLog::open_at(&path);
-        let event = UiEvent {
+        log.log_ui_event(&UiEvent {
             elapsed: Duration::ZERO,
             kind: UiEventKind::RequestUpdated {
                 id: RequestId(42),
@@ -112,15 +112,48 @@ mod tests {
                     error: "x".repeat(MAX_FIELD_CHARS + 50),
                 },
             },
-        };
-        log.log_ui_event(&event);
+        });
+        log.log_ui_event(&UiEvent {
+            elapsed: Duration::ZERO,
+            kind: UiEventKind::RequestUpdated {
+                id: RequestId(43),
+                update: RequestUpdate::LaunchProcessResponded {
+                    status: crate::mcp::LaunchProcessStatus::Completed,
+                    error: None,
+                    pid: Some(123),
+                    exit_code: Some(0),
+                    stdout: Some("inline stdout".to_string()),
+                    stderr: Some("inline stderr".to_string()),
+                    stdout_file: None,
+                    stderr_file: None,
+                },
+            },
+        });
+        log.log_ui_event(&UiEvent {
+            elapsed: Duration::ZERO,
+            kind: UiEventKind::RequestUpdated {
+                id: RequestId(44),
+                update: RequestUpdate::ReadFileResponded {
+                    status: crate::mcp::ReadFileStatus::Completed,
+                    error: None,
+                    actual_start_line: Some(1),
+                    actual_end_line: Some(1),
+                    next_start_line: None,
+                    eof: Some(true),
+                    text: "returned file text".to_string(),
+                },
+            },
+        });
         drop(log);
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert!(text.contains("event=request_updated request_id=42"));
         assert!(text.contains("result=InternalFailure"));
+        assert!(text.contains("inline stdout"));
+        assert!(text.contains("inline stderr"));
+        assert!(text.contains("returned file text"));
         assert!(text.contains("[truncated"));
-        assert!(text.len() < MAX_FIELD_CHARS + 500);
+        assert!(text.len() < MAX_FIELD_CHARS + 1_500);
     }
 
     #[test]
