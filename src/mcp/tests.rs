@@ -39,7 +39,7 @@ fn tracked_http_io_reports_connection_lifecycle() {
 }
 
 struct InstructionsToolExchange {
-    server_info: Arc<rmcp::model::ServerInfo>,
+    server_info: Arc<rmcp::model::ServerPeerInfo>,
     tool: rmcp::model::Tool,
     call_result: rmcp::model::CallToolResult,
     unexpected_arguments_result: rmcp::model::CallToolResult,
@@ -351,49 +351,6 @@ fn resolve_local_schema_ref<'a>(
             .expect("schema reference should resolve within the schema");
     }
     schema
-}
-
-#[cfg(target_os = "windows")]
-fn escape_windows_arg(arg: &str) -> String {
-    if arg.is_empty() {
-        return "\"\"".to_string();
-    }
-    if !arg.contains([' ', '\t', '\n', '\x0b', '\"']) {
-        return arg.to_string();
-    }
-    let mut escaped = String::new();
-    escaped.push('\"');
-    let mut backslashes = 0;
-    for c in arg.chars() {
-        match c {
-            '\\' => backslashes += 1,
-            '\"' => {
-                escaped.push_str(&"\\".repeat(backslashes * 2 + 1));
-                escaped.push('\"');
-                backslashes = 0;
-            }
-            _ => {
-                if backslashes > 0 {
-                    escaped.push_str(&"\\".repeat(backslashes));
-                    backslashes = 0;
-                }
-                escaped.push(c);
-            }
-        }
-    }
-    if backslashes > 0 {
-        escaped.push_str(&"\\".repeat(backslashes * 2));
-    }
-    escaped.push('\"');
-    escaped
-}
-
-#[cfg(target_os = "windows")]
-fn escape_windows_args(args: &[&str]) -> String {
-    args.iter()
-        .map(|arg| escape_windows_arg(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn generate_temp_test_path(prefix: &str) -> std::path::PathBuf {
@@ -1820,14 +1777,12 @@ fn test_validation() {
     req.working_directory = Some("C:\\temp\0".to_string());
     assert!(validate_request(&req).is_err());
 
-    // 4. Null character in Windows raw arguments, under cfg(windows)
-    #[cfg(target_os = "windows")]
+    // 4. Null character in an argument-array item
     {
         let mut req = base_req.clone();
-        req.arguments = Some("some\0args".to_string());
+        req.arguments = Some(vec!["some\0args".to_string()]);
         assert!(validate_request(&req).is_err());
     }
-
     // 5. Null character in an argument-array item, under cfg(not(windows))
     #[cfg(not(target_os = "windows"))]
     {
@@ -1899,16 +1854,9 @@ fn test_validation() {
     req.arguments = None;
     assert!(validate_request(&req).is_ok());
 
-    // B. Empty string/vector is valid
+    // B. Empty vector is valid
     let mut req = base_req.clone();
-    #[cfg(target_os = "windows")]
-    {
-        req.arguments = Some("".to_string());
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        req.arguments = Some(vec![]);
-    }
+    req.arguments = Some(vec![]);
     assert!(validate_request(&req).is_ok());
 }
 
@@ -1929,7 +1877,7 @@ fn test_schema_arguments() {
     {
         assert_eq!(
             args_schema.get("type").and_then(|value| value.as_str()),
-            Some("string")
+            Some("array")
         );
     }
     #[cfg(not(target_os = "windows"))]
@@ -2953,9 +2901,6 @@ fn test_gui_events_launch_process() {
     let params = rmcp::handler::server::wrapper::Parameters(LaunchProcessRequest {
         working_directory: None,
         process_name: "".to_string(),
-        #[cfg(target_os = "windows")]
-        arguments: Some("".to_string()),
-        #[cfg(not(target_os = "windows"))]
         arguments: Some(vec![]),
         environment: EnvironmentConfig {
             inherit: true,
@@ -3000,9 +2945,6 @@ fn launch_process_events_include_command_line_but_exclude_environment_and_output
     let request = LaunchProcessRequest {
         working_directory: None,
         process_name: "safe-process-name".to_string(),
-        #[cfg(target_os = "windows")]
-        arguments: Some("secret argument".to_string()),
-        #[cfg(not(target_os = "windows"))]
         arguments: Some(vec!["secret argument".to_string()]),
         environment: EnvironmentConfig {
             inherit: true,
@@ -3104,7 +3046,7 @@ fn launch_process_integration_test_over_duplex() {
         {
             assert_eq!(
                 args_schema.get("type").and_then(|value| value.as_str()),
-                Some("string")
+                Some("array")
             );
         }
         #[cfg(not(target_os = "windows"))]
@@ -3159,9 +3101,6 @@ fn launch_process_integration_test_over_duplex() {
             Some("stderr: integration_test\n".to_string()),
         );
 
-        #[cfg(target_os = "windows")]
-        let base_arguments_val = rmcp::serde_json::json!(escape_windows_args(&["integration_arg"]));
-        #[cfg(not(target_os = "windows"))]
         let base_arguments_val = rmcp::serde_json::json!(vec!["integration_arg".to_string()]);
 
         let mut call_params = rmcp::model::CallToolRequestParams::new("launch_process");
@@ -4287,20 +4226,11 @@ fn test_argument_boundaries() {
         Some("echo_args".to_string()),
     );
 
-    #[cfg(target_os = "windows")]
-    {
-        let helper_args = vec!["arg1", "arg 2", "arg\"3"];
-        req.arguments = Some(escape_windows_args(&helper_args));
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        req.arguments = Some(vec![
-            "arg1".to_string(),
-            "arg 2".to_string(),
-            "arg\"3".to_string(),
-        ]);
-    }
-
+    req.arguments = Some(vec![
+        "arg1".to_string(),
+        "arg 2".to_string(),
+        "arg\"3".to_string(),
+    ]);
     let res = rt.block_on(async { server.execute_launch_process(req).await });
     assert!(matches!(res.status, LaunchProcessStatus::Completed));
     assert_eq!(res.stdout.unwrap().trim(), "arg1|arg 2|arg\"3");

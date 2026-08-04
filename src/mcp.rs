@@ -630,8 +630,7 @@ impl McpServer {
 
     #[tool(
         description = "Get the full instructions on how to use this MCP server. Call this tool before calling any other tools.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<GetInstructionsResult>()
-            .expect("GetInstructionsResult should generate a valid output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<GetInstructionsResult>(),
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -658,8 +657,7 @@ impl McpServer {
 
     #[tool(
         description = "Check whether the local Remote Control MCP server is running and responding.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<ping::PingResult>()
-            .expect("PingResult should generate a valid output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ping::PingResult>(),
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -678,8 +676,7 @@ impl McpServer {
 
     #[tool(
         description = "Launch a local process on the host machine with optional working directory, arguments, environment configuration, timeout, and detachment options.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<LaunchProcessResult>()
-            .expect("LaunchProcessResult should generate a valid output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<LaunchProcessResult>(),
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -696,8 +693,7 @@ impl McpServer {
 
     #[tool(
         description = "Read a 1-based inclusive line range from a local regular file.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<ReadFileResult>()
-            .expect("ReadFileResult should generate a valid output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ReadFileResult>(),
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -714,8 +710,7 @@ impl McpServer {
 
     #[tool(
         description = "Replace a strict 1-based inclusive line range in a local regular file, or explicitly create a missing file.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<WriteFileResult>()
-            .expect("WriteFileResult should generate a valid output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<WriteFileResult>(),
         annotations(
             read_only_hint = false,
             destructive_hint = true,
