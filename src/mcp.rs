@@ -731,20 +731,14 @@ impl ServerHandler for McpServer {
     fn initialize(
         &self,
         request: rmcp::model::InitializeRequestParams,
-        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> impl std::future::Future<Output = Result<rmcp::model::InitializeResult, rmcp::ErrorData>> + Send
     {
         let mut info = self.get_info();
         if rmcp::model::ProtocolVersion::KNOWN_VERSIONS.contains(&request.protocol_version) {
-            info.protocol_version = request.protocol_version.clone();
+            info.protocol_version = request.protocol_version;
         }
 
-        // `serve()` normally performs this negotiated peer-info update around the handler.
-        // `serve_directly()` does not, so preserve the same state for every request after
-        // initialize while still permitting earlier requests with no client information.
-        let mut negotiated_peer_info = request;
-        negotiated_peer_info.protocol_version = info.protocol_version.clone();
-        context.peer.set_peer_info(negotiated_peer_info);
         self.send_event(UiEventKind::ClientInitialized);
 
         std::future::ready(Ok(info))
@@ -892,12 +886,17 @@ where
     send_event(UiEventKind::LocalInstructionsDiagnostic { diagnostic });
     let service = McpServer::new_with_instructions(tx.clone(), start_time, instructions);
 
-    // This direct-service helper keeps the in-memory transport tests focused on tool behavior,
-    // including cases that intentionally send requests before initialize. Production HTTP
-    // sessions use the stateful Streamable HTTP service above.
-    let server =
-        rmcp::service::serve_directly::<rmcp::RoleServer, _, _, _, _>(service, transport, None);
-    send_event(UiEventKind::ClientConnected);
+    use rmcp::ServiceExt;
+
+    let server = match service.serve(transport).await {
+        Ok(server) => server,
+        Err(error) => {
+            send_event(UiEventKind::ServerError {
+                error: format!("Server initialization error: {error}"),
+            });
+            return;
+        }
+    };
     match server.waiting().await {
         Ok(_) => {
             send_event(UiEventKind::ServerStopped);
