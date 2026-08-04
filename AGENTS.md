@@ -4,7 +4,7 @@ Instructions for future coding agents working in this repository.
 
 ## Project scope
 
-* This is a lightweight Rust Windows GUI application.
+* This is a lightweight cross-platform Rust GUI application.
 * The GUI runs on the main thread using eframe/egui.
 * The MCP server runs on a dedicated background thread using a single-threaded Tokio runtime.
 * MCP transport uses Streamable HTTP on the fixed loopback endpoint `http://127.0.0.1:61337/mcp`.

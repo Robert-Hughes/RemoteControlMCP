@@ -1,19 +1,33 @@
-# OpenAI Secure MCP Tunnel Windows Developer Setup
+# OpenAI Secure MCP Tunnel Developer Setup
 
-This guide documents the complete Windows developer setup used to connect this local Streamable HTTP Model Context Protocol (MCP) server to ChatGPT through an OpenAI Secure MCP Tunnel.
+This guide documents the complete developer setup used to connect this local Streamable HTTP Model Context Protocol (MCP) server to ChatGPT through an OpenAI Secure MCP Tunnel. It covers **Windows (PowerShell)**, **macOS (bash/zsh)**, and **Linux (bash/zsh)**, and targets the **release executable**. The examples use `remote-control-mcp` for the application binary; on Windows the built executable is `remote-control-mcp.exe`.
 
 ## 1. Overview and Scope
 
-This setup allows a ChatGPT client to securely invoke the local `remote-control-mcp.exe` application using an outbound-only polling connection. 
+This setup allows a ChatGPT client to securely invoke the local `remote-control-mcp` application using an outbound-only polling connection. 
 
 * **Private and Local:** The MCP server remains entirely private within the local network.
 * **No Public URLs or Inbound Ports:** No inbound firewall ports or public URLs are opened or exposed.
 * **Outbound Polling:** The `tunnel-client` daemon establishes an outbound HTTPS connection to the OpenAI-hosted Secure MCP Tunnel control plane and polls for command dispatches.
-* **Independent Application Lifecycle:** `remote-control-mcp.exe` runs independently and listens only on `127.0.0.1:61337`; it does not need to be restarted when the tunnel client starts or stops.
+* **Independent Application Lifecycle:** `remote-control-mcp` runs independently and listens only on `127.0.0.1:61337`; it does not need to be restarted when the tunnel client starts or stops.
 * **Loopback HTTP:** `tunnel-client` connects to `http://127.0.0.1:61337/mcp` over Streamable HTTP. This TCP listener is not reachable from other machines.
 * **Continuous Operation:** The tunnel client must remain running continuously for ChatGPT application discovery and for executing all incoming MCP tool calls.
 
-This guide is written specifically for developers using **Windows PowerShell** and targeting the **release executable**.
+### Platform conventions
+
+The application and the `tunnel-client` daemon both store configuration in the platform user-config directory. The table below lists the equivalent locations on each supported platform.
+
+| Convention | Windows | macOS | Linux |
+|---|---|---|---|
+| Shell | PowerShell | bash / zsh | bash / zsh |
+| Tunnel client binary | `tunnel-client.exe` | `tunnel-client` | `tunnel-client` |
+| User config directory | `%APPDATA%` | `~/Library/Application Support` | `${XDG_CONFIG_HOME:-$HOME/.config}` |
+| Launcher path file | `%APPDATA%\RemoteControlMCP\tunnel-client-path.txt` | `~/Library/Application Support/RemoteControlMCP/tunnel-client-path.txt` | `~/.config/RemoteControlMCP/tunnel-client-path.txt` |
+| Runtime key file | `%APPDATA%\tunnel-client\remote-control-mcp.key` | `~/Library/Application Support/tunnel-client/remote-control-mcp.key` | `~/.config/tunnel-client/remote-control-mcp.key` |
+| Tunnel profile | `%APPDATA%\tunnel-client\remote-control-mcp.yaml` | `~/Library/Application Support/tunnel-client/remote-control-mcp.yaml` | `~/.config/tunnel-client/remote-control-mcp.yaml` |
+| Tunnel logs | `%TEMP%\RemoteControlMCP` | `$TMPDIR/RemoteControlMCP` (usually `/tmp`) | `/tmp/RemoteControlMCP` |
+
+These are the same user-config locations the `tunnel-client` daemon uses for its own profiles, so the runtime key file is shared between the manual CLI flow and the GUI launch button.
 
 ### Architecture
 
@@ -31,13 +45,13 @@ This guide is written specifically for developers using **Windows PowerShell** a
              │ outbound HTTPS polling
              │ (port 443)
  ┌───────────┴───────────┐
- │   tunnel-client.exe   │  (Windows Host)
+ │      tunnel-client     │  (Local Host)
  └───────────┬───────────┘
              │
              │ Streamable HTTP over loopback TCP
              ▼ (127.0.0.1:61337/mcp)
  ┌───────────────────────┐
- │remote-control-mcp.exe │  (Local Rust GUI App)
+ │    remote-control-mcp  │  (Local Rust GUI App)
  └───────────────────────┘
 ```
 
@@ -47,7 +61,7 @@ This guide is written specifically for developers using **Windows PowerShell** a
 
 Before starting, ensure you have:
 
-* **Windows Environment:** Windows operating system with PowerShell installed.
+* **Operating System:** Windows with PowerShell, or macOS/Linux with a bash or zsh shell.
 * **Rust Toolchain:** Cargo and `rustc` installed and available in your environment path.
 * **Local Repository:** A local clone of the `RemoteControlMCP` repository.
 * **OpenAI Platform Organisation:** Access to an OpenAI Platform developer organisation.
@@ -57,7 +71,7 @@ Before starting, ensure you have:
   * **Tunnels Read + Use:** Needed to run the `tunnel-client` daemon locally and select the tunnel when creating the ChatGPT application.
   * *Note: Platform tunnel permissions are managed via Organisation RBAC roles. They are separate from ChatGPT Developer mode settings.*
 * **Workspace Association:** The tunnel must be associated with both the owning Platform organisation and the target ChatGPT workspace.
-* **Tunnel Client CLI:** The `tunnel-client.exe` binary downloaded from the Platform settings page or official release.
+* **Tunnel Client CLI:** The `tunnel-client` binary downloaded from the Platform settings page or official release (the file is named `tunnel-client.exe` on Windows).
 
 ---
 
@@ -65,31 +79,45 @@ Before starting, ensure you have:
 
 First, compile and validate the Rust GUI application locally:
 
-1. Open a PowerShell session and navigate to the repository root:
-   ```powershell
-   cd C:\path\to\RemoteControlMCP
-   ```
+**Windows (PowerShell):**
 
-2. Run the validation sequence:
-   ```powershell
-   cargo fmt --check
-   cargo check
-   cargo test
-   cargo clippy --all-targets -- -D warnings
-   cargo build --release
-   ```
+```powershell
+cd C:\path\to\RemoteControlMCP
+cargo fmt --check
+cargo check
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+Test-Path .\target\release\remote-control-mcp.exe
+```
 
-3. Confirm that the release executable was built successfully:
-   ```powershell
-   Test-Path .\target\release\remote-control-mcp.exe
-   ```
-   This command must return `True`.
+The final command must return `True`.
+
+**macOS / Linux (bash or zsh):**
+
+```bash
+cd /path/to/RemoteControlMCP
+cargo fmt --check
+cargo check
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+test -x ./target/release/remote-control-mcp
+```
+
+`test -x` succeeds only if the executable exists and is executable.
 
 > [!IMPORTANT]
 > Start the application directly before using `doctor`, the tunnel client, or MCP Inspector:
 >
+> **Windows:**
 > ```powershell
 > .\target\release\remote-control-mcp.exe
+> ```
+>
+> **macOS / Linux:**
+> ```bash
+> ./target/release/remote-control-mcp
 > ```
 >
 > The GUI reports that it is waiting for an MCP client and offers to launch the configured tunnel client after the remaining setup steps are complete.
@@ -130,13 +158,15 @@ To set up the tunnel in the OpenAI control plane:
 > * They must never be committed to source control or pasted into documentation, screenshots, issue reports, or shared logs.
 > * If a key is ever exposed in terminal transcripts or shell histories, revoke and replace it immediately.
 > * The key is stored in a separate access-controlled file, not in the generated profile, application configuration, command line, or repository.
-> * The setup below removes inherited file permissions and grants access only to the current Windows account.
+> * The setup below restricts the key file to the current user account (Windows ACL, or Unix mode 0600).
 
 ---
 
-## 6. Configure the PowerShell Session Securely
+## 6. Configure the Shell Session Securely
 
-In your open PowerShell session, define path and identifier variables to make your commands portable. Use an absolute path to the downloaded tunnel client:
+Define path and identifier variables to make your commands portable. Use an absolute path to the downloaded tunnel client.
+
+### Windows (PowerShell)
 
 ```powershell
 $TunnelClient = (Resolve-Path -LiteralPath "C:\path\to\tunnel-client.exe").Path
@@ -194,14 +224,59 @@ Set-Acl -LiteralPath $KeyFile -AclObject $keyAcl
 $KeyReference = "file:$KeyFile"
 ```
 
+### macOS and Linux (bash or zsh)
+
+```bash
+TunnelClient="/absolute/path/to/tunnel-client"
+TunnelId="tunnel_<your-tunnel-id>"
+McpEndpoint="http://127.0.0.1:61337/mcp"
+```
+
+Record the tunnel-client executable path for the GUI launch button:
+
+```bash
+# macOS
+LauncherConfigDirectory="$HOME/Library/Application Support/RemoteControlMCP"
+# Linux
+LauncherConfigDirectory="${XDG_CONFIG_HOME:-$HOME/.config}/RemoteControlMCP"
+
+TunnelClientPathFile="$LauncherConfigDirectory/tunnel-client-path.txt"
+mkdir -p "$LauncherConfigDirectory"
+printf '%s' "$TunnelClient" > "$TunnelClientPathFile"
+```
+
+Next, prompt for the runtime API key, write it without a trailing newline, and restrict the file to the current user account:
+
+```bash
+# macOS
+KeyDirectory="$HOME/Library/Application Support/tunnel-client"
+# Linux
+KeyDirectory="${XDG_CONFIG_HOME:-$HOME/.config}/tunnel-client"
+
+KeyFile="$KeyDirectory/remote-control-mcp.key"
+mkdir -p "$KeyDirectory"
+
+umask 077
+printf "OpenAI tunnel runtime API key: "
+read -rs RuntimeKey
+echo
+printf '%s' "$RuntimeKey" > "$KeyFile"
+chmod 600 "$KeyFile"
+unset RuntimeKey
+
+KeyReference="file:$KeyFile"
+```
+
 > [!NOTE]
-> The key remains plaintext at rest so that `tunnel-client` can read it non-interactively, but the file's Windows ACL is restricted to your account. The application checks that this exact non-empty file exists but never reads its contents. `tunnel-client` resolves the `file:` reference itself.
+> The key remains plaintext at rest so that `tunnel-client` can read it non-interactively, but the file's permissions are restricted to your account: a Windows ACL in the PowerShell flow above, and Unix mode 0600 in the macOS/Linux flow. The application checks that this exact non-empty file exists but never reads its contents. `tunnel-client` resolves the `file:` reference itself. The `read` builtin does not echo input and is not recorded in shell history.
 
 ---
 
 ## 7. Create or Migrate the HTTP Profile
 
 Initialize a local profile named `remote-control-mcp` that points to the already-running loopback HTTP server:
+
+**Windows (PowerShell):**
 
 ```powershell
 & $TunnelClient init `
@@ -212,10 +287,26 @@ Initialize a local profile named `remote-control-mcp` that points to the already
     --control-plane-api-key-ref $KeyReference
 ```
 
-The generated configuration profile will be saved to:
-`%APPDATA%\tunnel-client\remote-control-mcp.yaml`
+**macOS / Linux (bash or zsh):**
+
+```bash
+"$TunnelClient" init \
+    --sample sample_mcp_remote_no_auth \
+    --profile remote-control-mcp \
+    --tunnel-id "$TunnelId" \
+    --mcp-server-url "$McpEndpoint" \
+    --control-plane-api-key-ref "$KeyReference"
+```
+
+The generated configuration profile will be saved to the tunnel client's platform user-config directory:
+
+* Windows: `%APPDATA%\tunnel-client\remote-control-mcp.yaml`
+* macOS: `~/Library/Application Support/tunnel-client/remote-control-mcp.yaml`
+* Linux: `~/.config/tunnel-client/remote-control-mcp.yaml`
 
 If this machine already has the former stdio profile, migrate it by rerunning the command with `--force`. This preserves the named profile and tunnel ID you supply while replacing the old `mcp.command` binding with `mcp.server_urls`:
+
+**Windows (PowerShell):**
 
 ```powershell
 & $TunnelClient init `
@@ -224,6 +315,18 @@ If this machine already has the former stdio profile, migrate it by rerunning th
     --tunnel-id $TunnelId `
     --mcp-server-url $McpEndpoint `
     --control-plane-api-key-ref $KeyReference `
+    --force
+```
+
+**macOS / Linux (bash or zsh):**
+
+```bash
+"$TunnelClient" init \
+    --sample sample_mcp_remote_no_auth \
+    --profile remote-control-mcp \
+    --tunnel-id "$TunnelId" \
+    --mcp-server-url "$McpEndpoint" \
+    --control-plane-api-key-ref "$KeyReference" \
     --force
 ```
 
@@ -236,10 +339,21 @@ If this machine already has the former stdio profile, migrate it by rerunning th
 
 Verify that the profile is fully operational before connecting:
 
+**Windows (PowerShell):**
+
 ```powershell
 & $TunnelClient doctor `
     --profile remote-control-mcp `
     --control-plane.api-key $KeyReference `
+    --explain
+```
+
+**macOS / Linux (bash or zsh):**
+
+```bash
+"$TunnelClient" doctor \
+    --profile remote-control-mcp \
+    --control-plane.api-key "$KeyReference" \
     --explain
 ```
 
@@ -255,7 +369,7 @@ The application must be running while `doctor` probes the MCP endpoint. The outp
 
 > [!NOTE]
 > The following status indicators are expected for this local HTTP tunnel:
-> * `mcp_server_reachable   PASS` while `remote-control-mcp.exe` is running
+> * `mcp_server_reachable   PASS` while `remote-control-mcp` is running
 > * `oauth_metadata         PASS` with a message that OAuth metadata is not advertised
 > * `codex_plugin           SKIP` (Optional check, not required for basic ChatGPT tunnel operation)
 
@@ -265,13 +379,25 @@ The application must be running while `doctor` probes the MCP endpoint. The outp
 
 Start the tunnel client daemon manually with the protected key-file reference:
 
+**Windows (PowerShell):**
+
 ```powershell
 & $TunnelClient run `
     --profile remote-control-mcp `
     --control-plane.api-key $KeyReference
 ```
 
+**macOS / Linux (bash or zsh):**
+
+```bash
+"$TunnelClient" run \
+    --profile remote-control-mcp \
+    --control-plane.api-key "$KeyReference"
+```
+
 For longer development sessions, increase the maximum lifetime of the local MCP transport connection from the tunnel client's 10-minute default:
+
+**Windows (PowerShell):**
 
 ```powershell
 & $TunnelClient run `
@@ -280,13 +406,22 @@ For longer development sessions, increase the maximum lifetime of the local MCP 
     --mcp.connection-max-ttl 24h
 ```
 
+**macOS / Linux (bash or zsh):**
+
+```bash
+"$TunnelClient" run \
+    --profile remote-control-mcp \
+    --control-plane.api-key "$KeyReference" \
+    --mcp.connection-max-ttl 24h
+```
+
 This reduces HTTP session rotation during a typical development session. It does not repair an already stale MCP session; after restarting the tunnel or local MCP process, start a new ChatGPT conversation so that the new connection receives a fresh MCP `initialize` handshake.
 
-Alternatively, select **Start Secure MCP Tunnel** in the already-running application. It uses the recorded tunnel-client path, the fixed `remote-control-mcp` profile, `%APPDATA%\tunnel-client\remote-control-mcp.key`, and its own displayed HTTP endpoint. It starts the tunnel on an ephemeral loopback health port, waits for `/readyz`, and continues monitoring the tunnel process. While it is waiting, **Cancel tunnel launch** terminates the supervised tunnel-client process. Once connected, **Stop Secure MCP Tunnel** terminates it without closing the local MCP application and leaves the tunnel ready to be started again. Logs are written beneath `%TEMP%\RemoteControlMCP`.
+Alternatively, select **Start Secure MCP Tunnel** in the already-running application. It uses the recorded tunnel-client path, the fixed `remote-control-mcp` profile, the runtime key file `remote-control-mcp.key` in the platform user-config directory (see section 6), and its own displayed HTTP endpoint. It starts the tunnel on an ephemeral loopback health port, waits for `/readyz`, and continues monitoring the tunnel process. While it is waiting, **Cancel tunnel launch** terminates the supervised tunnel-client process. Once connected, **Stop Secure MCP Tunnel** terminates it without closing the local MCP application and leaves the tunnel ready to be started again. Logs are written beneath the system temporary directory (`%TEMP%` on Windows, `$TMPDIR` on macOS and Linux).
 
 * **Manual launch:** Leave the terminal pane open. The process must remain active to handle connection dispatches.
-* **GUI-button launch:** The tunnel client runs without a console window and stops when the GUI closes.
-* **Structured Logs:** Manual launches write structured logs to the terminal. GUI-button launches write them beneath `%TEMP%\RemoteControlMCP`.
+* **GUI-button launch:** The tunnel client runs detached from the console and stops when the GUI closes.
+* **Structured Logs:** Manual launches write structured logs to the terminal. GUI-button launches write them beneath the system temporary directory.
 * **Independent UI:** The local Rust GUI remains open whether the tunnel is connected or not.
 * **Connection Status:** The compact GUI panel groups the HTTP server state with its endpoint and the supervised tunnel state with its action button, followed by independent HTTP connection and MCP session counts. The tunnel can be started, cancelled, or stopped without restarting the local MCP server.
 * **Admin Interface:** A manually launched tunnel client exposes its browser-based admin UI at the profile's configured health address. By default, this is:
@@ -352,7 +487,7 @@ The newly created application will appear in your workspace draft list.
   ```
 
 This confirms the complete path of execution:
-`ChatGPT` → `OpenAI Tunnel Control Plane` → `local tunnel-client` → `remote-control-mcp.exe` → `ping tool` → `pong response`.
+`ChatGPT` → `OpenAI Tunnel Control Plane` → `local tunnel-client` → `remote-control-mcp` → `ping tool` → `pong response`.
 
 ---
 
@@ -360,9 +495,12 @@ This confirms the complete path of execution:
 
 When you are finished testing:
 
-1. Stop the `tunnel-client` daemon by pressing `Ctrl+C` in its PowerShell window, or stop `tunnel-client.exe` from Task Manager if it was launched by the GUI button.
+1. Stop the `tunnel-client` daemon by pressing `Ctrl+C` in its terminal, or stop it from the system process manager (Task Manager on Windows, Activity Monitor on macOS, or your desktop's process tool on Linux) if it was launched by the GUI button.
 2. Close the Rust GUI application when finished. If it launched the tunnel client, closing the GUI also stops that tunnel-client process.
-3. The protected runtime key file remains available for the next launch. If you are decommissioning the setup, revoke the key in the OpenAI Platform Dashboard and then delete `%APPDATA%\tunnel-client\remote-control-mcp.key`.
+3. The protected runtime key file remains available for the next launch. If you are decommissioning the setup, revoke the key in the OpenAI Platform Dashboard and then delete the runtime key file in your platform user-config directory:
+   * Windows: `%APPDATA%\tunnel-client\remote-control-mcp.key`
+   * macOS: `~/Library/Application Support/tunnel-client/remote-control-mcp.key`
+   * Linux: `~/.config/tunnel-client/remote-control-mcp.key`
 
 ---
 
@@ -370,15 +508,15 @@ When you are finished testing:
 
 ### MCP server is not reachable
 * **Symptom:** `doctor` reports that `http://127.0.0.1:61337/mcp` is unreachable, or the tunnel starts but cannot initialize MCP.
-* **Fix:** Start `remote-control-mcp.exe` first and confirm that its GUI shows the same local endpoint. If it reports a bind error, another copy or process already owns port `61337`; close that process before starting this build.
+* **Fix:** Start `remote-control-mcp` first (`remote-control-mcp.exe` on Windows) and confirm that its GUI shows the same local endpoint. If it reports a bind error, another copy or process already owns port `61337`; close that process before starting this build.
 
 ### Runtime API key file is missing
-* **Symptom:** The GUI reports that `%APPDATA%\tunnel-client\remote-control-mcp.key` is missing or `tunnel-client` reports an invalid `file:` API-key reference.
-* **Fix:** Repeat the key-file creation and ACL commands in section 6, then run `doctor` with `--control-plane.api-key $KeyReference`.
+* **Symptom:** The GUI reports that the runtime key file is missing (`%APPDATA%\tunnel-client\remote-control-mcp.key` on Windows, `~/Library/Application Support/tunnel-client/remote-control-mcp.key` on macOS, `~/.config/tunnel-client/remote-control-mcp.key` on Linux) or `tunnel-client` reports an invalid `file:` API-key reference.
+* **Fix:** Repeat the key-file creation and permission commands in section 6 (Windows ACL in PowerShell, `chmod 600` in bash/zsh), then run `doctor` with `--control-plane.api-key $KeyReference`.
 
 ### Tunnel-client executable path is missing
-* **Symptom:** The GUI cannot launch `tunnel-client.exe` or reports that `tunnel-client-path.txt` is invalid.
-* **Fix:** Repeat the launcher-path commands in section 6. The file must contain one existing absolute path to `tunnel-client.exe`.
+* **Symptom:** The GUI cannot launch `tunnel-client` (`tunnel-client.exe` on Windows) or reports that `tunnel-client-path.txt` is invalid.
+* **Fix:** Repeat the launcher-path commands in section 6. The file must contain one existing absolute path to the tunnel-client executable.
 
 ### Profile already exists
 * **Symptom:** `profile "remote-control-mcp" already exists`

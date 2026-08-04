@@ -53,11 +53,11 @@ impl Drop for TunnelLaunch {
 }
 
 pub fn start_tunnel(mcp_endpoint: &str) -> Result<TunnelLaunch, String> {
-    let app_data = app_data_directory()?;
-    let key_path = app_data.join("tunnel-client").join(KEY_FILE_NAME);
+    let config_dir = config_directory()?;
+    let key_path = config_dir.join("tunnel-client").join(KEY_FILE_NAME);
     validate_key_file(&key_path)?;
 
-    let tunnel_client = resolve_tunnel_client(&app_data)?;
+    let tunnel_client = resolve_tunnel_client(&config_dir)?;
     let runtime_directory = std::env::temp_dir().join("RemoteControlMCP");
     fs::create_dir_all(&runtime_directory).map_err(|error| {
         format!(
@@ -98,12 +98,10 @@ pub fn start_tunnel(mcp_endpoint: &str) -> Result<TunnelLaunch, String> {
     })
 }
 
-fn app_data_directory() -> Result<PathBuf, String> {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            "APPDATA is unavailable, so the tunnel configuration cannot be located.".to_string()
-        })
+fn config_directory() -> Result<PathBuf, String> {
+    dirs::config_dir().ok_or_else(|| {
+        "The user configuration directory could not be determined, so the tunnel configuration cannot be located.".to_string()
+    })
 }
 
 fn validate_key_file(key_path: &Path) -> Result<(), String> {
@@ -122,8 +120,8 @@ fn validate_key_file(key_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn resolve_tunnel_client(app_data: &Path) -> Result<PathBuf, String> {
-    let configured_path_file = app_data
+fn resolve_tunnel_client(config_dir: &Path) -> Result<PathBuf, String> {
+    let configured_path_file = config_dir
         .join("RemoteControlMCP")
         .join(TUNNEL_CLIENT_PATH_FILE);
     if configured_path_file.exists() {
@@ -147,13 +145,21 @@ fn resolve_tunnel_client(app_data: &Path) -> Result<PathBuf, String> {
     if let Ok(current_exe) = std::env::current_exe()
         && let Some(directory) = current_exe.parent()
     {
-        let adjacent = directory.join("tunnel-client.exe");
+        let adjacent = directory.join(tunnel_client_executable_name());
         if adjacent.is_file() {
             return Ok(adjacent);
         }
     }
 
-    Ok(PathBuf::from("tunnel-client.exe"))
+    Ok(PathBuf::from(tunnel_client_executable_name()))
+}
+
+fn tunnel_client_executable_name() -> &'static str {
+    if cfg!(windows) {
+        "tunnel-client.exe"
+    } else {
+        "tunnel-client"
+    }
 }
 
 fn launch_id() -> String {
@@ -436,6 +442,24 @@ mod tests {
         assert_eq!(
             argument,
             OsStr::new(r"--health.url-file=C:\Temp\Remote Control\health.url")
+        );
+    }
+
+    #[test]
+    fn tunnel_client_executable_name_matches_platform_convention() {
+        #[cfg(windows)]
+        assert_eq!(tunnel_client_executable_name(), "tunnel-client.exe");
+        #[cfg(not(windows))]
+        assert_eq!(tunnel_client_executable_name(), "tunnel-client");
+    }
+
+    #[test]
+    fn tunnel_client_resolution_falls_back_to_platform_executable_name() {
+        let config_dir =
+            std::env::temp_dir().join(format!("rmcp-tunnel-resolve-test-{}", std::process::id()));
+        assert_eq!(
+            resolve_tunnel_client(&config_dir).unwrap(),
+            PathBuf::from(tunnel_client_executable_name())
         );
     }
 }
