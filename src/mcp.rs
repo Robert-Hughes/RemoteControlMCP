@@ -290,14 +290,6 @@ pub struct LaunchProcessRequest {
     pub working_directory: Option<String>,
     pub process_name: String,
 
-    #[cfg(target_os = "windows")]
-    // Omitting `None` prevents Schemars advertising `default: null`, which MCP
-    // Inspector would render as the literal text `null` in its string control.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "String")]
-    pub arguments: Option<String>,
-
-    #[cfg(not(target_os = "windows"))]
     // Omitting `None` prevents Schemars advertising `default: null`, which MCP
     // Inspector would otherwise use to initialise the optional field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -309,7 +301,6 @@ pub struct LaunchProcessRequest {
     pub timeout_ms: Option<u64>,
     pub timeout_action: Option<TimeoutAction>,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RequestId(pub(crate) u64);
 

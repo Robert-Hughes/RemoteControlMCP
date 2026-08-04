@@ -121,26 +121,12 @@ pub(crate) fn validate_request(req: &LaunchProcessRequest) -> Result<(), String>
     {
         return Err("working_directory cannot contain null characters".to_string());
     }
-
-    #[cfg(target_os = "windows")]
+    if req
+        .arguments
+        .as_ref()
+        .is_some_and(|arguments| arguments.iter().any(|argument| argument.contains('\0')))
     {
-        if req
-            .arguments
-            .as_ref()
-            .is_some_and(|arguments| arguments.contains('\0'))
-        {
-            return Err("arguments cannot contain null characters".to_string());
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        if req
-            .arguments
-            .as_ref()
-            .is_some_and(|arguments| arguments.iter().any(|argument| argument.contains('\0')))
-        {
-            return Err("arguments cannot contain null characters".to_string());
-        }
+        return Err("arguments cannot contain null characters".to_string());
     }
 
     for (k, v) in &req.environment.variables {
@@ -184,17 +170,6 @@ pub(crate) fn validate_request(req: &LaunchProcessRequest) -> Result<(), String>
 fn command_line_for_display(req: &LaunchProcessRequest) -> String {
     let mut command_line = req.process_name.clone();
 
-    #[cfg(target_os = "windows")]
-    if let Some(arguments) = req
-        .arguments
-        .as_deref()
-        .filter(|arguments| !arguments.is_empty())
-    {
-        command_line.push(' ');
-        command_line.push_str(arguments);
-    }
-
-    #[cfg(not(target_os = "windows"))]
     if let Some(arguments) = req
         .arguments
         .as_deref()
@@ -208,7 +183,6 @@ fn command_line_for_display(req: &LaunchProcessRequest) -> String {
 
     command_line
 }
-
 #[cfg(test)]
 pub use crate::mcp::test_hooks;
 
@@ -772,27 +746,13 @@ fn execute_launch_process_blocking(
         }
     }
 
-    #[cfg(target_os = "windows")]
+    if let Some(arguments) = req
+        .arguments
+        .as_ref()
+        .filter(|arguments| !arguments.is_empty())
     {
-        if let Some(arguments) = req
-            .arguments
-            .as_ref()
-            .filter(|arguments| !arguments.is_empty())
-        {
-            cmd.raw_arg(arguments);
-        }
+        cmd.args(arguments);
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        if let Some(arguments) = req
-            .arguments
-            .as_ref()
-            .filter(|arguments| !arguments.is_empty())
-        {
-            cmd.args(arguments);
-        }
-    }
-
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
