@@ -21,13 +21,13 @@ The application and the `tunnel-client` daemon both store configuration in the p
 |---|---|---|---|
 | Shell | PowerShell | bash / zsh | bash / zsh |
 | Tunnel client binary | `tunnel-client.exe` | `tunnel-client` | `tunnel-client` |
-| User config directory | `%APPDATA%` | `~/Library/Application Support` | `${XDG_CONFIG_HOME:-$HOME/.config}` |
-| Launcher path file | `%APPDATA%\RemoteControlMCP\tunnel-client-path.txt` | `~/Library/Application Support/RemoteControlMCP/tunnel-client-path.txt` | `~/.config/RemoteControlMCP/tunnel-client-path.txt` |
-| Runtime key file | `%APPDATA%\tunnel-client\remote-control-mcp.key` | `~/Library/Application Support/tunnel-client/remote-control-mcp.key` | `~/.config/tunnel-client/remote-control-mcp.key` |
-| Tunnel profile | `%APPDATA%\tunnel-client\remote-control-mcp.yaml` | `~/Library/Application Support/tunnel-client/remote-control-mcp.yaml` | `~/.config/tunnel-client/remote-control-mcp.yaml` |
+| User config directory | `%APPDATA%` | `~/.config` | `${XDG_CONFIG_HOME:-$HOME/.config}` |
+| Launcher path file | `%APPDATA%\RemoteControlMCP\tunnel-client-path.txt` | `~/.config/RemoteControlMCP/tunnel-client-path.txt` | `~/.config/RemoteControlMCP/tunnel-client-path.txt` |
+| Runtime key file | `%APPDATA%\tunnel-client\remote-control-mcp.key` | `~/.config/tunnel-client/remote-control-mcp.key` | `~/.config/tunnel-client/remote-control-mcp.key` |
+| Tunnel profile | `%APPDATA%\tunnel-client\remote-control-mcp.yaml` | `~/.config/tunnel-client/remote-control-mcp.yaml` | `~/.config/tunnel-client/remote-control-mcp.yaml` |
 | Tunnel logs | `%TEMP%\RemoteControlMCP` | `$TMPDIR/RemoteControlMCP` (usually `/tmp`) | `/tmp/RemoteControlMCP` |
 
-These are the same user-config locations the `tunnel-client` daemon uses for its own profiles, so the runtime key file is shared between the manual CLI flow and the GUI launch button.
+These are the same user-config locations the `tunnel-client` daemon uses for its own profiles, so the runtime key file is shared between the manual CLI flow and the GUI launch button. The tunnel client resolves its profile directory as `$XDG_CONFIG_HOME/tunnel-client` when that variable is set, otherwise `~/.config/tunnel-client`, and only falls back to the operating system's user-config directory (such as `%APPDATA%` on Windows) when `HOME` is unset. On macOS `HOME` is always set, so `~/.config` applies there too.
 
 ### Architecture
 
@@ -71,7 +71,31 @@ Before starting, ensure you have:
   * **Tunnels Read + Use:** Needed to run the `tunnel-client` daemon locally and select the tunnel when creating the ChatGPT application.
   * *Note: Platform tunnel permissions are managed via Organisation RBAC roles. They are separate from ChatGPT Developer mode settings.*
 * **Workspace Association:** The tunnel must be associated with both the owning Platform organisation and the target ChatGPT workspace.
-* **Tunnel Client CLI:** The `tunnel-client` binary downloaded from the Platform settings page or official release (the file is named `tunnel-client.exe` on Windows).
+* **Tunnel Client CLI:** The `tunnel-client` binary (named `tunnel-client.exe` on Windows) downloaded from the [Platform Tunnels console](https://platform.openai.com/settings/organization/tunnels) or an official release. See [Downloading the tunnel client](#downloading-the-tunnel-client) below.
+
+### Downloading the tunnel client
+
+The tunnel client CLI is distributed by OpenAI from two places:
+
+* The [Platform Tunnels console](https://platform.openai.com/settings/organization/tunnels): use the download link there, which always points at the currently supported release.
+* The [latest public release on GitHub](https://github.com/openai/tunnel-client/releases/latest): releases are tagged with plain semantic versions (such as `v0.0.10`) and ship archives for Linux (amd64/arm64), macOS (amd64/arm64), and Windows (amd64/arm64). On macOS the client is also published to the `openai/homebrew-tools` Homebrew tap.
+
+The [official Secure MCP Tunnels guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) is the canonical reference for the whole flow.
+
+Download the client on the same machine that runs the local MCP application, then extract it and confirm it runs:
+
+**Windows:** the executable is `tunnel-client.exe`.
+
+**macOS / Linux:** the executable is `tunnel-client`. Make it executable first:
+
+```bash
+chmod +x /path/to/tunnel-client
+```
+
+In every case, confirm the binary works: `tunnel-client --version` prints the release version, and `tunnel-client help quickstart` is the official first-run command. Keep the absolute path to the binary handy, because section 6 records it for the GUI launch button.
+
+> [!NOTE]
+> If macOS shows a security prompt for a freshly downloaded binary, right-click it in Finder, select **Open**, and confirm once; subsequent launches run normally.
 
 ---
 
@@ -149,8 +173,7 @@ To set up the tunnel in the OpenAI control plane:
 
 1. Navigate to the [Platform API Keys Settings](https://platform.openai.com/settings/organization/api-keys).
 2. Create a new API key.
-3. Restrict its scope to the minimum permissions required to run and use tunnels:
-   * **Tunnels Read + Use**
+3. Restrict its scope to the minimum permissions required to run and use tunnels: choose **Restricted** and select **Tunnels Read + Use**.
 4. Copy the API key and store it securely (e.g. in a credential manager). Do not use an Admin API key for general tunnel runtime execution.
 
 > [!CAUTION]
@@ -235,11 +258,7 @@ McpEndpoint="http://127.0.0.1:61337/mcp"
 Record the tunnel-client executable path for the GUI launch button:
 
 ```bash
-# macOS
-LauncherConfigDirectory="$HOME/Library/Application Support/RemoteControlMCP"
-# Linux
 LauncherConfigDirectory="${XDG_CONFIG_HOME:-$HOME/.config}/RemoteControlMCP"
-
 TunnelClientPathFile="$LauncherConfigDirectory/tunnel-client-path.txt"
 mkdir -p "$LauncherConfigDirectory"
 printf '%s' "$TunnelClient" > "$TunnelClientPathFile"
@@ -248,11 +267,7 @@ printf '%s' "$TunnelClient" > "$TunnelClientPathFile"
 Next, prompt for the runtime API key, write it without a trailing newline, and restrict the file to the current user account:
 
 ```bash
-# macOS
-KeyDirectory="$HOME/Library/Application Support/tunnel-client"
-# Linux
 KeyDirectory="${XDG_CONFIG_HOME:-$HOME/.config}/tunnel-client"
-
 KeyFile="$KeyDirectory/remote-control-mcp.key"
 mkdir -p "$KeyDirectory"
 
@@ -266,6 +281,9 @@ unset RuntimeKey
 
 KeyReference="file:$KeyFile"
 ```
+
+> [!NOTE]
+> On macOS `XDG_CONFIG_HOME` is normally unset, so these commands resolve to `~/.config`. The tunnel client resolves its config directory the same way on every platform where `HOME` is set (see the platform conventions table in section 1).
 
 > [!NOTE]
 > The key remains plaintext at rest so that `tunnel-client` can read it non-interactively, but the file's permissions are restricted to your account: a Windows ACL in the PowerShell flow above, and Unix mode 0600 in the macOS/Linux flow. The application checks that this exact non-empty file exists but never reads its contents. `tunnel-client` resolves the `file:` reference itself. The `read` builtin does not echo input and is not recorded in shell history.
@@ -301,7 +319,7 @@ Initialize a local profile named `remote-control-mcp` that points to the already
 The generated configuration profile will be saved to the tunnel client's platform user-config directory:
 
 * Windows: `%APPDATA%\tunnel-client\remote-control-mcp.yaml`
-* macOS: `~/Library/Application Support/tunnel-client/remote-control-mcp.yaml`
+* macOS: `~/.config/tunnel-client/remote-control-mcp.yaml`
 * Linux: `~/.config/tunnel-client/remote-control-mcp.yaml`
 
 If this machine already has the former stdio profile, migrate it by rerunning the command with `--force`. This preserves the named profile and tunnel ID you supply while replacing the old `mcp.command` binding with `mcp.server_urls`:
@@ -499,7 +517,7 @@ When you are finished testing:
 2. Close the Rust GUI application when finished. If it launched the tunnel client, closing the GUI also stops that tunnel-client process.
 3. The protected runtime key file remains available for the next launch. If you are decommissioning the setup, revoke the key in the OpenAI Platform Dashboard and then delete the runtime key file in your platform user-config directory:
    * Windows: `%APPDATA%\tunnel-client\remote-control-mcp.key`
-   * macOS: `~/Library/Application Support/tunnel-client/remote-control-mcp.key`
+   * macOS: `~/.config/tunnel-client/remote-control-mcp.key`
    * Linux: `~/.config/tunnel-client/remote-control-mcp.key`
 
 ---
@@ -511,12 +529,12 @@ When you are finished testing:
 * **Fix:** Start `remote-control-mcp` first (`remote-control-mcp.exe` on Windows) and confirm that its GUI shows the same local endpoint. If it reports a bind error, another copy or process already owns port `61337`; close that process before starting this build.
 
 ### Runtime API key file is missing
-* **Symptom:** The GUI reports that the runtime key file is missing (`%APPDATA%\tunnel-client\remote-control-mcp.key` on Windows, `~/Library/Application Support/tunnel-client/remote-control-mcp.key` on macOS, `~/.config/tunnel-client/remote-control-mcp.key` on Linux) or `tunnel-client` reports an invalid `file:` API-key reference.
+* **Symptom:** The GUI reports that the runtime key file is missing (`%APPDATA%\tunnel-client\remote-control-mcp.key` on Windows, `~/.config/tunnel-client/remote-control-mcp.key` on macOS and Linux) or `tunnel-client` reports an invalid `file:` API-key reference.
 * **Fix:** Repeat the key-file creation and permission commands in section 6 (Windows ACL in PowerShell, `chmod 600` in bash/zsh), then run `doctor` with `--control-plane.api-key $KeyReference`.
 
 ### Tunnel-client executable path is missing
 * **Symptom:** The GUI cannot launch `tunnel-client` (`tunnel-client.exe` on Windows) or reports that `tunnel-client-path.txt` is invalid.
-* **Fix:** Repeat the launcher-path commands in section 6. The file must contain one existing absolute path to the tunnel-client executable.
+* **Fix:** If the binary is not installed yet, download it as described in [section 2](#downloading-the-tunnel-client). Then repeat the launcher-path commands in section 6. The file must contain one existing absolute path to the tunnel-client executable.
 
 ### Profile already exists
 * **Symptom:** `profile "remote-control-mcp" already exists`

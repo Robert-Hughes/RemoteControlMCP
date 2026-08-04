@@ -99,6 +99,15 @@ pub fn start_tunnel(mcp_endpoint: &str) -> Result<TunnelLaunch, String> {
 }
 
 fn config_directory() -> Result<PathBuf, String> {
+    // Mirror the tunnel-client profile directory resolution so the key file
+    // lands next to the profiles it is used with: XDG_CONFIG_HOME, then
+    // ~/.config, then the OS user-config directory (e.g. %APPDATA%).
+    if let Some(xdg_config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Ok(PathBuf::from(xdg_config_home));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return Ok(PathBuf::from(home).join(".config"));
+    }
     dirs::config_dir().ok_or_else(|| {
         "The user configuration directory could not be determined, so the tunnel configuration cannot be located.".to_string()
     })
