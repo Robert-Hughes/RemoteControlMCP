@@ -215,14 +215,24 @@ Valid requests return ordinary non-error MCP tool results even for structured fi
 
 To build the application, run:
 
-```powershell
+```sh
 cargo build
 ```
 
+This command works identically in PowerShell, bash, and zsh.
+
 ## Starting from the executable
+
+**Windows (PowerShell):**
 
 ```powershell
 .\target\debug\remote-control-mcp.exe
+```
+
+**macOS / Linux (bash or zsh):**
+
+```bash
+./target/debug/remote-control-mcp
 ```
 
 The application immediately starts its loopback-only Streamable HTTP endpoint at `http://127.0.0.1:61337/mcp`. Its compact status panel groups the server state with that endpoint, keeps the supervised tunnel state beside its action button, and independently shows the number of open HTTP connections and active MCP sessions. **Start Secure MCP Tunnel** launches the tunnel, **Cancel tunnel launch** terminates it while it is starting, and **Stop Secure MCP Tunnel** disconnects it without closing the application.
@@ -233,7 +243,7 @@ The button requires the one-time launcher path, HTTP profile, and runtime-key fi
 
 To run the automated unit and integration test suite:
 
-```powershell
+```sh
 cargo test
 ```
 
@@ -255,8 +265,17 @@ The suite covers:
 
 You can test the application interactively using the Model Context Protocol Inspector:
 
+**Windows (PowerShell):**
+
 ```powershell
 .\target\debug\remote-control-mcp.exe
+npx -y @modelcontextprotocol/inspector
+```
+
+**macOS / Linux (bash or zsh):**
+
+```bash
+./target/debug/remote-control-mcp
 npx -y @modelcontextprotocol/inspector
 ```
 
@@ -269,15 +288,15 @@ When you run this command:
 
 ### CLI Mode
 
-You can also run the Inspector in non-interactive CLI mode:
+You can also run the Inspector in non-interactive CLI mode. The commands below use single quotes, which PowerShell and bash/zsh both accept:
 
 **List available tools:**
-```powershell
+```sh
 npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transport http --method tools/list
 ```
 
 **Call the `ping` tool:**
-```powershell
+```sh
 npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transport http --method tools/call --tool-name ping
 ```
 
@@ -286,17 +305,25 @@ npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transp
 npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transport http --method tools/call --tool-name launch_process --tool-arg process_name=whoami.exe --tool-arg 'environment={"inherit":true,"variables":{}}' --tool-arg detached=false
 ```
 
-This no-argument example is suitable for a typical Windows installation; executable availability differs between systems.
+On macOS and Linux, replace `whoami.exe` with `whoami`:
+
+```bash
+npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transport http --method tools/call --tool-name launch_process --tool-arg process_name=whoami --tool-arg 'environment={"inherit":true,"variables":{}}' --tool-arg detached=false
+```
+
+This no-argument example works on any supported system; executable availability differs between systems.
 
 **Call the `read_file` tool:**
-```powershell
-npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transport http --method tools/call --tool-name read_file --tool-arg path=RemoteControlMCP\example.stdout.log --tool-arg start_line=1 --tool-arg end_line=100
+```sh
+npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transport http --method tools/call --tool-name read_file --tool-arg path=RemoteControlMCP/example.stdout.log --tool-arg start_line=1 --tool-arg end_line=100
 ```
 
 **Call the `write_file` tool:**
-```powershell
-npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transport http --method tools/call --tool-name write_file --tool-arg path=RemoteControlMCP\example.txt --tool-arg start_line=1 --tool-arg end_line=1 --tool-arg text=updated --tool-arg create_if_missing=true
+```sh
+npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transport http --method tools/call --tool-name write_file --tool-arg path=RemoteControlMCP/example.txt --tool-arg start_line=1 --tool-arg end_line=1 --tool-arg text=updated --tool-arg create_if_missing=true
 ```
+
+Relative paths resolve beneath the system temporary directory (`%TEMP%` on Windows, `$TMPDIR` on macOS and Linux); Windows also accepts backslash separators.
 
 ## Connect to ChatGPT
 
