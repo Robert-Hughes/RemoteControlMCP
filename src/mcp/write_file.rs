@@ -1,6 +1,7 @@
 use crate::mcp::file_path::validate_line_file_path;
 use crate::mcp::{
     McpServer, RequestData, RequestUpdate, WriteFileRequest, WriteFileResult, WriteFileStatus,
+    argument_error_result, missing_argument_message,
 };
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -627,9 +628,24 @@ pub(crate) fn write_file_summary(result: &WriteFileResult) -> String {
 impl McpServer {
     pub async fn write_file_impl(
         &self,
-        params: rmcp::handler::server::wrapper::Parameters<WriteFileRequest>,
+        params: rmcp::handler::server::wrapper::Parameters<rmcp::model::JsonObject>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-        let req = params.0;
+        let req: WriteFileRequest =
+            match rmcp::serde_json::from_value(rmcp::serde_json::Value::Object(params.0)) {
+                Ok(req) => req,
+                Err(error) => {
+                    return Ok(argument_error_result(missing_argument_message(
+                        &error,
+                        &[
+                            "path",
+                            "start_line",
+                            "end_line",
+                            "text",
+                            "create_if_missing",
+                        ],
+                    )));
+                }
+            };
         let replacement_bytes = req.text.len() as u64;
         let id = self.start_request(RequestData::WriteFile {
             path: req.path.clone(),
@@ -647,7 +663,7 @@ impl McpServer {
                         error: error.clone(),
                     },
                 );
-                return Err(rmcp::ErrorData::invalid_params(error, None));
+                return Ok(argument_error_result(error));
             }
         };
 
@@ -671,7 +687,7 @@ impl McpServer {
             inserted_bytes: result.inserted_bytes,
         };
         let summary = write_file_summary(&result);
-        self.finish_structured_request(id, summary, &result, update)
+        self.finish_structured_request(id, summary, &result, false, update)
     }
 }
 

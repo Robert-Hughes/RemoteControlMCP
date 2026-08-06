@@ -1,6 +1,7 @@
 use crate::mcp::launch_process::{
-    ChildOps, CleanupOutcome, handle_background_wait_result_with_notifier, launch_process_summary,
-    perform_cleanup, read_and_truncate_file, report_background_error, validate_request,
+    ChildOps, CleanupOutcome, handle_background_wait_result_with_notifier,
+    launch_process_failure_summary, launch_process_summary, perform_cleanup,
+    read_and_truncate_file, report_background_error, validate_request,
 };
 use crate::mcp::ping::PingResult;
 use crate::mcp::read_file::{
@@ -392,11 +393,7 @@ fn call_read_file_direct(req: ReadFileRequest) -> (rmcp::model::CallToolResult, 
         .build()
         .unwrap();
     let result = rt
-        .block_on(async {
-            server
-                .read_file(rmcp::handler::server::wrapper::Parameters(req))
-                .await
-        })
+        .block_on(async { server.read_file(parameters_of(&req)).await })
         .unwrap();
     let events = rx.try_iter().map(|event| event.kind).collect();
     (result, events)
@@ -437,11 +434,7 @@ fn call_write_file_direct(
         .build()
         .unwrap();
     let result = rt
-        .block_on(async {
-            server
-                .write_file(rmcp::handler::server::wrapper::Parameters(req))
-                .await
-        })
+        .block_on(async { server.write_file(parameters_of(&req)).await })
         .unwrap();
     let events = rx.try_iter().map(|event| event.kind).collect();
     (result, events)
@@ -463,6 +456,18 @@ fn only_text_content(result: &rmcp::model::CallToolResult) -> &str {
         panic!("expected exactly one text content block");
     };
     &text.text
+}
+
+fn parameters_of<T: rmcp::serde::Serialize>(
+    request: &T,
+) -> rmcp::handler::server::wrapper::Parameters<rmcp::model::JsonObject> {
+    rmcp::handler::server::wrapper::Parameters(
+        rmcp::serde_json::to_value(request)
+            .expect("test request must serialise")
+            .as_object()
+            .expect("test request must be a JSON object")
+            .clone(),
+    )
 }
 
 fn make_helper_request() -> LaunchProcessRequest {
@@ -604,6 +609,7 @@ fn response_serialisation_failure_emits_internal_failure_not_completion() {
         id,
         "unused".to_string(),
         &FailingSerialize,
+        false,
         RequestUpdate::PingCompleted,
     );
     assert!(result.is_err());
@@ -1009,12 +1015,9 @@ fn read_file_validates_ranges_and_ambiguous_windows_paths() {
         .build()
         .unwrap();
     let invalid = make_read_file_request(&valid_path, 1, 501);
-    let error = rt.block_on(async {
-        server
-            .read_file(rmcp::handler::server::wrapper::Parameters(invalid))
-            .await
-    });
-    assert!(error.is_err());
+    let error = rt.block_on(async { server.read_file(parameters_of(&invalid)).await });
+    let error = error.expect("invalid read_file must return a tool error result");
+    assert_eq!(error.is_error, Some(true));
     let started = rx.try_recv().unwrap().kind;
     let updated = rx.try_recv().unwrap().kind;
     let UiEventKind::RequestStarted {
@@ -1274,12 +1277,9 @@ fn write_file_validation_rejection_has_one_privacy_safe_lifecycle() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    let error = rt.block_on(async {
-        server
-            .write_file(rmcp::handler::server::wrapper::Parameters(req))
-            .await
-    });
-    assert!(error.is_err());
+    let error = rt.block_on(async { server.write_file(parameters_of(&req)).await });
+    let error = error.expect("invalid write_file must return a tool error result");
+    assert_eq!(error.is_error, Some(true));
 
     let events = rx.try_iter().map(|event| event.kind).collect::<Vec<_>>();
     assert_eq!(events.len(), 2);
@@ -2730,7 +2730,7 @@ fn test_gui_events_launch_process() {
         .unwrap();
 
     let req = make_helper_request();
-    let params = rmcp::handler::server::wrapper::Parameters(req);
+    let params = parameters_of(&req);
     let res = rt.block_on(async { server.launch_process(params).await.unwrap() });
     let structured: LaunchProcessResult =
         rmcp::serde_json::from_value(res.structured_content.clone().expect("structured result"))
@@ -2775,7 +2775,7 @@ fn test_gui_events_launch_process() {
     let (tx2, rx2) = std::sync::mpsc::channel();
     let server2 = McpServer::new(tx2, Instant::now());
 
-    let params = rmcp::handler::server::wrapper::Parameters(LaunchProcessRequest {
+    let params = parameters_of(&LaunchProcessRequest {
         working_directory: None,
         process_name: "".to_string(),
         arguments: Some(vec![]),
@@ -2790,7 +2790,8 @@ fn test_gui_events_launch_process() {
 
     let call_res = rt.block_on(async { server2.launch_process(params).await });
 
-    assert!(call_res.is_err());
+    let call_res = call_res.expect("invalid launch_process must return a tool error result");
+    assert_eq!(call_res.is_error, Some(true));
     let events2: Vec<UiEventKind> = rx2.try_iter().map(|e| e.kind).collect();
     assert_eq!(events2.len(), 2);
     let UiEventKind::RequestStarted {
@@ -2834,10 +2835,10 @@ fn launch_process_events_include_command_line_but_exclude_environment_and_output
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    assert!(
-        rt.block_on(server.launch_process(rmcp::handler::server::wrapper::Parameters(request)))
-            .is_err()
-    );
+    let call_result = rt
+        .block_on(server.launch_process(parameters_of(&request)))
+        .expect("invalid launch_process must return a tool error result");
+    assert_eq!(call_result.is_error, Some(true));
     let events = rx.try_iter().map(|event| event.kind).collect::<Vec<_>>();
     assert_eq!(events.len(), 2);
     let debug = format!("{events:?}");
@@ -3146,13 +3147,12 @@ fn launch_process_integration_test_over_duplex() {
             .clone(),
         );
 
-        let call_err = client.call_tool(invalid_call_params).await.unwrap_err();
-        match call_err {
-            rmcp::ServiceError::McpError(err_data) => {
-                assert_eq!(err_data.code.0, -32602);
-            }
-            other => panic!("Expected McpError, got: {:?}", other),
-        }
+        let invalid_call = client
+            .call_tool(invalid_call_params)
+            .await
+            .expect("invalid launch_process should produce a tool error result");
+        assert_eq!(invalid_call.is_error, Some(true));
+        assert!(only_text_content(&invalid_call).contains("timeout_ms requires timeout_action"));
 
         let ping_params = rmcp::model::CallToolRequestParams::new("ping");
         let ping_result = client
@@ -3330,11 +3330,13 @@ fn launch_process_mcp_summaries_cover_nonzero_detach_timeouts_and_failure() {
             rmcp::serde_json::from_value(timeout_detach_call.structured_content.clone().unwrap())
                 .unwrap();
         assert_eq!(timeout_detach.status, LaunchProcessStatus::TimedOutDetached);
-        assert_eq!(timeout_detach_call.is_error, Some(false));
+        assert_eq!(timeout_detach_call.is_error, Some(true));
         assert_eq!(
             only_text_content(&timeout_detach_call),
-            launch_process_summary(&timeout_detach)
+            launch_process_failure_summary(&timeout_detach, Some(50))
         );
+        assert!(only_text_content(&timeout_detach_call).contains("50 ms"));
+        assert!(only_text_content(&timeout_detach_call).contains("may still be running"));
 
         let mut timeout_stop_params = rmcp::model::CallToolRequestParams::new("launch_process");
         timeout_stop_params.arguments = Some(
@@ -3363,11 +3365,12 @@ fn launch_process_mcp_summaries_cover_nonzero_detach_timeouts_and_failure() {
             rmcp::serde_json::from_value(timeout_stop_call.structured_content.clone().unwrap())
                 .unwrap();
         assert_eq!(timeout_stop.status, LaunchProcessStatus::TimedOutStopped);
-        assert_eq!(timeout_stop_call.is_error, Some(false));
+        assert_eq!(timeout_stop_call.is_error, Some(true));
         assert_eq!(
             only_text_content(&timeout_stop_call),
-            launch_process_summary(&timeout_stop)
+            launch_process_failure_summary(&timeout_stop, Some(50))
         );
+        assert!(only_text_content(&timeout_stop_call).contains("terminated at the timeout"));
 
         let mut failure_params = rmcp::model::CallToolRequestParams::new("launch_process");
         failure_params.arguments = Some(
@@ -3387,9 +3390,12 @@ fn launch_process_mcp_summaries_cover_nonzero_detach_timeouts_and_failure() {
         let failure: LaunchProcessResult =
             rmcp::serde_json::from_value(failure_call.structured_content.clone().unwrap()).unwrap();
         assert_eq!(failure.status, LaunchProcessStatus::LaunchProcessFailed);
-        assert_eq!(failure_call.is_error, Some(false));
-        assert_eq!(only_text_content(&failure_call), "Process launch failed.");
-        assert!(!only_text_content(&failure_call).contains(failure.error.as_deref().unwrap()));
+        assert_eq!(failure_call.is_error, Some(true));
+        assert_eq!(
+            only_text_content(&failure_call),
+            launch_process_failure_summary(&failure, None)
+        );
+        assert!(only_text_content(&failure_call).contains(failure.error.as_deref().unwrap()));
 
         // Keep the process-test mutex until both deliberately detached helper
         // children have exited and their reapers have sent any test notifications.
@@ -3562,12 +3568,12 @@ fn write_file_integration_test_over_duplex() {
             .unwrap()
             .clone(),
         );
-        let invalid_error = client.call_tool(invalid_params).await.unwrap_err();
-        let rmcp::ServiceError::McpError(error) = invalid_error else {
-            panic!("expected MCP invalid-parameter error");
-        };
-        assert_eq!(error.code.0, -32602);
-        assert!(error.message.contains("500"));
+        let invalid_call = client
+            .call_tool(invalid_params)
+            .await
+            .expect("invalid write_file should produce a tool error result");
+        assert_eq!(invalid_call.is_error, Some(true));
+        assert!(only_text_content(&invalid_call).contains("500"));
 
         let events = rx.try_iter().map(|event| event.kind).collect::<Vec<_>>();
         for status in [
@@ -3844,12 +3850,12 @@ fn read_file_integration_test_over_duplex() {
 
         let mut invalid_params = rmcp::model::CallToolRequestParams::new("read_file");
         invalid_params.arguments = Some(excessive_arguments.as_object().unwrap().clone());
-        let invalid_error = client.call_tool(invalid_params).await.unwrap_err();
-        let rmcp::ServiceError::McpError(error) = invalid_error else {
-            panic!("expected MCP invalid-parameter error");
-        };
-        assert_eq!(error.code.0, -32602);
-        assert!(error.message.contains("500"));
+        let invalid_call = client
+            .call_tool(invalid_params)
+            .await
+            .expect("invalid read_file should produce a tool error result");
+        assert_eq!(invalid_call.is_error, Some(true));
+        assert!(only_text_content(&invalid_call).contains("500"));
 
         let ping = client
             .call_tool(rmcp::model::CallToolRequestParams::new("ping"))

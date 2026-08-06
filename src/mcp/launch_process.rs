@@ -1,6 +1,7 @@
 use crate::mcp::{
     LaunchProcessRequest, LaunchProcessResult, LaunchProcessStatus, McpServer, RequestData,
-    RequestId, RequestUpdate, TimeoutAction, UiEvent, UiEventKind,
+    RequestId, RequestUpdate, TimeoutAction, UiEvent, UiEventKind, argument_error_result,
+    missing_argument_message,
 };
 use std::sync::mpsc::Sender;
 use std::time::Instant;
@@ -585,14 +586,24 @@ fn cleanup_child(
 impl McpServer {
     pub async fn launch_process_impl(
         &self,
-        params: rmcp::handler::server::wrapper::Parameters<LaunchProcessRequest>,
+        params: rmcp::handler::server::wrapper::Parameters<rmcp::model::JsonObject>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-        let req = params.0;
+        let req: LaunchProcessRequest =
+            match rmcp::serde_json::from_value(rmcp::serde_json::Value::Object(params.0)) {
+                Ok(req) => req,
+                Err(error) => {
+                    return Ok(argument_error_result(missing_argument_message(
+                        &error,
+                        &["process_name", "environment", "detached"],
+                    )));
+                }
+            };
+        let timeout_ms = req.timeout_ms;
         let id = self.start_request(RequestData::LaunchProcess {
             command_line: command_line_for_display(&req),
             working_directory: req.working_directory.clone(),
             detached: req.detached,
-            timeout_ms: req.timeout_ms,
+            timeout_ms,
             timeout_action: req.timeout_action,
         });
 
@@ -603,7 +614,7 @@ impl McpServer {
                     error: err_msg.clone(),
                 },
             );
-            return Err(rmcp::ErrorData::invalid_params(err_msg, None));
+            return Ok(argument_error_result(err_msg));
         }
 
         let result = self.execute_launch_process_for_request(req, id).await;
@@ -618,8 +629,13 @@ impl McpServer {
             stderr_file: result.stderr_file.clone(),
         };
 
-        let summary = launch_process_summary(&result);
-        self.finish_structured_request(id, summary, &result, update)
+        let is_error = launch_status_is_error(result.status);
+        let summary = if is_error {
+            launch_process_failure_summary(&result, timeout_ms)
+        } else {
+            launch_process_summary(&result)
+        };
+        self.finish_structured_request(id, summary, &result, is_error, update)
     }
 
     #[cfg(test)]
@@ -697,6 +713,64 @@ pub(crate) fn launch_process_summary(result: &LaunchProcessResult) -> String {
             },
         ),
     }
+}
+
+/// Statuses where the launch call itself failed to complete as requested; these are
+/// surfaced to the model as `isError` tool results instead of successes.
+fn launch_status_is_error(status: LaunchProcessStatus) -> bool {
+    matches!(
+        status,
+        LaunchProcessStatus::TimedOutDetached
+            | LaunchProcessStatus::TimedOutStopped
+            | LaunchProcessStatus::SetupFailed
+            | LaunchProcessStatus::LaunchProcessFailed
+            | LaunchProcessStatus::WaitFailed
+            | LaunchProcessStatus::StopFailed
+    )
+}
+
+/// Text summary for failed launches: the concise status line plus the timeout that was
+/// configured, the underlying error, and the output-file locations so the model can
+/// inspect partial output and decide how to retry.
+pub(crate) fn launch_process_failure_summary(
+    result: &LaunchProcessResult,
+    timeout_ms: Option<u64>,
+) -> String {
+    let mut text = launch_process_summary(result);
+    if let Some(ms) = timeout_ms {
+        text.push_str(&format!(" The process was allowed {ms} ms to exit."));
+    }
+    match result.status {
+        LaunchProcessStatus::TimedOutDetached => {
+            text.push_str(
+                " The process may still be running; retry with a larger timeout_ms if it must \
+                 complete before this call returns.",
+            );
+        }
+        LaunchProcessStatus::TimedOutStopped => {
+            text.push_str(
+                " The process was terminated at the timeout; descendant processes may still be \
+                 running.",
+            );
+        }
+        LaunchProcessStatus::StopFailed => {
+            text.push_str(" The process may still be running.");
+        }
+        _ => {}
+    }
+    if let Some(error) = &result.error {
+        text.push(' ');
+        text.push_str(error);
+        if !text.ends_with('.') {
+            text.push('.');
+        }
+    }
+    if let (Some(stdout_file), Some(stderr_file)) = (&result.stdout_file, &result.stderr_file) {
+        text.push_str(&format!(
+            " Output was written to {stdout_file} (stdout) and {stderr_file} (stderr)."
+        ));
+    }
+    text
 }
 
 fn execute_launch_process_blocking(

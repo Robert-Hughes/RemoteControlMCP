@@ -1,6 +1,7 @@
 use crate::mcp::file_path::validate_line_file_path;
 use crate::mcp::{
     McpServer, ReadFileRequest, ReadFileResult, ReadFileStatus, RequestData, RequestUpdate,
+    argument_error_result, missing_argument_message,
 };
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -336,9 +337,18 @@ pub(crate) fn read_file_summary(result: &ReadFileResult) -> String {
 impl McpServer {
     pub async fn read_file_impl(
         &self,
-        params: rmcp::handler::server::wrapper::Parameters<ReadFileRequest>,
+        params: rmcp::handler::server::wrapper::Parameters<rmcp::model::JsonObject>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-        let req = params.0;
+        let req: ReadFileRequest =
+            match rmcp::serde_json::from_value(rmcp::serde_json::Value::Object(params.0)) {
+                Ok(req) => req,
+                Err(error) => {
+                    return Ok(argument_error_result(missing_argument_message(
+                        &error,
+                        &["path", "start_line", "end_line"],
+                    )));
+                }
+            };
         let id = self.start_request(RequestData::ReadFile {
             path: req.path.clone(),
             start_line: req.start_line,
@@ -353,7 +363,7 @@ impl McpServer {
                         error: error.clone(),
                     },
                 );
-                return Err(rmcp::ErrorData::invalid_params(error, None));
+                return Ok(argument_error_result(error));
             }
         };
 
@@ -381,7 +391,7 @@ impl McpServer {
         };
 
         let summary = read_file_summary(&result);
-        self.finish_structured_request(id, summary, &result, update)
+        self.finish_structured_request(id, summary, &result, false, update)
     }
 }
 

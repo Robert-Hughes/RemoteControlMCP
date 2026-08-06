@@ -4,6 +4,7 @@ Use this server to launch local processes and to read or modify regular files on
 
 ## Choosing a tool
 
+- Call `get_instructions` once at the start of your session. The instructions are static; there is no need to call it again before each tool.
 - Use `ping` only to check that the MCP connection is responding.
 - Use `launch_process` to start an executable. The server does not add a shell implicitly; select a shell executable explicitly when the command needs shell syntax, built-ins, pipes, redirection, or variable expansion.
 - Use `read_file` to read a bounded range of lines from a regular file.
@@ -16,6 +17,7 @@ Use this server to launch local processes and to read or modify regular files on
 - Use detached execution for work that must continue after the tool call returns. The result provides `stdout_file` and `stderr_file` paths that can be inspected later with `read_file`.
 - For bounded foreground execution, provide both `timeout_ms` and `timeout_action`. Do not combine `detached = true` with `timeout_action = "detach"`.
 - Inspect the returned status, exit code, stdout, and stderr. A non-zero process exit code is reported as a completed tool invocation rather than as an MCP protocol error.
+- A timed-out foreground launch is returned with `isError = true` and a summary of what happened; retry with a larger `timeout_ms` when the process needs more time.
 - A stop timeout terminates only the immediate child process; descendant processes may continue running.
 - Environment variables inherit from the server by default. Set `inherit = false` only when a clean environment is required, then provide every needed variable explicitly.
 

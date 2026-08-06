@@ -25,7 +25,7 @@ const MACHINE_INSTRUCTIONS_HEADING: &str = "# Machine-specific instructions";
 // This intentionally stays short because the ChatGPT MCP connector has been observed silently
 // truncating longer MCP initialisation instruction strings, preventing later machine-specific
 // instructions from reaching the model.
-const BOOTSTRAP_INSTRUCTIONS: &str = "Call the get_instructions tool to get full instructions on how to use this MCP server. DO THIS BEFORE calling any other tools";
+const BOOTSTRAP_INSTRUCTIONS: &str = "Call the get_instructions tool once to get full instructions on how to use this MCP server; the instructions are stable, so there is no need to call it again.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalInstructionsDiagnostic {
@@ -533,6 +533,39 @@ pub mod test_hooks {
     }
 }
 
+/// Build the advertised input schema for a tool whose handler now receives raw
+/// JSON arguments, so the model still sees the full typed parameter schema.
+fn input_schema_for<T>(tool: &str) -> Arc<rmcp::model::JsonObject>
+where
+    T: schemars::JsonSchema + std::any::Any,
+{
+    rmcp::handler::server::common::schema_for_input::<T>()
+        .unwrap_or_else(|error| panic!("Invalid input schema for {tool}: {error}"))
+}
+
+/// Build an `isError: true` tool result carrying only a text explanation.
+/// Tool-level failures must be returned as tool results, not JSON-RPC errors,
+/// so clients relay the message to the model instead of reporting a protocol failure.
+fn argument_error_result(message: impl Into<String>) -> rmcp::model::CallToolResult {
+    rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(message.into())])
+}
+
+/// Turn a serde argument deserialisation error into an actionable message, naming
+/// the exact argument that was omitted so the model can correct the call.
+fn missing_argument_message(error: &rmcp::serde_json::Error, required: &[&str]) -> String {
+    let message = error.to_string();
+    let missing = message
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.split('`').next());
+    match missing {
+        Some(field) => format!(
+            "Missing required argument '{field}'. Required arguments: {}.",
+            required.join(", ")
+        ),
+        None => format!("Invalid arguments: {error}"),
+    }
+}
+
 #[tool_router]
 impl McpServer {
     #[cfg(test)]
@@ -588,9 +621,10 @@ impl McpServer {
         self.send_event(UiEventKind::RequestUpdated { id, update });
     }
 
-    fn structured_success<T: Serialize>(
+    fn structured_result<T: Serialize>(
         summary: String,
         value: &T,
+        is_error: bool,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let structured_content = rmcp::serde_json::to_value(value).map_err(|error| {
             rmcp::ErrorData::internal_error(
@@ -598,8 +632,11 @@ impl McpServer {
                 None,
             )
         })?;
-        let mut result =
-            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(summary)]);
+        let mut result = if is_error {
+            rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(summary)])
+        } else {
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(summary)])
+        };
         result.structured_content = Some(structured_content);
         Ok(result)
     }
@@ -609,9 +646,10 @@ impl McpServer {
         id: RequestId,
         summary: String,
         value: &T,
+        is_error: bool,
         update: RequestUpdate,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-        match Self::structured_success(summary, value) {
+        match Self::structured_result(summary, value, is_error) {
             Ok(result) => {
                 self.update_request(id, update);
                 Ok(result)
@@ -651,6 +689,7 @@ impl McpServer {
             id,
             instructions,
             &result,
+            false,
             RequestUpdate::GetInstructionsCompleted,
         )
     }
@@ -671,11 +710,12 @@ impl McpServer {
         let result = ping::PingResult {
             message: message.clone(),
         };
-        self.finish_structured_request(id, message, &result, RequestUpdate::PingCompleted)
+        self.finish_structured_request(id, message, &result, false, RequestUpdate::PingCompleted)
     }
 
     #[tool(
         description = "Launch a local process on the host machine with optional working directory, arguments, environment configuration, timeout, and detachment options.",
+        input_schema = input_schema_for::<LaunchProcessRequest>("launch_process"),
         output_schema = rmcp::handler::server::tool::schema_for_output::<LaunchProcessResult>(),
         annotations(
             read_only_hint = false,
@@ -686,13 +726,14 @@ impl McpServer {
     )]
     async fn launch_process(
         &self,
-        params: rmcp::handler::server::wrapper::Parameters<LaunchProcessRequest>,
+        params: rmcp::handler::server::wrapper::Parameters<rmcp::model::JsonObject>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         self.launch_process_impl(params).await
     }
 
     #[tool(
         description = "Read a 1-based inclusive line range from a local regular file.",
+        input_schema = input_schema_for::<ReadFileRequest>("read_file"),
         output_schema = rmcp::handler::server::tool::schema_for_output::<ReadFileResult>(),
         annotations(
             read_only_hint = true,
@@ -703,13 +744,14 @@ impl McpServer {
     )]
     async fn read_file(
         &self,
-        params: rmcp::handler::server::wrapper::Parameters<ReadFileRequest>,
+        params: rmcp::handler::server::wrapper::Parameters<rmcp::model::JsonObject>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         self.read_file_impl(params).await
     }
 
     #[tool(
         description = "Replace a strict 1-based inclusive line range in a local regular file, or explicitly create a missing file.",
+        input_schema = input_schema_for::<WriteFileRequest>("write_file"),
         output_schema = rmcp::handler::server::tool::schema_for_output::<WriteFileResult>(),
         annotations(
             read_only_hint = false,
@@ -720,7 +762,7 @@ impl McpServer {
     )]
     async fn write_file(
         &self,
-        params: rmcp::handler::server::wrapper::Parameters<WriteFileRequest>,
+        params: rmcp::handler::server::wrapper::Parameters<rmcp::model::JsonObject>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         self.write_file_impl(params).await
     }
