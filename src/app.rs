@@ -859,7 +859,14 @@ impl RemoteControlApp {
                         .on_hover_text(path.display().to_string());
                     if link.clicked()
                         && let Some(folder) = path.parent()
-                        && let Err(error) = std::process::Command::new("explorer.exe")
+                        && let Err(error) =
+                            std::process::Command::new(if cfg!(target_os = "windows") {
+                                "explorer.exe"
+                            } else if cfg!(target_os = "macos") {
+                                "open"
+                            } else {
+                                "xdg-open"
+                            })
                             .arg(folder)
                             .spawn()
                     {
