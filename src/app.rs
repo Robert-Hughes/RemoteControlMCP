@@ -648,6 +648,9 @@ pub struct RemoteControlApp {
     mcp_endpoint: Option<String>,
     tunnel_launch: Option<TunnelLaunch>,
     tunnel_state: TunnelUiState,
+    tunnel_start_automatically: bool,
+    automatic_tunnel_launch_pending: bool,
+    tunnel_setting_error: Option<String>,
     active_http_connections: usize,
     active_mcp_sessions: usize,
     fatal_error: Option<String>,
@@ -658,6 +661,29 @@ pub struct RemoteControlApp {
 
 impl RemoteControlApp {
     pub fn new(rx: Receiver<UiEvent>, start_time: Instant) -> Self {
+        let (tunnel_start_automatically, tunnel_setting_error) =
+            match tunnel::load_start_automatically() {
+                Ok(enabled) => (enabled, None),
+                Err(error) => {
+                    eprintln!("{error}");
+                    (false, Some(error))
+                }
+            };
+
+        Self::with_tunnel_setting(
+            rx,
+            start_time,
+            tunnel_start_automatically,
+            tunnel_setting_error,
+        )
+    }
+
+    fn with_tunnel_setting(
+        rx: Receiver<UiEvent>,
+        start_time: Instant,
+        tunnel_start_automatically: bool,
+        tunnel_setting_error: Option<String>,
+    ) -> Self {
         Self {
             rx,
             requests: Vec::new(),
@@ -668,6 +694,9 @@ impl RemoteControlApp {
             mcp_endpoint: None,
             tunnel_launch: None,
             tunnel_state: TunnelUiState::Idle,
+            tunnel_start_automatically,
+            automatic_tunnel_launch_pending: tunnel_start_automatically,
+            tunnel_setting_error,
             active_http_connections: 0,
             active_mcp_sessions: 0,
             fatal_error: None,
@@ -697,6 +726,10 @@ impl RemoteControlApp {
                 UiEventKind::ServerListening { endpoint } => {
                     self.status_text = "MCP server running".to_string();
                     self.mcp_endpoint = Some(endpoint.clone());
+                    if self.automatic_tunnel_launch_pending && self.fatal_error.is_none() {
+                        self.automatic_tunnel_launch_pending = false;
+                        self.start_tunnel();
+                    }
                 }
                 UiEventKind::HttpConnectionOpened => {
                     self.active_http_connections = self.active_http_connections.saturating_add(1);
@@ -729,7 +762,7 @@ impl RemoteControlApp {
     fn update_window_icon(
         &mut self,
         context: &egui::Context,
-        frame: &eframe::Frame,
+        _frame: &eframe::Frame,
         current_elapsed: Duration,
     ) {
         let should_be_busy =
@@ -747,7 +780,7 @@ impl RemoteControlApp {
         context.send_viewport_cmd(egui::ViewportCommand::Icon(Some(icon)));
 
         #[cfg(target_os = "windows")]
-        if let Some(window) = frame.winit_window() {
+        if let Some(window) = _frame.winit_window() {
             use winit::platform::windows::WindowExtWindows as _;
 
             let taskbar_icon = if should_be_busy {
@@ -839,6 +872,8 @@ impl RemoteControlApp {
         let tunnel_failed = matches!(self.tunnel_state, TunnelUiState::Failed { .. });
         let mut stop_clicked = false;
         let mut start_clicked = false;
+        let mut automatic_setting_changed = false;
+        let previous_automatic_setting = self.tunnel_start_automatically;
 
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -925,12 +960,42 @@ impl RemoteControlApp {
                         .clicked();
                 }
 
+                automatic_setting_changed = ui
+                    .checkbox(&mut self.tunnel_start_automatically, "Start automatically")
+                    .changed();
+
                 if let TunnelUiState::Failed { error } = &self.tunnel_state {
                     ui.colored_label(ui.visuals().error_fg_color, "Tunnel launch failed")
                         .on_hover_text(error);
                 }
+                if let Some(error) = &self.tunnel_setting_error {
+                    ui.colored_label(ui.visuals().error_fg_color, "Automatic-start setting error")
+                        .on_hover_text(error);
+                }
             });
         });
+
+        if automatic_setting_changed {
+            match tunnel::save_start_automatically(self.tunnel_start_automatically) {
+                Ok(()) => {
+                    self.disk_log.log_tunnel(
+                        "tunnel_auto_start_setting_changed",
+                        format!("enabled={}", self.tunnel_start_automatically),
+                    );
+                    if self.mcp_endpoint.is_none() {
+                        self.automatic_tunnel_launch_pending = self.tunnel_start_automatically;
+                    }
+                    self.tunnel_setting_error = None;
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    self.disk_log
+                        .log_tunnel("tunnel_auto_start_setting_save_failed", &error);
+                    self.tunnel_start_automatically = previous_automatic_setting;
+                    self.tunnel_setting_error = Some(error);
+                }
+            }
+        }
 
         if stop_clicked {
             self.stop_tunnel();
@@ -988,6 +1053,10 @@ mod tests {
     use super::*;
     use chrono::{FixedOffset, TimeZone};
 
+    fn test_app(rx: Receiver<UiEvent>) -> RemoteControlApp {
+        RemoteControlApp::with_tunnel_setting(rx, Instant::now(), false, None)
+    }
+
     fn started_event(id: u64, elapsed: Duration) -> UiEvent {
         UiEvent {
             elapsed,
@@ -1012,7 +1081,7 @@ mod tests {
     #[test]
     fn app_starts_while_the_http_worker_prepares_the_listener() {
         let (_tx, rx) = mpsc::channel();
-        let app = RemoteControlApp::new(rx, Instant::now());
+        let app = test_app(rx);
 
         assert_eq!(app.status_text, "Starting");
         assert!(app.mcp_endpoint.is_none());
@@ -1026,7 +1095,7 @@ mod tests {
     #[test]
     fn cancelling_tunnel_launch_returns_to_idle_state() {
         let (_tx, rx) = mpsc::channel();
-        let mut app = RemoteControlApp::new(rx, Instant::now());
+        let mut app = test_app(rx);
         app.status_text = "MCP server running".to_string();
         app.tunnel_state = TunnelUiState::Starting {
             log_path: "tunnel.log".to_string(),
@@ -1042,7 +1111,7 @@ mod tests {
     #[test]
     fn stopping_running_tunnel_returns_to_idle_state() {
         let (_tx, rx) = mpsc::channel();
-        let mut app = RemoteControlApp::new(rx, Instant::now());
+        let mut app = test_app(rx);
         app.status_text = "MCP server running".to_string();
         app.active_http_connections = 3;
         app.active_mcp_sessions = 2;
@@ -1543,7 +1612,7 @@ mod tests {
     #[test]
     fn server_events_update_status_without_creating_requests() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut app = RemoteControlApp::new(rx, Instant::now());
+        let mut app = test_app(rx);
         tx.send(UiEvent {
             elapsed: Duration::ZERO,
             kind: UiEventKind::ServerListening {
@@ -1600,7 +1669,7 @@ mod tests {
     #[test]
     fn http_connection_and_mcp_session_counts_update_independently() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut app = RemoteControlApp::new(rx, Instant::now());
+        let mut app = test_app(rx);
         tx.send(UiEvent {
             elapsed: Duration::ZERO,
             kind: UiEventKind::ServerListening {

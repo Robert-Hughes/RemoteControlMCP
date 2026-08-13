@@ -23,6 +23,7 @@ The application and the `tunnel-client` daemon both store configuration in the p
 | Tunnel client binary | `tunnel-client.exe` | `tunnel-client` | `tunnel-client` |
 | User config directory | `%APPDATA%` | `~/.config` | `${XDG_CONFIG_HOME:-$HOME/.config}` |
 | Launcher path file | `%APPDATA%\RemoteControlMCP\tunnel-client-path.txt` | `~/.config/RemoteControlMCP/tunnel-client-path.txt` | `~/.config/RemoteControlMCP/tunnel-client-path.txt` |
+| Automatic-start setting | `%APPDATA%\RemoteControlMCP\start-tunnel-automatically.txt` | `~/.config/RemoteControlMCP/start-tunnel-automatically.txt` | `~/.config/RemoteControlMCP/start-tunnel-automatically.txt` |
 | Runtime key file | `%APPDATA%\tunnel-client\remote-control-mcp.key` | `~/.config/tunnel-client/remote-control-mcp.key` | `~/.config/tunnel-client/remote-control-mcp.key` |
 | Tunnel profile | `%APPDATA%\tunnel-client\remote-control-mcp.yaml` | `~/.config/tunnel-client/remote-control-mcp.yaml` | `~/.config/tunnel-client/remote-control-mcp.yaml` |
 | Tunnel logs | `%TEMP%\RemoteControlMCP` | `$TMPDIR/RemoteControlMCP` (usually `/tmp`) | `/tmp/RemoteControlMCP` |
@@ -436,6 +437,8 @@ For longer development sessions, increase the maximum lifetime of the local MCP 
 This reduces HTTP session rotation during a typical development session. It does not repair an already stale MCP session; after restarting the tunnel or local MCP process, start a new ChatGPT conversation so that the new connection receives a fresh MCP `initialize` handshake.
 
 Alternatively, select **Start Secure MCP Tunnel** in the already-running application. It uses the recorded tunnel-client path, the fixed `remote-control-mcp` profile, the runtime key file `remote-control-mcp.key` in the platform user-config directory (see section 6), and its own displayed HTTP endpoint. It starts the tunnel on an ephemeral loopback health port, waits for `/readyz`, and continues monitoring the tunnel process. While it is waiting, **Cancel tunnel launch** terminates the supervised tunnel-client process. Once connected, **Stop Secure MCP Tunnel** terminates it without closing the local MCP application and leaves the tunnel ready to be started again. Logs are written beneath the system temporary directory (`%TEMP%` on Windows, `$TMPDIR` on macOS and Linux).
+
+Select **Start automatically** beside the tunnel button to launch the tunnel once the local MCP listener is ready on future application starts. The preference is stored in the application configuration directory shown in the platform conventions table. Automatic launch is attempted once per application start; a failure remains visible and can be retried manually.
 
 * **Manual launch:** Leave the terminal pane open. The process must remain active to handle connection dispatches.
 * **GUI-button launch:** The tunnel client runs detached from the console and stops when the GUI closes.

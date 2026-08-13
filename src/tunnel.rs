@@ -16,6 +16,7 @@ use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 const PROFILE_NAME: &str = "remote-control-mcp";
 const KEY_FILE_NAME: &str = "remote-control-mcp.key";
 const TUNNEL_CLIENT_PATH_FILE: &str = "tunnel-client-path.txt";
+const START_AUTOMATICALLY_FILE: &str = "start-tunnel-automatically.txt";
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -98,6 +99,58 @@ pub fn start_tunnel(mcp_endpoint: &str) -> Result<TunnelLaunch, String> {
     })
 }
 
+pub fn load_start_automatically() -> Result<bool, String> {
+    load_start_automatically_from(&config_directory()?)
+}
+
+pub fn save_start_automatically(enabled: bool) -> Result<(), String> {
+    save_start_automatically_to(&config_directory()?, enabled)
+}
+
+fn load_start_automatically_from(config_dir: &Path) -> Result<bool, String> {
+    let path = launcher_config_directory(config_dir).join(START_AUTOMATICALLY_FILE);
+    let value = match fs::read_to_string(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "Could not read the automatic tunnel setting {}: {error}",
+                path.display()
+            ));
+        }
+    };
+
+    match value.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!(
+            "The automatic tunnel setting {} must contain either true or false.",
+            path.display()
+        )),
+    }
+}
+
+fn save_start_automatically_to(config_dir: &Path, enabled: bool) -> Result<(), String> {
+    let directory = launcher_config_directory(config_dir);
+    fs::create_dir_all(&directory).map_err(|error| {
+        format!(
+            "Could not create the application configuration directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    let path = directory.join(START_AUTOMATICALLY_FILE);
+    fs::write(&path, if enabled { "true\n" } else { "false\n" }).map_err(|error| {
+        format!(
+            "Could not save the automatic tunnel setting {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn launcher_config_directory(config_dir: &Path) -> PathBuf {
+    config_dir.join("RemoteControlMCP")
+}
+
 fn config_directory() -> Result<PathBuf, String> {
     // Mirror the tunnel-client profile directory resolution so the key file
     // lands next to the profiles it is used with: XDG_CONFIG_HOME, then
@@ -130,9 +183,7 @@ fn validate_key_file(key_path: &Path) -> Result<(), String> {
 }
 
 fn resolve_tunnel_client(config_dir: &Path) -> Result<PathBuf, String> {
-    let configured_path_file = config_dir
-        .join("RemoteControlMCP")
-        .join(TUNNEL_CLIENT_PATH_FILE);
+    let configured_path_file = launcher_config_directory(config_dir).join(TUNNEL_CLIENT_PATH_FILE);
     if configured_path_file.exists() {
         let configured_path = fs::read_to_string(&configured_path_file).map_err(|error| {
             format!(
@@ -460,6 +511,23 @@ mod tests {
         assert_eq!(tunnel_client_executable_name(), "tunnel-client.exe");
         #[cfg(not(windows))]
         assert_eq!(tunnel_client_executable_name(), "tunnel-client");
+    }
+
+    #[test]
+    fn automatic_start_setting_defaults_to_false_and_round_trips() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "rmcp-auto-start-setting-test-{}-{}",
+            std::process::id(),
+            launch_id()
+        ));
+
+        assert!(!load_start_automatically_from(&config_dir).unwrap());
+        save_start_automatically_to(&config_dir, true).unwrap();
+        assert!(load_start_automatically_from(&config_dir).unwrap());
+        save_start_automatically_to(&config_dir, false).unwrap();
+        assert!(!load_start_automatically_from(&config_dir).unwrap());
+
+        fs::remove_dir_all(config_dir).unwrap();
     }
 
     #[test]

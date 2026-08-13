@@ -235,7 +235,7 @@ This command works identically in PowerShell, bash, and zsh.
 ./target/debug/remote-control-mcp
 ```
 
-The application immediately starts its loopback-only Streamable HTTP endpoint at `http://127.0.0.1:61337/mcp`. Its compact status panel groups the server state with that endpoint, keeps the supervised tunnel state beside its action button, and independently shows the number of open HTTP connections and active MCP sessions. **Start Secure MCP Tunnel** launches the tunnel, **Cancel tunnel launch** terminates it while it is starting, and **Stop Secure MCP Tunnel** disconnects it without closing the application.
+The application immediately starts its loopback-only Streamable HTTP endpoint at `http://127.0.0.1:61337/mcp`. Its compact status panel groups the server state with that endpoint, keeps the supervised tunnel state beside its action button, and independently shows the number of open HTTP connections and active MCP sessions. **Start Secure MCP Tunnel** launches the tunnel, **Cancel tunnel launch** terminates it while it is starting, and **Stop Secure MCP Tunnel** disconnects it without closing the application. The adjacent **Start automatically** setting is remembered across application restarts and launches the tunnel once the local listener is ready.
 
 The button requires the one-time launcher path, HTTP profile, and runtime-key file configuration documented in [DEVELOPER_SETUP.md](docs/DEVELOPER_SETUP.md). The fixed port allows the same profile to reconnect after application restarts without relaunching the application as a child process.
 
