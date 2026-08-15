@@ -1,12 +1,15 @@
+use crate::mcp::file_path::{RegularFileOpenErrorKind, open_regular_file_with_metadata};
 use crate::mcp::launch_process::{
     ChildOps, CleanupOutcome, handle_background_wait_result_with_notifier,
     launch_process_failure_summary, launch_process_summary, perform_cleanup,
     read_and_truncate_file, report_background_error, validate_request,
 };
 use crate::mcp::ping::PingResult;
+use crate::mcp::read_binary_file::{
+    MAX_BINARY_FILE_BYTES, read_binary_file_summary, validate_read_binary_file_request,
+};
 use crate::mcp::read_file::{
-    install_blocking_test_hook, open_regular_file_with_metadata, read_file_summary,
-    validate_read_file_request,
+    install_blocking_test_hook, read_file_summary, validate_read_file_request,
 };
 use crate::mcp::write_file::{
     install_blocking_test_hook as install_write_file_blocking_test_hook,
@@ -15,7 +18,8 @@ use crate::mcp::write_file::{
 use crate::mcp::{
     BOOTSTRAP_INSTRUCTIONS, EnvironmentConfig, GENERAL_INSTRUCTIONS, LaunchProcessRequest,
     LaunchProcessResult, LaunchProcessStatus, LocalInstructionsDiagnostic,
-    MACHINE_INSTRUCTIONS_HEADING, McpServer, ReadFileRequest, ReadFileResult, ReadFileStatus,
+    MACHINE_INSTRUCTIONS_HEADING, McpServer, ReadBinaryFileContentKind, ReadBinaryFileRequest,
+    ReadBinaryFileResult, ReadBinaryFileStatus, ReadFileRequest, ReadFileResult, ReadFileStatus,
     RequestData, RequestId, RequestUpdate, TimeoutAction, TrackedHttpIo, UiEventKind,
     WriteFileRequest, WriteFileResult, WriteFileStatus, build_http_mcp_service, build_mcp_runtime,
     compose_instructions, load_server_instructions_from_path, read_local_instructions,
@@ -374,6 +378,18 @@ fn write_temp_test_file(prefix: &str, bytes: &[u8]) -> std::path::PathBuf {
     path
 }
 
+fn write_temp_test_file_with_extension(
+    prefix: &str,
+    extension: &str,
+    bytes: &[u8],
+) -> std::path::PathBuf {
+    let mut path = generate_temp_test_path(prefix);
+    path.set_extension(extension);
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
 fn make_read_file_request(
     path: &std::path::Path,
     start_line: u64,
@@ -405,6 +421,43 @@ fn read_file_structured_result(result: &rmcp::model::CallToolResult) -> ReadFile
             .structured_content
             .clone()
             .expect("read_file should return structured content"),
+    )
+    .unwrap()
+}
+
+fn make_read_binary_file_request(
+    path: &std::path::Path,
+    max_bytes: Option<u64>,
+) -> ReadBinaryFileRequest {
+    ReadBinaryFileRequest {
+        path: path.to_string_lossy().into_owned(),
+        max_bytes,
+    }
+}
+
+fn call_read_binary_file_direct(
+    req: ReadBinaryFileRequest,
+) -> (rmcp::model::CallToolResult, Vec<UiEventKind>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let result = rt
+        .block_on(async { server.read_binary_file(parameters_of(&req)).await })
+        .unwrap();
+    let events = rx.try_iter().map(|event| event.kind).collect();
+    (result, events)
+}
+
+fn read_binary_file_structured_result(
+    result: &rmcp::model::CallToolResult,
+) -> ReadBinaryFileResult {
+    rmcp::serde_json::from_value(
+        result
+            .structured_content
+            .clone()
+            .expect("read_binary_file should return structured content"),
     )
     .unwrap()
 }
@@ -1000,7 +1053,12 @@ fn read_file_validates_ranges_and_ambiguous_windows_paths() {
     }
 
     #[cfg(target_os = "windows")]
-    for path in [r"C:some-file.txt", r"\some-file.txt"] {
+    for path in [
+        r"C:some-file.txt",
+        r"\some-file.txt",
+        r"\.\PhysicalDrive0",
+        r"\.\COM42",
+    ] {
         let req = ReadFileRequest {
             path: path.to_string(),
             start_line: 1,
@@ -1082,32 +1140,29 @@ fn read_file_returns_structured_filesystem_failures() {
 #[test]
 fn read_file_validates_metadata_from_the_opened_handle() {
     let path = write_temp_test_file("opened_metadata", b"regular file\n");
-    let req = make_read_file_request(&path, 1, 1);
-
-    let file = open_regular_file_with_metadata(&req, &path, std::fs::File::metadata)
+    let (file, _) = open_regular_file_with_metadata(&path, std::fs::File::metadata)
         .expect("ordinary regular file should be accepted");
     drop(file);
 
-    let metadata_failure = open_regular_file_with_metadata(&req, &path, |_| {
+    let metadata_failure = open_regular_file_with_metadata(&path, |_| {
         Err(std::io::Error::other(
             "injected opened-handle metadata failure",
         ))
     })
     .unwrap_err();
-    assert_eq!(metadata_failure.status, ReadFileStatus::ReadFailed);
+    assert_eq!(metadata_failure.kind, RegularFileOpenErrorKind::Other);
     assert!(
         metadata_failure
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("injected opened-handle metadata failure"))
+            .message
+            .contains("injected opened-handle metadata failure")
     );
 
     let directory = generate_temp_test_path("opened_metadata_directory");
     std::fs::create_dir(&directory).unwrap();
     let directory_metadata = std::fs::metadata(&directory).unwrap();
     let swapped_object =
-        open_regular_file_with_metadata(&req, &path, move |_| Ok(directory_metadata)).unwrap_err();
-    assert_eq!(swapped_object.status, ReadFileStatus::NotAFile);
+        open_regular_file_with_metadata(&path, move |_| Ok(directory_metadata)).unwrap_err();
+    assert_eq!(swapped_object.kind, RegularFileOpenErrorKind::NotAFile);
 
     std::fs::remove_file(path).unwrap();
     std::fs::remove_dir(directory).unwrap();
@@ -1456,7 +1511,7 @@ fn ping_works_over_mcp_duplex_transport() {
         assert_eq!(transmitted_instructions, BOOTSTRAP_INSTRUCTIONS);
         // 1. Tool discovery through tools/list
         let tools = client.list_all_tools().await.expect("Failed to list tools");
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
         let tool = tools
             .iter()
             .find(|t| t.name == "ping")
@@ -2885,7 +2940,7 @@ fn launch_process_integration_test_over_duplex() {
 
         // 1. Tool discovery integration test
         let tools = client.list_all_tools().await.expect("Failed to list tools");
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
 
         let launch_tool = tools
             .iter()
@@ -3469,7 +3524,7 @@ fn write_file_integration_test_over_duplex() {
         use rmcp::ServiceExt;
         let mut client = ().serve(client_transport).await.expect("serve client");
         let tools = client.list_all_tools().await.expect("list tools");
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
         let tool = tools
             .iter()
             .find(|tool| tool.name == "write_file")
@@ -3678,6 +3733,290 @@ fn write_file_blocking_work_does_not_block_ping() {
 }
 
 #[test]
+fn read_binary_file_integration_returns_native_content_over_duplex() {
+    use base64::Engine as _;
+
+    let png_bytes = b"\x89PNG\r\n\x1a\nsynthetic-png";
+    let jpeg_bytes = b"\xff\xd8\xff\xe0synthetic-jpeg";
+    let binary_bytes = b"\x00\x01\x02\xffbinary";
+    let png_path = write_temp_test_file_with_extension("binary_png", "png", png_bytes);
+    let jpeg_path = write_temp_test_file_with_extension("binary_jpeg", "jpeg", jpeg_bytes);
+    let binary_path = write_temp_test_file_with_extension("binary_blob", "bin", binary_bytes);
+    let empty_path = write_temp_test_file_with_extension("binary_empty", "bin", b"");
+
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let (server_transport, client_transport) = tokio::io::duplex(256 * 1024);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let server_task = tokio::spawn(async move {
+            run_mcp_server_loop(tx, Instant::now(), server_transport).await;
+        });
+        use rmcp::ServiceExt;
+        let mut client = ().serve(client_transport).await.expect("serve client");
+        let tools = client.list_all_tools().await.expect("list tools");
+        assert_eq!(tools.len(), 6);
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "read_binary_file")
+            .expect("read_binary_file tool should be exposed");
+
+        let annotations = tool
+            .annotations
+            .as_ref()
+            .expect("read_binary_file annotations");
+        assert_eq!(annotations.read_only_hint, Some(true));
+        assert_eq!(annotations.destructive_hint, Some(false));
+        assert_eq!(annotations.idempotent_hint, Some(true));
+        assert_eq!(annotations.open_world_hint, Some(false));
+
+        let required = tool.input_schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|value| value == "path"));
+        assert!(!required.iter().any(|value| value == "max_bytes"));
+        let max_bytes_schema = &tool.input_schema["properties"]["max_bytes"];
+        assert_eq!(max_bytes_schema["type"], "integer");
+        assert_eq!(max_bytes_schema["minimum"], 1);
+        assert_eq!(max_bytes_schema["maximum"], MAX_BINARY_FILE_BYTES);
+        assert!(max_bytes_schema.get("default").is_none());
+
+        let output_schema = tool
+            .output_schema
+            .as_ref()
+            .expect("read_binary_file output schema should be present");
+        let encoded_output_schema =
+            rmcp::serde_json::Value::Object((**output_schema).clone()).to_string();
+        for field in [
+            "status",
+            "error",
+            "path",
+            "size",
+            "mime_type",
+            "content_kind",
+        ] {
+            assert!(encoded_output_schema.contains(field));
+        }
+        for status in [
+            "completed",
+            "not_found",
+            "access_denied",
+            "not_a_file",
+            "too_large",
+            "read_failed",
+        ] {
+            assert!(encoded_output_schema.contains(status));
+        }
+
+        async fn call(
+            client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+            path: &Path,
+        ) -> rmcp::model::CallToolResult {
+            let mut params = rmcp::model::CallToolRequestParams::new("read_binary_file");
+            params.arguments = Some(
+                rmcp::serde_json::json!({ "path": path.to_string_lossy() })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+            client.call_tool(params).await.expect("read binary file")
+        }
+
+        let png = call(&client, &png_path).await;
+        assert_eq!(png.is_error, Some(false));
+        let png_result = read_binary_file_structured_result(&png);
+        assert_eq!(png_result.status, ReadBinaryFileStatus::Completed);
+        assert_eq!(png_result.size, Some(png_bytes.len() as u64));
+        assert_eq!(png_result.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            png_result.content_kind,
+            Some(ReadBinaryFileContentKind::Image)
+        );
+        assert_eq!(png.content.len(), 2);
+        let rmcp::model::ContentBlock::Image(image) = &png.content[1] else {
+            panic!("PNG should return native image content");
+        };
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(
+            base64::prelude::BASE64_STANDARD
+                .decode(&image.data)
+                .unwrap(),
+            png_bytes
+        );
+
+        let jpeg = call(&client, &jpeg_path).await;
+        let jpeg_result = read_binary_file_structured_result(&jpeg);
+        assert_eq!(jpeg_result.mime_type.as_deref(), Some("image/jpeg"));
+        let rmcp::model::ContentBlock::Image(image) = &jpeg.content[1] else {
+            panic!("JPEG should return native image content");
+        };
+        assert_eq!(image.mime_type, "image/jpeg");
+        assert_eq!(
+            base64::prelude::BASE64_STANDARD
+                .decode(&image.data)
+                .unwrap(),
+            jpeg_bytes
+        );
+
+        let binary = call(&client, &binary_path).await;
+        let binary_result = read_binary_file_structured_result(&binary);
+        assert_eq!(
+            binary_result.mime_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            binary_result.content_kind,
+            Some(ReadBinaryFileContentKind::EmbeddedResource)
+        );
+        let rmcp::model::ContentBlock::Resource(resource) = &binary.content[1] else {
+            panic!("arbitrary binary should return an embedded resource");
+        };
+        let rmcp::model::ResourceContents::BlobResourceContents {
+            uri,
+            mime_type,
+            blob,
+            ..
+        } = &resource.resource
+        else {
+            panic!("arbitrary binary should return blob resource contents");
+        };
+        assert!(uri.starts_with("file:"));
+        assert_eq!(mime_type.as_deref(), Some("application/octet-stream"));
+        assert_eq!(
+            base64::prelude::BASE64_STANDARD.decode(blob).unwrap(),
+            binary_bytes
+        );
+        assert!(
+            !binary
+                .structured_content
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("AAEC/2JpbmFyeQ==")
+        );
+
+        let empty = call(&client, &empty_path).await;
+        let empty_result = read_binary_file_structured_result(&empty);
+        assert_eq!(empty_result.status, ReadBinaryFileStatus::Completed);
+        assert_eq!(empty_result.size, Some(0));
+        let rmcp::model::ContentBlock::Resource(resource) = &empty.content[1] else {
+            panic!("empty binary should return an embedded resource");
+        };
+        let rmcp::model::ResourceContents::BlobResourceContents { blob, .. } = &resource.resource
+        else {
+            panic!("empty binary should return blob resource contents");
+        };
+        assert!(blob.is_empty());
+
+        client.close().await.expect("close client");
+        server_task.await.expect("server task");
+    });
+
+    for path in [png_path, jpeg_path, binary_path, empty_path] {
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn read_binary_file_enforces_limits_and_reports_filesystem_failures() {
+    let small_path = write_temp_test_file_with_extension("binary_limit", "bin", b"1234");
+    let lower_limit = read_binary_file_structured_result(
+        &call_read_binary_file_direct(make_read_binary_file_request(&small_path, Some(3))).0,
+    );
+    assert_eq!(lower_limit.status, ReadBinaryFileStatus::TooLarge);
+    assert_eq!(lower_limit.size, Some(4));
+
+    let oversized_path = generate_temp_test_path("binary_sparse_oversized");
+    let oversized = std::fs::File::create(&oversized_path).unwrap();
+    oversized.set_len(MAX_BINARY_FILE_BYTES + 1).unwrap();
+    drop(oversized);
+    let oversized_result = read_binary_file_structured_result(
+        &call_read_binary_file_direct(make_read_binary_file_request(&oversized_path, None)).0,
+    );
+    assert_eq!(oversized_result.status, ReadBinaryFileStatus::TooLarge);
+    assert_eq!(oversized_result.size, Some(MAX_BINARY_FILE_BYTES + 1));
+
+    let invalid_limit = make_read_binary_file_request(&small_path, Some(MAX_BINARY_FILE_BYTES + 1));
+    assert!(validate_read_binary_file_request(&invalid_limit).is_err());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let invalid_call = rt
+        .block_on(async { server.read_binary_file(parameters_of(&invalid_limit)).await })
+        .unwrap();
+    assert_eq!(invalid_call.is_error, Some(true));
+    assert!(only_text_content(&invalid_call).contains("100000000"));
+    assert!(rx.try_iter().any(|event| matches!(
+        event.kind,
+        UiEventKind::RequestUpdated {
+            update: RequestUpdate::Rejected { .. },
+            ..
+        }
+    )));
+
+    let missing_path = generate_temp_test_path("binary_missing");
+    let missing = read_binary_file_structured_result(
+        &call_read_binary_file_direct(make_read_binary_file_request(&missing_path, None)).0,
+    );
+    assert_eq!(missing.status, ReadBinaryFileStatus::NotFound);
+
+    let directory = generate_temp_test_path("binary_directory");
+    std::fs::create_dir(&directory).unwrap();
+    let directory_result = read_binary_file_structured_result(
+        &call_read_binary_file_direct(make_read_binary_file_request(&directory, None)).0,
+    );
+    assert_eq!(directory_result.status, ReadBinaryFileStatus::NotAFile);
+
+    let relative_name = generate_temp_test_path("binary_relative")
+        .file_name()
+        .unwrap()
+        .to_owned();
+    let relative_path = std::env::temp_dir().join(&relative_name);
+    std::fs::write(&relative_path, b"relative binary").unwrap();
+    let relative_request = ReadBinaryFileRequest {
+        path: PathBuf::from(&relative_name).to_string_lossy().into_owned(),
+        max_bytes: None,
+    };
+    let relative =
+        read_binary_file_structured_result(&call_read_binary_file_direct(relative_request).0);
+    assert_eq!(relative.status, ReadBinaryFileStatus::Completed);
+    assert!(Path::new(&relative.path).is_absolute());
+
+    assert_eq!(
+        read_binary_file_summary(&oversized_result),
+        format!(
+            "Binary file is too large to read: {}.",
+            oversized_result.path
+        )
+    );
+
+    std::fs::remove_file(small_path).unwrap();
+    std::fs::remove_file(oversized_path).unwrap();
+    std::fs::remove_dir(directory).unwrap();
+    std::fs::remove_file(relative_path).unwrap();
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn binary_file_path_validation_rejects_device_namespace_and_keeps_unc() {
+    for path in [r"\\.\PhysicalDrive0", r"\\.\COM42"] {
+        let req = ReadBinaryFileRequest {
+            path: path.to_string(),
+            max_bytes: None,
+        };
+        assert!(validate_read_binary_file_request(&req).is_err());
+    }
+    let unc = ReadBinaryFileRequest {
+        path: r"\\server\share\image.png".to_string(),
+        max_bytes: None,
+    };
+    assert!(validate_read_binary_file_request(&unc).is_ok());
+}
+
+#[test]
 fn read_file_integration_test_over_duplex() {
     let relative_name = generate_temp_test_path("mcp_read_relative")
         .file_name()
@@ -3707,7 +4046,7 @@ fn read_file_integration_test_over_duplex() {
         use rmcp::ServiceExt;
         let mut client = ().serve(client_transport).await.expect("serve client");
         let tools = client.list_all_tools().await.expect("list tools");
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
         let tool = tools
             .iter()
             .find(|tool| tool.name == "read_file")

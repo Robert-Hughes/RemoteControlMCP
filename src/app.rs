@@ -1,7 +1,8 @@
 use crate::disk_log::DiskLog;
 use crate::mcp::{
-    LaunchProcessStatus, LocalInstructionsDiagnostic, ReadFileStatus, RequestData, RequestId,
-    RequestUpdate, UiEvent, UiEventKind, WriteFileStatus,
+    LaunchProcessStatus, LocalInstructionsDiagnostic, ReadBinaryFileContentKind,
+    ReadBinaryFileStatus, ReadFileStatus, RequestData, RequestId, RequestUpdate, UiEvent,
+    UiEventKind, WriteFileStatus,
 };
 use crate::tunnel::{self, TunnelLaunch, TunnelLaunchEvent};
 use chrono::{DateTime, Local, TimeZone};
@@ -189,6 +190,47 @@ fn read_file_presentation(
     }
 }
 
+fn read_binary_file_presentation(
+    status: ReadBinaryFileStatus,
+    error: Option<String>,
+    size: Option<u64>,
+    mime_type: Option<String>,
+    content_kind: Option<ReadBinaryFileContentKind>,
+) -> RequestPresentation {
+    let (state, status_text) = match status {
+        ReadBinaryFileStatus::Completed => {
+            let size = size.map_or_else(
+                || "unknown size".to_string(),
+                |size| format!("{size} bytes"),
+            );
+            let mime = mime_type.unwrap_or_else(|| "application/octet-stream".to_string());
+            let kind = match content_kind {
+                Some(ReadBinaryFileContentKind::Image) => "image",
+                Some(ReadBinaryFileContentKind::EmbeddedResource) => "binary resource",
+                None => "binary content",
+            };
+            (
+                RequestState::Completed,
+                format!("Completed · {size} · {mime} · {kind}"),
+            )
+        }
+        ReadBinaryFileStatus::NotFound => (RequestState::Failed, "File not found".to_string()),
+        ReadBinaryFileStatus::AccessDenied => (RequestState::Failed, "Access denied".to_string()),
+        ReadBinaryFileStatus::NotAFile => (RequestState::Failed, "Not a regular file".to_string()),
+        ReadBinaryFileStatus::TooLarge => (
+            RequestState::Failed,
+            "File exceeds binary read limit".to_string(),
+        ),
+        ReadBinaryFileStatus::ReadFailed => (RequestState::Failed, "Read failed".to_string()),
+    };
+    RequestPresentation {
+        state,
+        status_text,
+        detail_text: (state == RequestState::Failed).then_some(error).flatten(),
+        pid: None,
+    }
+}
+
 fn write_file_presentation(
     status: WriteFileStatus,
     error: Option<String>,
@@ -280,6 +322,13 @@ fn presentation_for_update(update: RequestUpdate) -> RequestPresentation {
             next_start_line,
             eof,
         ),
+        RequestUpdate::ReadBinaryFileResponded {
+            status,
+            error,
+            size,
+            mime_type,
+            content_kind,
+        } => read_binary_file_presentation(status, error, size, mime_type, content_kind),
         RequestUpdate::WriteFileResponded {
             status,
             error,
@@ -374,6 +423,7 @@ fn apply_request_event(requests: &mut Vec<RequestEntry>, event: UiEvent) {
                         | RequestUpdate::GetInstructionsCompleted
                         | RequestUpdate::LaunchProcessResponded { .. }
                         | RequestUpdate::ReadFileResponded { .. }
+                        | RequestUpdate::ReadBinaryFileResponded { .. }
                         | RequestUpdate::WriteFileResponded { .. }
                         | RequestUpdate::Rejected { .. }
                         | RequestUpdate::InternalFailure { .. }
@@ -432,6 +482,7 @@ fn request_tool_name(request: &RequestData) -> &'static str {
         RequestData::GetInstructions => "get_instructions",
         RequestData::LaunchProcess { .. } => "launch_process",
         RequestData::ReadFile { .. } => "read_file",
+        RequestData::ReadBinaryFile { .. } => "read_binary_file",
         RequestData::WriteFile { .. } => "write_file",
     }
 }
@@ -459,6 +510,10 @@ fn request_summary(request: &RequestEntry) -> String {
             start_line,
             end_line,
         } => format!("{path} · requested lines {start_line}–{end_line}"),
+        RequestData::ReadBinaryFile { path, max_bytes } => max_bytes.map_or_else(
+            || format!("{path} · server limit 100 MB"),
+            |max_bytes| format!("{path} · requested maximum {max_bytes} bytes"),
+        ),
         RequestData::WriteFile {
             path,
             start_line,

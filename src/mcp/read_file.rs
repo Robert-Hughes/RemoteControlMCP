@@ -1,4 +1,7 @@
-use crate::mcp::file_path::validate_line_file_path;
+use crate::mcp::file_path::{
+    RegularFileOpenError, RegularFileOpenErrorKind, open_regular_file_with_metadata,
+    validate_line_file_path,
+};
 use crate::mcp::{
     McpServer, ReadFileRequest, ReadFileResult, ReadFileStatus, RequestData, RequestUpdate,
     argument_error_result, missing_argument_message,
@@ -128,53 +131,23 @@ fn read_line_bounded(
     }
 }
 
-pub(crate) fn open_regular_file_with_metadata(
-    req: &ReadFileRequest,
-    path: &Path,
-    opened_metadata: impl FnOnce(&std::fs::File) -> std::io::Result<std::fs::Metadata>,
-) -> Result<std::fs::File, Box<ReadFileResult>> {
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) => return Err(Box::new(io_failure(req, path, error))),
+fn open_failure(req: &ReadFileRequest, path: &Path, error: RegularFileOpenError) -> ReadFileResult {
+    let status = match error.kind {
+        RegularFileOpenErrorKind::NotFound => ReadFileStatus::NotFound,
+        RegularFileOpenErrorKind::AccessDenied => ReadFileStatus::AccessDenied,
+        RegularFileOpenErrorKind::NotAFile => ReadFileStatus::NotAFile,
+        RegularFileOpenErrorKind::Other => ReadFileStatus::ReadFailed,
     };
-    if !metadata.is_file() {
-        return Err(Box::new(failure_result(
-            req,
-            path,
-            ReadFileStatus::NotAFile,
-            "The resolved path is not a regular file",
-        )));
-    }
-
-    // The pathname check gives useful early classification, while metadata from
-    // the opened handle prevents reading a different non-file swapped in before open.
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) => return Err(Box::new(io_failure(req, path, error))),
-    };
-    let metadata = match opened_metadata(&file) {
-        Ok(metadata) => metadata,
-        Err(error) => return Err(Box::new(io_failure(req, path, error))),
-    };
-    if !metadata.is_file() {
-        return Err(Box::new(failure_result(
-            req,
-            path,
-            ReadFileStatus::NotAFile,
-            "The opened path is not a regular file",
-        )));
-    }
-
-    Ok(file)
+    failure_result(req, path, status, error.message)
 }
 
 fn read_file_blocking(req: ReadFileRequest, path: PathBuf) -> ReadFileResult {
     #[cfg(test)]
     test_hooks::wait_if_installed(&path);
 
-    let file = match open_regular_file_with_metadata(&req, &path, std::fs::File::metadata) {
-        Ok(file) => file,
-        Err(result) => return *result,
+    let (file, _) = match open_regular_file_with_metadata(&path, std::fs::File::metadata) {
+        Ok(opened) => opened,
+        Err(error) => return open_failure(&req, &path, error),
     };
     let mut reader = std::io::BufReader::new(file);
     let mut line_number = 1_u64;

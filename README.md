@@ -283,7 +283,7 @@ When you run this command:
 1. The Inspector web UI launches.
 2. In the Inspector, choose **Streamable HTTP**, enter `http://127.0.0.1:61337/mcp`, and connect.
 3. The Inspector connects to the already-running application over loopback TCP.
-4. The Inspector UI shows the `ping`, `launch_process`, `read_file`, and `write_file` tools.
+4. The Inspector UI shows the `get_instructions`, `ping`, `launch_process`, `read_file`, `read_binary_file`, and `write_file` tools.
 5. You can invoke any tool and inspect outputs.
 
 ### CLI Mode
@@ -317,6 +317,13 @@ This no-argument example works on any supported system; executable availability 
 ```sh
 npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transport http --method tools/call --tool-name read_file --tool-arg path=RemoteControlMCP/example.stdout.log --tool-arg start_line=1 --tool-arg end_line=100
 ```
+
+**Call the `read_binary_file` tool:**
+```sh
+npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transport http --method tools/call --tool-name read_binary_file --tool-arg path=RemoteControlMCP/example.png
+```
+
+Recognised images are returned as native MCP image content. Other binary files are returned as native embedded resources. The hard server limit is 100,000,000 bytes (100 MB); `max_bytes` can request a lower per-call limit. Oversized files are rejected rather than truncated.
 
 **Call the `write_file` tool:**
 ```sh

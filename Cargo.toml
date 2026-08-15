@@ -8,6 +8,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs = "6"
 eframe = { version = "0.35", default-features = false, features = ["default_fonts"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+base64 = "0.23"
 rmcp = { version = "3.1", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt", "io-util", "net", "time"] }
 serde = { version = "1.0", features = ["derive"] }

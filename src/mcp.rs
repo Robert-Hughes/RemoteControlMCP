@@ -16,6 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 mod file_path;
 mod launch_process;
 mod ping;
+mod read_binary_file;
 mod read_file;
 mod write_file;
 
@@ -151,6 +152,24 @@ pub enum ReadFileStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+pub enum ReadBinaryFileStatus {
+    Completed,
+    NotFound,
+    AccessDenied,
+    NotAFile,
+    TooLarge,
+    ReadFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadBinaryFileContentKind {
+    Image,
+    EmbeddedResource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum WriteFileStatus {
     Completed,
     Created,
@@ -240,6 +259,32 @@ pub struct ReadFileResult {
     pub lossy_utf8: bool,
 }
 
+fn binary_max_bytes_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "integer",
+        "minimum": 1,
+        "maximum": read_binary_file::MAX_BINARY_FILE_BYTES
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReadBinaryFileRequest {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "binary_max_bytes_schema")]
+    pub max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReadBinaryFileResult {
+    pub status: ReadBinaryFileStatus,
+    pub error: Option<String>,
+    pub path: String,
+    pub size: Option<u64>,
+    pub mime_type: Option<String>,
+    pub content_kind: Option<ReadBinaryFileContentKind>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WriteFileRequest {
     pub path: String,
@@ -326,6 +371,10 @@ pub enum RequestData {
         start_line: u64,
         end_line: u64,
     },
+    ReadBinaryFile {
+        path: String,
+        max_bytes: Option<u64>,
+    },
     WriteFile {
         path: String,
         start_line: u64,
@@ -357,6 +406,13 @@ pub enum RequestUpdate {
         next_start_line: Option<u64>,
         eof: Option<bool>,
         text: String,
+    },
+    ReadBinaryFileResponded {
+        status: ReadBinaryFileStatus,
+        error: Option<String>,
+        size: Option<u64>,
+        mime_type: Option<String>,
+        content_kind: Option<ReadBinaryFileContentKind>,
     },
     WriteFileResponded {
         status: WriteFileStatus,
@@ -621,8 +677,8 @@ impl McpServer {
         self.send_event(UiEventKind::RequestUpdated { id, update });
     }
 
-    fn structured_result<T: Serialize>(
-        summary: String,
+    fn structured_result_with_content<T: Serialize>(
+        content: Vec<rmcp::model::ContentBlock>,
         value: &T,
         is_error: bool,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
@@ -633,12 +689,49 @@ impl McpServer {
             )
         })?;
         let mut result = if is_error {
-            rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(summary)])
+            rmcp::model::CallToolResult::error(content)
         } else {
-            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(summary)])
+            rmcp::model::CallToolResult::success(content)
         };
         result.structured_content = Some(structured_content);
         Ok(result)
+    }
+
+    fn structured_result<T: Serialize>(
+        summary: String,
+        value: &T,
+        is_error: bool,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        Self::structured_result_with_content(
+            vec![rmcp::model::ContentBlock::text(summary)],
+            value,
+            is_error,
+        )
+    }
+
+    fn finish_structured_request_with_content<T: Serialize>(
+        &self,
+        id: RequestId,
+        content: Vec<rmcp::model::ContentBlock>,
+        value: &T,
+        is_error: bool,
+        update: RequestUpdate,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        match Self::structured_result_with_content(content, value, is_error) {
+            Ok(result) => {
+                self.update_request(id, update);
+                Ok(result)
+            }
+            Err(error) => {
+                self.update_request(
+                    id,
+                    RequestUpdate::InternalFailure {
+                        error: error.message.to_string(),
+                    },
+                );
+                Err(error)
+            }
+        }
     }
 
     fn finish_structured_request<T: Serialize>(
@@ -747,6 +840,24 @@ impl McpServer {
         params: rmcp::handler::server::wrapper::Parameters<rmcp::model::JsonObject>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         self.read_file_impl(params).await
+    }
+
+    #[tool(
+        description = "Read a bounded binary file. Images are returned as native MCP image content; other files are returned as native embedded binary resources. The server hard limit is 100 MB.",
+        input_schema = input_schema_for::<ReadBinaryFileRequest>("read_binary_file"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ReadBinaryFileResult>(),
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn read_binary_file(
+        &self,
+        params: rmcp::handler::server::wrapper::Parameters<rmcp::model::JsonObject>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        self.read_binary_file_impl(params).await
     }
 
     #[tool(
