@@ -2,8 +2,8 @@ use crate::mcp::file_path::{RegularFileOpenErrorKind, open_regular_file_with_met
 use crate::mcp::launch_process::{
     ChildOps, CleanupOutcome, DEFAULT_MAX_OUTPUT_BYTES,
     handle_background_wait_result_with_notifier, launch_process_failure_summary,
-    launch_process_summary, perform_cleanup, read_and_truncate_file, report_background_error,
-    validate_request,
+    launch_process_summary, output_progress_snapshot_for_test, perform_cleanup,
+    read_and_truncate_file, report_background_error, validate_request,
 };
 use crate::mcp::ping::PingResult;
 use crate::mcp::read_binary_file::{
@@ -2337,6 +2337,175 @@ fn test_output_truncation_logic() {
 }
 
 #[test]
+fn output_progress_snapshot_counts_lines_and_truncation_exactly() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "rmcp_output_progress_snapshot_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let stdout_path = temp_dir.join("stdout.log");
+    let stderr_path = temp_dir.join("stderr.log");
+    std::fs::write(&stdout_path, b"one\ntwo\nthree").unwrap();
+    std::fs::write(&stderr_path, b"alpha\nbeta\n").unwrap();
+
+    let snapshot = output_progress_snapshot_for_test(
+        stdout_path.to_str().unwrap(),
+        stderr_path.to_str().unwrap(),
+        11,
+    );
+    assert_eq!(snapshot.stdout_lines, 3);
+    assert_eq!(snapshot.stderr_lines, 2);
+    assert!(snapshot.stdout_truncated);
+    assert!(!snapshot.stderr_truncated);
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn foreground_launch_emits_exact_final_progress_before_terminal_update() {
+    let _guard = match ENV_MUTEX.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut req = make_helper_request();
+    req.max_output_bytes = Some(11);
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_ACTION".to_string(),
+        Some("stdout_stderr".to_string()),
+    );
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_STDOUT".to_string(),
+        Some("one\ntwo\nthree".to_string()),
+    );
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_STDERR".to_string(),
+        Some("alpha\nbeta\n".to_string()),
+    );
+
+    let call = rt
+        .block_on(async { server.launch_process(parameters_of(&req)).await })
+        .unwrap();
+    assert_eq!(call.is_error, Some(false));
+
+    let events = rx.try_iter().map(|event| event.kind).collect::<Vec<_>>();
+    let terminal_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                UiEventKind::RequestUpdated {
+                    update: RequestUpdate::LaunchProcessResponded { .. },
+                    ..
+                }
+            )
+        })
+        .expect("terminal launch update");
+    let (progress_index, progress) = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event {
+            UiEventKind::RequestUpdated {
+                update:
+                    RequestUpdate::LaunchProcessOutputProgress {
+                        stdout_lines,
+                        stderr_lines,
+                        stdout_truncated,
+                        stderr_truncated,
+                        ..
+                    },
+                ..
+            } => Some((
+                index,
+                (
+                    *stdout_lines,
+                    *stderr_lines,
+                    *stdout_truncated,
+                    *stderr_truncated,
+                ),
+            )),
+            _ => None,
+        })
+        .next_back()
+        .expect("final output progress update");
+    assert!(progress_index < terminal_index);
+    assert_eq!(progress, (3, 2, true, false));
+}
+
+#[test]
+fn live_output_progress_arrives_before_foreground_process_finishes() {
+    let _guard = match ENV_MUTEX.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut req = make_helper_request();
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_ACTION".to_string(),
+        Some("sleep".to_string()),
+    );
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_SLEEP_MS".to_string(),
+        Some("1500".to_string()),
+    );
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_PARTIAL_STDOUT".to_string(),
+        Some("partial stdout".to_string()),
+    );
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_PARTIAL_STDERR".to_string(),
+        Some("partial stderr".to_string()),
+    );
+
+    rt.block_on(async {
+        let launch = tokio::spawn(async move { server.launch_process(parameters_of(&req)).await });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut saw_live_progress = false;
+        while tokio::time::Instant::now() < deadline {
+            while let Ok(event) = rx.try_recv() {
+                if matches!(
+                    event.kind,
+                    UiEventKind::RequestUpdated {
+                        update: RequestUpdate::LaunchProcessOutputProgress {
+                            stdout_lines: 1..,
+                            stderr_lines: 1..,
+                            ..
+                        },
+                        ..
+                    }
+                ) {
+                    assert!(!launch.is_finished());
+                    saw_live_progress = true;
+                    break;
+                }
+            }
+            if saw_live_progress {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            saw_live_progress,
+            "expected output progress while process was running"
+        );
+        let result = launch.await.unwrap().unwrap();
+        assert_eq!(result.is_error, Some(false));
+    });
+}
+
+#[test]
 fn test_real_helper_truncation() {
     let _guard = match ENV_MUTEX.lock() {
         Ok(g) => g,
@@ -2865,7 +3034,6 @@ fn test_gui_events_launch_process() {
     assert!(matches!(structured.status, LaunchProcessStatus::Completed));
 
     let events: Vec<UiEventKind> = rx.try_iter().map(|e| e.kind).collect();
-    assert_eq!(events.len(), 2);
     let UiEventKind::RequestStarted {
         id,
         request:
@@ -2881,24 +3049,42 @@ fn test_gui_events_launch_process() {
     };
     assert_eq!(command_line, &make_helper_request().process_name);
     assert!(!detached);
-    assert!(matches!(
-        events[1],
-        UiEventKind::RequestUpdated {
-            id: update_id,
-            update: RequestUpdate::LaunchProcessResponded {
-                status: LaunchProcessStatus::Completed,
-                pid,
-                exit_code: Some(0),
-                ref stdout_file,
-                ref stderr_file,
-                ..
-            },
-        } if update_id == id
-            && pid == structured.pid
-            && stdout_file == &structured.stdout_file
-            && stderr_file == &structured.stderr_file
-    ));
 
+    let progress_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                UiEventKind::RequestUpdated {
+                    id: update_id,
+                    update: RequestUpdate::LaunchProcessOutputProgress { .. },
+                } if *update_id == id
+            )
+        })
+        .expect("launch_process progress update");
+    let terminal_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                UiEventKind::RequestUpdated {
+                    id: update_id,
+                    update: RequestUpdate::LaunchProcessResponded {
+                        status: LaunchProcessStatus::Completed,
+                        pid,
+                        exit_code: Some(0),
+                        stdout_file,
+                        stderr_file,
+                        ..
+                    },
+                } if *update_id == id
+                    && *pid == structured.pid
+                    && stdout_file == &structured.stdout_file
+                    && stderr_file == &structured.stderr_file
+            )
+        })
+        .expect("launch_process terminal update");
+    assert!(progress_index < terminal_index);
     let (tx2, rx2) = std::sync::mpsc::channel();
     let server2 = McpServer::new(tx2, Instant::now());
 
@@ -3301,23 +3487,36 @@ fn launch_process_integration_test_over_duplex() {
 
     // 7. Verify correlated GUI request lifecycles.
     let events: Vec<UiEventKind> = rx.try_iter().map(|e| e.kind).collect();
-    assert!(events.windows(2).any(|pair| matches!(
-        pair,
-        [
-            UiEventKind::RequestStarted {
-                id,
-                request: RequestData::LaunchProcess { .. },
-                ..
-            },
+    let (terminal_index, completed_launch_id) = events
+        .iter()
+        .enumerate()
+        .find_map(|(index, event)| match event {
             UiEventKind::RequestUpdated {
-                id: update_id,
-                update: RequestUpdate::LaunchProcessResponded {
-                    status: LaunchProcessStatus::Completed,
-                    exit_code: Some(0),
-                    ..
-                },
-            },
-        ] if id == update_id
+                id,
+                update:
+                    RequestUpdate::LaunchProcessResponded {
+                        status: LaunchProcessStatus::Completed,
+                        exit_code: Some(0),
+                        ..
+                    },
+            } => Some((index, *id)),
+            _ => None,
+        })
+        .expect("completed launch terminal update");
+    assert!(events[..terminal_index].iter().any(|event| matches!(
+        event,
+        UiEventKind::RequestStarted {
+            id,
+            request: RequestData::LaunchProcess { .. },
+            ..
+        } if *id == completed_launch_id
+    )));
+    assert!(events[..terminal_index].iter().any(|event| matches!(
+        event,
+        UiEventKind::RequestUpdated {
+            id,
+            update: RequestUpdate::LaunchProcessOutputProgress { .. },
+        } if *id == completed_launch_id
     )));
     assert!(events.windows(2).any(|pair| matches!(
         pair,

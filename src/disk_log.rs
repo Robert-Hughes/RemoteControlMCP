@@ -46,6 +46,10 @@ impl DiskLog {
             UiEventKind::RequestStarted { id, request, .. } => {
                 self.write("request_started", Some(id.get()), &format_request(request))
             }
+            UiEventKind::RequestUpdated {
+                update: RequestUpdate::LaunchProcessOutputProgress { .. },
+                ..
+            } => {}
             UiEventKind::RequestUpdated { id, update } => {
                 self.write("request_updated", Some(id.get()), &format_update(update))
             }
@@ -144,6 +148,19 @@ mod tests {
                 },
             },
         });
+        log.log_ui_event(&UiEvent {
+            elapsed: Duration::ZERO,
+            kind: UiEventKind::RequestUpdated {
+                id: RequestId(45),
+                update: RequestUpdate::LaunchProcessOutputProgress {
+                    pid: 123,
+                    stdout_lines: 10,
+                    stderr_lines: 2,
+                    stdout_truncated: true,
+                    stderr_truncated: false,
+                },
+            },
+        });
         drop(log);
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -153,6 +170,8 @@ mod tests {
         assert!(text.contains("inline stderr"));
         assert!(text.contains("returned file text"));
         assert!(text.contains("[truncated"));
+        assert!(!text.contains("request_id=45"));
+        assert!(!text.contains("LaunchProcessOutputProgress"));
         assert!(text.len() < MAX_FIELD_CHARS + 1_500);
     }
 

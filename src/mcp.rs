@@ -410,6 +410,13 @@ pub enum RequestUpdate {
         stdout_file: Option<String>,
         stderr_file: Option<String>,
     },
+    LaunchProcessOutputProgress {
+        pid: u32,
+        stdout_lines: u64,
+        stderr_lines: u64,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
+    },
     ReadFileResponded {
         status: ReadFileStatus,
         error: Option<String>,

@@ -82,6 +82,10 @@ struct RequestEntry {
     pid: Option<u32>,
     stdout_file: Option<String>,
     stderr_file: Option<String>,
+    stdout_lines: u64,
+    stderr_lines: u64,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
     background_failure: bool,
 }
 
@@ -306,6 +310,12 @@ fn presentation_for_update(update: RequestUpdate) -> RequestPresentation {
             exit_code,
             ..
         } => launch_process_presentation(status, error, pid, exit_code),
+        RequestUpdate::LaunchProcessOutputProgress { pid, .. } => RequestPresentation {
+            state: RequestState::InProgress,
+            status_text: "In progress".to_string(),
+            detail_text: None,
+            pid: Some(pid),
+        },
         RequestUpdate::ReadFileResponded {
             status,
             error,
@@ -404,10 +414,29 @@ fn apply_request_event(requests: &mut Vec<RequestEntry>, event: UiEvent) {
             pid: None,
             stdout_file: None,
             stderr_file: None,
+            stdout_lines: 0,
+            stderr_lines: 0,
+            stdout_truncated: false,
+            stderr_truncated: false,
             background_failure: false,
         }),
         UiEventKind::RequestUpdated { id, update } => {
             if let Some(request) = requests.iter_mut().rev().find(|request| request.id == id) {
+                if let RequestUpdate::LaunchProcessOutputProgress {
+                    pid,
+                    stdout_lines,
+                    stderr_lines,
+                    stdout_truncated,
+                    stderr_truncated,
+                } = &update
+                {
+                    request.pid = Some(*pid);
+                    request.stdout_lines = *stdout_lines;
+                    request.stderr_lines = *stderr_lines;
+                    request.stdout_truncated = *stdout_truncated;
+                    request.stderr_truncated = *stderr_truncated;
+                    return;
+                }
                 if let RequestUpdate::LaunchProcessResponded {
                     stdout_file,
                     stderr_file,
@@ -474,6 +503,26 @@ fn format_duration(duration: Duration) -> String {
         let seconds = duration.as_secs() % 60;
         format!("{minutes}m {seconds:02}s")
     }
+}
+
+fn launch_output_summary(request: &RequestEntry) -> Option<String> {
+    if !matches!(request.request, RequestData::LaunchProcess { .. }) {
+        return None;
+    }
+
+    let total = request.stdout_lines.saturating_add(request.stderr_lines);
+    let unit = if total == 1 { "line" } else { "lines" };
+    let mut summary = format!(
+        "Output {total} {unit} (stdout {} · stderr {})",
+        request.stdout_lines, request.stderr_lines
+    );
+    match (request.stdout_truncated, request.stderr_truncated) {
+        (true, true) => summary.push_str(" · stdout + stderr truncated"),
+        (true, false) => summary.push_str(" · stdout truncated"),
+        (false, true) => summary.push_str(" · stderr truncated"),
+        (false, false) => {}
+    }
+    Some(summary)
 }
 
 fn request_tool_name(request: &RequestData) -> &'static str {
@@ -680,11 +729,16 @@ fn render_request_row(ui: &mut egui::Ui, request: &RequestEntry, current_elapsed
                 if let Some(tooltip) = request_summary_tooltip(request) {
                     summary.on_hover_text(tooltip);
                 }
-                ui.weak(format!(
+                let mut timing = format!(
                     "Started {} · Duration {}",
                     format_start_time(&request.started_at),
                     format_duration(request.duration(current_elapsed))
-                ));
+                );
+                if let Some(output) = launch_output_summary(request) {
+                    timing.push_str(" · ");
+                    timing.push_str(&output);
+                }
+                ui.weak(timing);
                 if let Some(detail) = &request.detail_text {
                     ui.label(detail);
                 }
@@ -1304,6 +1358,90 @@ mod tests {
     }
 
     #[test]
+    fn launch_output_progress_updates_live_and_after_detached_terminal_response() {
+        let mut requests = Vec::new();
+        apply_request_event(
+            &mut requests,
+            UiEvent {
+                elapsed: Duration::from_secs(2),
+                kind: UiEventKind::RequestStarted {
+                    id: RequestId(7),
+                    request: RequestData::LaunchProcess {
+                        command_line: "worker.exe".to_string(),
+                        working_directory: None,
+                        detached: true,
+                        timeout_ms: None,
+                        timeout_action: None,
+                    },
+                    started_at: Local::now(),
+                },
+            },
+        );
+        apply_request_event(
+            &mut requests,
+            updated_event(
+                7,
+                Duration::from_secs(3),
+                RequestUpdate::LaunchProcessOutputProgress {
+                    pid: 42,
+                    stdout_lines: 5,
+                    stderr_lines: 2,
+                    stdout_truncated: true,
+                    stderr_truncated: false,
+                },
+            ),
+        );
+        assert_eq!(requests[0].state, RequestState::InProgress);
+        assert!(requests[0].finished_duration.is_none());
+        assert_eq!(requests[0].pid, Some(42));
+        assert_eq!(
+            launch_output_summary(&requests[0]).as_deref(),
+            Some("Output 7 lines (stdout 5 · stderr 2) · stdout truncated")
+        );
+
+        apply_request_event(
+            &mut requests,
+            updated_event(
+                7,
+                Duration::from_secs(4),
+                RequestUpdate::LaunchProcessResponded {
+                    status: LaunchProcessStatus::Detached,
+                    error: None,
+                    pid: Some(42),
+                    exit_code: None,
+                    stdout: None,
+                    stderr: None,
+                    stdout_file: Some("stdout.log".to_string()),
+                    stderr_file: Some("stderr.log".to_string()),
+                },
+            ),
+        );
+        assert_eq!(requests[0].state, RequestState::Warning);
+        assert_eq!(requests[0].finished_duration, Some(Duration::from_secs(2)));
+
+        apply_request_event(
+            &mut requests,
+            updated_event(
+                7,
+                Duration::from_secs(6),
+                RequestUpdate::LaunchProcessOutputProgress {
+                    pid: 42,
+                    stdout_lines: 8,
+                    stderr_lines: 3,
+                    stdout_truncated: true,
+                    stderr_truncated: true,
+                },
+            ),
+        );
+        assert_eq!(requests[0].state, RequestState::Warning);
+        assert_eq!(requests[0].finished_duration, Some(Duration::from_secs(2)));
+        assert_eq!(
+            launch_output_summary(&requests[0]).as_deref(),
+            Some("Output 11 lines (stdout 8 · stderr 3) · stdout + stderr truncated")
+        );
+    }
+
+    #[test]
     fn background_failure_before_launch_response_is_sticky() {
         let mut requests = Vec::new();
         apply_request_event(
@@ -1553,6 +1691,10 @@ mod tests {
             pid: Some(42),
             stdout_file: None,
             stderr_file: None,
+            stdout_lines: 0,
+            stderr_lines: 0,
+            stdout_truncated: false,
+            stderr_truncated: false,
             background_failure: false,
         };
         assert_eq!(

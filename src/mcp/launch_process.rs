@@ -14,6 +14,208 @@ use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 * 1024;
+const OUTPUT_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct OutputProgressSnapshot {
+    pub stdout_lines: u64,
+    pub stderr_lines: u64,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
+#[derive(Default)]
+struct StreamLineCounter {
+    offset: u64,
+    newline_count: u64,
+    last_byte: Option<u8>,
+    file_len: u64,
+}
+
+impl StreamLineCounter {
+    fn refresh(&mut self, path: &str) -> std::io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        if len < self.offset {
+            self.offset = 0;
+            self.newline_count = 0;
+            self.last_byte = None;
+        }
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            for byte in &buffer[..read] {
+                if *byte == b'\n' {
+                    self.newline_count = self.newline_count.saturating_add(1);
+                }
+                self.last_byte = Some(*byte);
+            }
+            self.offset = self.offset.saturating_add(read as u64);
+        }
+        self.file_len = len.max(self.offset);
+        Ok(())
+    }
+
+    fn lines(&self) -> u64 {
+        self.newline_count
+            .saturating_add(u64::from(self.offset > 0 && self.last_byte != Some(b'\n')))
+    }
+}
+
+#[derive(Default)]
+struct OutputProgressState {
+    stdout: StreamLineCounter,
+    stderr: StreamLineCounter,
+    last_sent: Option<OutputProgressSnapshot>,
+}
+
+struct OutputProgressShared {
+    state: std::sync::Mutex<OutputProgressState>,
+    stdout_path: String,
+    stderr_path: String,
+    max_output_bytes: usize,
+    pid: u32,
+    tx: Sender<UiEvent>,
+    start_time: Instant,
+    request_id: RequestId,
+}
+
+fn refresh_output_progress(
+    state: &mut OutputProgressState,
+    stdout_path: &str,
+    stderr_path: &str,
+    max_output_bytes: usize,
+) -> OutputProgressSnapshot {
+    let _ = state.stdout.refresh(stdout_path);
+    let _ = state.stderr.refresh(stderr_path);
+    OutputProgressSnapshot {
+        stdout_lines: state.stdout.lines(),
+        stderr_lines: state.stderr.lines(),
+        stdout_truncated: state.stdout.file_len > max_output_bytes as u64,
+        stderr_truncated: state.stderr.file_len > max_output_bytes as u64,
+    }
+}
+
+fn emit_output_progress(shared: &OutputProgressShared) {
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let progress = refresh_output_progress(
+        &mut state,
+        &shared.stdout_path,
+        &shared.stderr_path,
+        shared.max_output_bytes,
+    );
+    if state.last_sent == Some(progress) {
+        return;
+    }
+    let _ = shared.tx.send(UiEvent {
+        elapsed: shared.start_time.elapsed(),
+        kind: UiEventKind::RequestUpdated {
+            id: shared.request_id,
+            update: RequestUpdate::LaunchProcessOutputProgress {
+                pid: shared.pid,
+                stdout_lines: progress.stdout_lines,
+                stderr_lines: progress.stderr_lines,
+                stdout_truncated: progress.stdout_truncated,
+                stderr_truncated: progress.stderr_truncated,
+            },
+        },
+    });
+    state.last_sent = Some(progress);
+}
+
+#[derive(Clone)]
+struct OutputProgressCompletion {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shared: std::sync::Arc<OutputProgressShared>,
+}
+
+impl OutputProgressCompletion {
+    fn finish(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        emit_output_progress(&self.shared);
+    }
+}
+
+struct OutputProgressMonitor {
+    completion: OutputProgressCompletion,
+    finish_on_drop: bool,
+}
+
+impl OutputProgressMonitor {
+    fn completion_handle(&self) -> OutputProgressCompletion {
+        self.completion.clone()
+    }
+
+    fn disarm(&mut self) {
+        self.finish_on_drop = false;
+    }
+}
+
+impl Drop for OutputProgressMonitor {
+    fn drop(&mut self) {
+        if self.finish_on_drop {
+            self.completion.finish();
+        }
+    }
+}
+
+fn start_output_progress_monitor(
+    stdout_path: String,
+    stderr_path: String,
+    max_output_bytes: usize,
+    pid: u32,
+    tx: Sender<UiEvent>,
+    start_time: Instant,
+    request_id: RequestId,
+) -> OutputProgressMonitor {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shared = std::sync::Arc::new(OutputProgressShared {
+        state: std::sync::Mutex::new(OutputProgressState::default()),
+        stdout_path,
+        stderr_path,
+        max_output_bytes,
+        pid,
+        tx,
+        start_time,
+        request_id,
+    });
+    let monitor_stop = stop.clone();
+    let monitor_shared = shared.clone();
+    let _ = std::thread::Builder::new()
+        .name(format!("mcp-output-{pid}"))
+        .spawn(move || {
+            loop {
+                emit_output_progress(&monitor_shared);
+                if monitor_stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(OUTPUT_PROGRESS_INTERVAL);
+            }
+        });
+    OutputProgressMonitor {
+        completion: OutputProgressCompletion { stop, shared },
+        finish_on_drop: true,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn output_progress_snapshot_for_test(
+    stdout_path: &str,
+    stderr_path: &str,
+    max_output_bytes: usize,
+) -> OutputProgressSnapshot {
+    let mut state = OutputProgressState::default();
+    refresh_output_progress(&mut state, stdout_path, stderr_path, max_output_bytes)
+}
 
 fn generate_output_files() -> Result<(std::fs::File, std::fs::File, String, String), std::io::Error>
 {
@@ -303,17 +505,22 @@ pub(crate) fn handle_background_wait_result_with_notifier<F>(
     }
 }
 
+struct BackgroundReaperOptions {
+    thread_name: String,
+    context: &'static str,
+    output_completion: Option<OutputProgressCompletion>,
+}
+
 fn spawn_background_reaper(
     child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
     pid: u32,
     tx: Sender<UiEvent>,
     start_time: Instant,
     request_id: RequestId,
-    thread_name: String,
-    context: &'static str,
+    options: BackgroundReaperOptions,
 ) -> std::io::Result<()> {
     std::thread::Builder::new()
-        .name(thread_name)
+        .name(options.thread_name)
         .spawn(move || {
             let child = child
                 .lock()
@@ -327,13 +534,15 @@ fn spawn_background_reaper(
                     &tx,
                     start_time,
                     request_id,
-                    context,
+                    options.context,
                 );
+            }
+            if let Some(completion) = options.output_completion {
+                completion.finish();
             }
         })
         .map(|_| ())
 }
-
 #[derive(Clone, Copy)]
 struct BackgroundContext<'a> {
     tx: &'a Sender<UiEvent>,
@@ -619,8 +828,11 @@ fn cleanup_child(
                 tx,
                 start_time,
                 request_id,
-                format!("mcp-reaper-cleanup-{pid}"),
-                "Cleanup reaper failed",
+                BackgroundReaperOptions {
+                    thread_name: format!("mcp-reaper-cleanup-{pid}"),
+                    context: "Cleanup reaper failed",
+                    output_completion: None,
+                },
             )
         },
     );
@@ -899,20 +1111,34 @@ fn execute_launch_process_blocking(
     };
 
     let pid = child.id();
+    let mut output_monitor = start_output_progress_monitor(
+        stdout_path.clone(),
+        stderr_path.clone(),
+        max_output_bytes,
+        pid,
+        tx.clone(),
+        start_time,
+        request_id,
+    );
     let child_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
-
     match (req.detached, req.timeout_ms, req.timeout_action) {
         (true, None, None) => {
+            let output_completion = Some(output_monitor.completion_handle());
             let reaper_spawn = spawn_background_reaper(
                 child_arc.clone(),
                 pid,
                 tx.clone(),
                 start_time,
                 request_id,
-                format!("mcp-reaper-{pid}"),
-                "Detached reaper failed",
+                BackgroundReaperOptions {
+                    thread_name: format!("mcp-reaper-{pid}"),
+                    context: "Detached reaper failed",
+                    output_completion,
+                },
             );
-
+            if reaper_spawn.is_ok() {
+                output_monitor.disarm();
+            }
             match reaper_spawn {
                 Ok(_) => LaunchProcessResult {
                     status: LaunchProcessStatus::Detached,
@@ -974,6 +1200,7 @@ fn execute_launch_process_blocking(
             let monitor_stdout = stdout_path.clone();
             let monitor_stderr = stderr_path.clone();
             let tx_clone = tx.clone();
+            let monitor_output = Some(output_monitor.completion_handle());
             let monitor_spawn = std::thread::Builder::new()
                 .name(format!("mcp-monitor-{}", pid))
                 .spawn(move || {
@@ -1065,8 +1292,14 @@ fn execute_launch_process_blocking(
                             }
                         }
                     }
+                    if let Some(completion) = monitor_output {
+                        completion.finish();
+                    }
                 });
 
+            if monitor_spawn.is_ok() {
+                output_monitor.disarm();
+            }
             match monitor_spawn {
                 Ok(_) => LaunchProcessResult {
                     status: LaunchProcessStatus::DetachedWithStopTimeout,
@@ -1203,16 +1436,22 @@ fn execute_launch_process_blocking(
                     stderr_file: Some(stderr_path),
                 }
             } else {
+                let output_completion = Some(output_monitor.completion_handle());
                 let reaper_spawn = spawn_background_reaper(
                     child_arc.clone(),
                     pid,
                     tx.clone(),
                     start_time,
                     request_id,
-                    format!("mcp-reaper-{pid}"),
-                    "Timeout-detach reaper failed",
+                    BackgroundReaperOptions {
+                        thread_name: format!("mcp-reaper-{pid}"),
+                        context: "Timeout-detach reaper failed",
+                        output_completion,
+                    },
                 );
-
+                if reaper_spawn.is_ok() {
+                    output_monitor.disarm();
+                }
                 match reaper_spawn {
                     Ok(_) => LaunchProcessResult {
                         status: LaunchProcessStatus::TimedOutDetached,
