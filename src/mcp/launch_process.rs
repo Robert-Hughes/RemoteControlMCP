@@ -13,6 +13,8 @@ use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+pub(crate) const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 * 1024;
+
 fn generate_output_files() -> Result<(std::fs::File, std::fs::File, String, String), std::io::Error>
 {
     let dir = std::env::temp_dir().join("RemoteControlMCP");
@@ -46,7 +48,10 @@ fn generate_output_files() -> Result<(std::fs::File, std::fs::File, String, Stri
     Ok((stdout_file, stderr_file, stdout_str, stderr_str))
 }
 
-pub fn read_and_truncate_file(path: &str) -> Result<String, std::io::Error> {
+pub fn read_and_truncate_file(
+    path: &str,
+    max_output_bytes: usize,
+) -> Result<String, std::io::Error> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut file = std::fs::File::open(path)?;
@@ -57,22 +62,23 @@ pub fn read_and_truncate_file(path: &str) -> Result<String, std::io::Error> {
         return Ok(String::new());
     }
 
-    let limit = 1024usize;
-    let (to_read, truncated) = if len > limit as u64 {
-        (limit, true)
+    let (to_read, truncated) = if len > max_output_bytes as u64 {
+        (max_output_bytes, true)
     } else {
         (len as usize, false)
     };
 
     let mut buffer = vec![0u8; to_read];
     if truncated {
-        file.seek(SeekFrom::End(-(limit as i64)))?;
+        file.seek(SeekFrom::Start(len - max_output_bytes as u64))?;
     }
     file.read_exact(&mut buffer)?;
 
     let decoded = String::from_utf8_lossy(&buffer).into_owned();
     if truncated {
-        Ok(format!("[... beginning truncated ...]\n{}", decoded))
+        Ok(format!(
+            "[... beginning truncated; full output available in {path} ...]\n{decoded}"
+        ))
     } else {
         Ok(decoded)
     }
@@ -84,16 +90,16 @@ struct FinalOutput {
     stderr: Option<String>,
 }
 
-fn read_final_output(stdout_path: &str, stderr_path: &str) -> FinalOutput {
+fn read_final_output(stdout_path: &str, stderr_path: &str, max_output_bytes: usize) -> FinalOutput {
     let mut errors = Vec::new();
-    let stdout = match read_and_truncate_file(stdout_path) {
+    let stdout = match read_and_truncate_file(stdout_path, max_output_bytes) {
         Ok(output) => Some(output),
         Err(error) => {
             errors.push(format!("Failed to read stdout: {error}"));
             None
         }
     };
-    let stderr = match read_and_truncate_file(stderr_path) {
+    let stderr = match read_and_truncate_file(stderr_path, max_output_bytes) {
         Ok(output) => Some(output),
         Err(error) => {
             errors.push(format!("Failed to read stderr: {error}"));
@@ -165,9 +171,17 @@ pub(crate) fn validate_request(req: &LaunchProcessRequest) -> Result<(), String>
         }
     }
 
+    if let Some(max_output_bytes) = req.max_output_bytes {
+        if max_output_bytes == 0 {
+            return Err("max_output_bytes must be greater than zero".to_string());
+        }
+        if usize::try_from(max_output_bytes).is_err() {
+            return Err("max_output_bytes is too large for this platform".to_string());
+        }
+    }
+
     Ok(())
 }
-
 fn command_line_for_display(req: &LaunchProcessRequest) -> String {
     let mut command_line = req.process_name.clone();
 
@@ -326,14 +340,48 @@ struct BackgroundContext<'a> {
     start_time: Instant,
     request_id: RequestId,
 }
-
+#[cfg(test)]
 pub(crate) fn perform_cleanup<C, F>(
+    child: C,
+    pid: u32,
+    original_error: &str,
+    is_timeout_stop: bool,
+    stdout_path: &str,
+    stderr_path: &str,
+    spawn_reaper_fn: F,
+) -> (
+    LaunchProcessStatus,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+    Option<String>,
+    CleanupOutcome,
+)
+where
+    C: ChildOps + Send + 'static,
+    F: FnOnce(C) -> Result<(), std::io::Error>,
+{
+    perform_cleanup_with_limit(
+        child,
+        pid,
+        original_error,
+        is_timeout_stop,
+        stdout_path,
+        stderr_path,
+        DEFAULT_MAX_OUTPUT_BYTES,
+        spawn_reaper_fn,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn perform_cleanup_with_limit<C, F>(
     mut child: C,
     pid: u32,
     original_error: &str,
     is_timeout_stop: bool,
     stdout_path: &str,
     stderr_path: &str,
+    max_output_bytes: usize,
     spawn_reaper_fn: F,
 ) -> (
     LaunchProcessStatus,
@@ -515,7 +563,7 @@ where
         status,
         LaunchProcessStatus::TimedOutStopped | LaunchProcessStatus::Completed
     ) {
-        let final_output = read_final_output(stdout_path, stderr_path);
+        let final_output = read_final_output(stdout_path, stderr_path, max_output_bytes);
         let error = match (outcome, final_output.error) {
             (CleanupOutcome::KillFailedChildExited, Some(read_error)) => {
                 Some(format!("{err_msg} {read_error}"))
@@ -536,6 +584,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cleanup_child(
     child: std::process::Child,
     pid: u32,
@@ -543,6 +592,7 @@ fn cleanup_child(
     is_timeout_stop: bool,
     stdout_path: &str,
     stderr_path: &str,
+    max_output_bytes: usize,
     background: BackgroundContext<'_>,
 ) -> (
     LaunchProcessStatus,
@@ -554,13 +604,14 @@ fn cleanup_child(
     let tx = background.tx.clone();
     let start_time = background.start_time;
     let request_id = background.request_id;
-    let (status, err, exit_code, stdout, stderr, _outcome) = perform_cleanup(
+    let (status, err, exit_code, stdout, stderr, _outcome) = perform_cleanup_with_limit(
         child,
         pid,
         original_error,
         is_timeout_stop,
         stdout_path,
         stderr_path,
+        max_output_bytes,
         move |child| {
             spawn_background_reaper(
                 std::sync::Arc::new(std::sync::Mutex::new(Some(child))),
@@ -779,6 +830,10 @@ fn execute_launch_process_blocking(
     start_time: Instant,
     request_id: RequestId,
 ) -> LaunchProcessResult {
+    let max_output_bytes = req
+        .max_output_bytes
+        .map(|value| usize::try_from(value).expect("validated max_output_bytes must fit usize"))
+        .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES);
     let (stdout_file, stderr_file, stdout_path, stderr_path) = match generate_output_files() {
         Ok(files) => files,
         Err(e) => {
@@ -881,6 +936,7 @@ fn execute_launch_process_blocking(
                             false,
                             &stdout_path,
                             &stderr_path,
+                            max_output_bytes,
                             BackgroundContext {
                                 tx: &tx,
                                 start_time,
@@ -962,6 +1018,7 @@ fn execute_launch_process_blocking(
                                     true,
                                     &monitor_stdout,
                                     &monitor_stderr,
+                                    max_output_bytes,
                                     BackgroundContext {
                                         tx: &tx_clone,
                                         start_time,
@@ -994,6 +1051,7 @@ fn execute_launch_process_blocking(
                                     false,
                                     &monitor_stdout,
                                     &monitor_stderr,
+                                    max_output_bytes,
                                     BackgroundContext {
                                         tx: &tx_clone,
                                         start_time,
@@ -1032,6 +1090,7 @@ fn execute_launch_process_blocking(
                             false,
                             &stdout_path,
                             &stderr_path,
+                            max_output_bytes,
                             BackgroundContext {
                                 tx: &tx,
                                 start_time,
@@ -1094,6 +1153,7 @@ fn execute_launch_process_blocking(
                                         false,
                                         &stdout_path,
                                         &stderr_path,
+                                        max_output_bytes,
                                         BackgroundContext {
                                             tx: &tx,
                                             start_time,
@@ -1130,7 +1190,7 @@ fn execute_launch_process_blocking(
             }
 
             if exited {
-                let final_output = read_final_output(&stdout_path, &stderr_path);
+                let final_output = read_final_output(&stdout_path, &stderr_path, max_output_bytes);
 
                 LaunchProcessResult {
                     status: LaunchProcessStatus::Completed,
@@ -1178,6 +1238,7 @@ fn execute_launch_process_blocking(
                                 false,
                                 &stdout_path,
                                 &stderr_path,
+                                max_output_bytes,
                                 BackgroundContext {
                                     tx: &tx,
                                     start_time,
@@ -1241,6 +1302,7 @@ fn execute_launch_process_blocking(
                                         false,
                                         &stdout_path,
                                         &stderr_path,
+                                        max_output_bytes,
                                         BackgroundContext {
                                             tx: &tx,
                                             start_time,
@@ -1277,7 +1339,7 @@ fn execute_launch_process_blocking(
             }
 
             if exited {
-                let final_output = read_final_output(&stdout_path, &stderr_path);
+                let final_output = read_final_output(&stdout_path, &stderr_path, max_output_bytes);
 
                 LaunchProcessResult {
                     status: LaunchProcessStatus::Completed,
@@ -1300,6 +1362,7 @@ fn execute_launch_process_blocking(
                         true,
                         &stdout_path,
                         &stderr_path,
+                        max_output_bytes,
                         BackgroundContext {
                             tx: &tx,
                             start_time,
@@ -1338,7 +1401,8 @@ fn execute_launch_process_blocking(
                 let wait_res = child.wait();
                 match wait_res {
                     Ok(status) => {
-                        let final_output = read_final_output(&stdout_path, &stderr_path);
+                        let final_output =
+                            read_final_output(&stdout_path, &stderr_path, max_output_bytes);
 
                         LaunchProcessResult {
                             status: LaunchProcessStatus::Completed,
@@ -1360,6 +1424,7 @@ fn execute_launch_process_blocking(
                             false,
                             &stdout_path,
                             &stderr_path,
+                            max_output_bytes,
                             BackgroundContext {
                                 tx: &tx,
                                 start_time,

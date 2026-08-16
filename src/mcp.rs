@@ -330,6 +330,14 @@ pub enum TimeoutAction {
     Stop,
 }
 
+fn launch_process_max_output_bytes_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "integer",
+        "minimum": 1,
+        "description": "Maximum number of bytes returned inline for each of stdout and stderr. Defaults to 16384 bytes. If a stream exceeds this limit, its beginning is truncated from the inline result; the complete output remains available in the corresponding stdout_file or stderr_file."
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LaunchProcessRequest {
     pub working_directory: Option<String>,
@@ -345,6 +353,10 @@ pub struct LaunchProcessRequest {
     pub detached: bool,
     pub timeout_ms: Option<u64>,
     pub timeout_action: Option<TimeoutAction>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "launch_process_max_output_bytes_schema")]
+    pub max_output_bytes: Option<u64>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RequestId(pub(crate) u64);

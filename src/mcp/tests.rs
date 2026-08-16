@@ -1,8 +1,9 @@
 use crate::mcp::file_path::{RegularFileOpenErrorKind, open_regular_file_with_metadata};
 use crate::mcp::launch_process::{
-    ChildOps, CleanupOutcome, handle_background_wait_result_with_notifier,
-    launch_process_failure_summary, launch_process_summary, perform_cleanup,
-    read_and_truncate_file, report_background_error, validate_request,
+    ChildOps, CleanupOutcome, DEFAULT_MAX_OUTPUT_BYTES,
+    handle_background_wait_result_with_notifier, launch_process_failure_summary,
+    launch_process_summary, perform_cleanup, read_and_truncate_file, report_background_error,
+    validate_request,
 };
 use crate::mcp::ping::PingResult;
 use crate::mcp::read_binary_file::{
@@ -546,6 +547,7 @@ fn make_helper_request() -> LaunchProcessRequest {
         detached: false,
         timeout_ms: None,
         timeout_action: None,
+        max_output_bytes: None,
     }
 }
 
@@ -1776,6 +1778,14 @@ fn test_validation() {
     req.timeout_action = Some(TimeoutAction::Detach);
     assert!(validate_request(&req).is_err());
 
+    // 14. max_output_bytes = 0
+    let mut req = base_req.clone();
+    req.max_output_bytes = Some(0);
+    assert_eq!(
+        validate_request(&req).unwrap_err(),
+        "max_output_bytes must be greater than zero"
+    );
+
     // Valid request validation test
     let req = base_req.clone();
     assert!(validate_request(&req).is_ok());
@@ -1829,6 +1839,18 @@ fn test_schema_arguments() {
 }
 
 #[test]
+fn test_schema_max_output_bytes() {
+    let attr = McpServer::launch_process_tool_attr();
+    let schema = &attr.input_schema["properties"]["max_output_bytes"];
+    assert_eq!(schema["type"], "integer");
+    assert_eq!(schema["minimum"], 1);
+    assert!(schema.get("default").is_none());
+    let description = schema["description"].as_str().unwrap();
+    assert!(description.contains("Defaults to 16384 bytes"));
+    assert!(description.contains("stdout_file or stderr_file"));
+}
+
+#[test]
 fn test_schema_required_fields() {
     let attr = McpServer::launch_process_tool_attr();
     let required = attr
@@ -1841,8 +1863,9 @@ fn test_schema_required_fields() {
     let required_fields: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
 
     // arguments must NOT be in required
+    // Optional fields must NOT be required.
     assert!(!required_fields.contains(&"arguments"));
-
+    assert!(!required_fields.contains(&"max_output_bytes"));
     // process_name, environment, detached must be in required
     assert!(required_fields.contains(&"process_name"));
     assert!(required_fields.contains(&"environment"));
@@ -2067,6 +2090,7 @@ fn test_successful_completion_without_arguments() {
         detached: false,
         timeout_ms: None,
         timeout_action: None,
+        max_output_bytes: None,
     };
 
     assert!(validate_request(&req).is_ok());
@@ -2268,46 +2292,46 @@ fn test_output_truncation_logic() {
     std::fs::create_dir_all(&temp_dir).unwrap();
     let file_path = temp_dir.join("test_trunc.txt");
     let file_path_str = file_path.to_string_lossy().into_owned();
+    let limit = 1024;
+    let marker =
+        format!("[... beginning truncated; full output available in {file_path_str} ...]\n");
 
-    // 1. Empty output
     std::fs::write(&file_path, "").unwrap();
-    let res = read_and_truncate_file(&file_path_str).unwrap();
-    assert_eq!(res, "");
+    assert_eq!(read_and_truncate_file(&file_path_str, limit).unwrap(), "");
 
-    // 2. Output shorter than 1024 bytes
     let short_data = "Hello World!";
     std::fs::write(&file_path, short_data).unwrap();
-    let res = read_and_truncate_file(&file_path_str).unwrap();
-    assert_eq!(res, short_data);
+    assert_eq!(
+        read_and_truncate_file(&file_path_str, limit).unwrap(),
+        short_data
+    );
 
-    // 3. Output exactly 1024 bytes
-    let exact_data = "X".repeat(1024);
+    let exact_data = "X".repeat(limit);
     std::fs::write(&file_path, &exact_data).unwrap();
-    let res = read_and_truncate_file(&file_path_str).unwrap();
-    assert_eq!(res, exact_data);
+    assert_eq!(
+        read_and_truncate_file(&file_path_str, limit).unwrap(),
+        exact_data
+    );
 
-    // 4. Output 1025 bytes
-    let data_1025 = "Y".repeat(1025);
-    std::fs::write(&file_path, &data_1025).unwrap();
-    let res = read_and_truncate_file(&file_path_str).unwrap();
-    assert!(res.starts_with("[... beginning truncated ...]\n"));
-    let retained = res.strip_prefix("[... beginning truncated ...]\n").unwrap();
-    assert_eq!(retained, &data_1025[1..]);
+    let over_limit = "Y".repeat(limit + 1);
+    std::fs::write(&file_path, &over_limit).unwrap();
+    let result = read_and_truncate_file(&file_path_str, limit).unwrap();
+    let retained = result.strip_prefix(&marker).unwrap();
+    assert_eq!(retained, &over_limit[1..]);
 
-    // 5. Much larger output
     let mut large_data = "Z".repeat(5000);
     large_data.push_str("TAIL_INFO");
     std::fs::write(&file_path, &large_data).unwrap();
-    let res = read_and_truncate_file(&file_path_str).unwrap();
-    assert!(res.starts_with("[... beginning truncated ...]\n"));
-    let retained = res.strip_prefix("[... beginning truncated ...]\n").unwrap();
-    assert_eq!(retained.len(), 1024);
+    let result = read_and_truncate_file(&file_path_str, limit).unwrap();
+    let retained = result.strip_prefix(&marker).unwrap();
+    assert_eq!(retained.len(), limit);
     assert!(retained.ends_with("TAIL_INFO"));
 
-    // 6. Lossy UTF-8 conversion for invalid byte sequences
     std::fs::write(&file_path, [0xff, 0xff, 0xff, 0xff]).unwrap();
-    let res = read_and_truncate_file(&file_path_str).unwrap();
-    assert_eq!(res, "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}");
+    assert_eq!(
+        read_and_truncate_file(&file_path_str, limit).unwrap(),
+        "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}"
+    );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
@@ -2325,6 +2349,7 @@ fn test_real_helper_truncation() {
         .unwrap();
 
     let mut req = make_helper_request();
+    req.max_output_bytes = Some(1024);
     req.environment.variables.insert(
         "RMCP_TEST_HELPER_ACTION".to_string(),
         Some("large_output".to_string()),
@@ -2353,30 +2378,23 @@ fn test_real_helper_truncation() {
     let res = rt.block_on(async { server.execute_launch_process(req).await });
     assert!(matches!(res.status, LaunchProcessStatus::Completed));
 
-    assert!(
-        res.stdout
-            .as_ref()
-            .unwrap()
-            .starts_with("[... beginning truncated ...]\n")
-    );
-    assert!(
-        res.stderr
-            .as_ref()
-            .unwrap()
-            .starts_with("[... beginning truncated ...]\n")
-    );
-
+    let stdout_file = res.stdout_file.as_ref().unwrap();
+    let stderr_file = res.stderr_file.as_ref().unwrap();
+    let stdout_marker =
+        format!("[... beginning truncated; full output available in {stdout_file} ...]\n");
+    let stderr_marker =
+        format!("[... beginning truncated; full output available in {stderr_file} ...]\n");
     let stdout_retained = res
         .stdout
         .as_ref()
         .unwrap()
-        .strip_prefix("[... beginning truncated ...]\n")
+        .strip_prefix(&stdout_marker)
         .unwrap();
     let stderr_retained = res
         .stderr
         .as_ref()
         .unwrap()
-        .strip_prefix("[... beginning truncated ...]\n")
+        .strip_prefix(&stderr_marker)
         .unwrap();
 
     assert_eq!(stdout_retained.len(), 1024);
@@ -2384,15 +2402,69 @@ fn test_real_helper_truncation() {
     assert!(stdout_retained.trim().ends_with("END_OF_STDOUT"));
     assert!(stderr_retained.trim().ends_with("END_OF_STDERR"));
 
-    let stdout_file = res.stdout_file.unwrap();
-    let stderr_file = res.stderr_file.unwrap();
-    let stdout_full = std::fs::read_to_string(&stdout_file).unwrap();
-    let stderr_full = std::fs::read_to_string(&stderr_file).unwrap();
-
+    let stdout_full = std::fs::read_to_string(stdout_file).unwrap();
+    let stderr_full = std::fs::read_to_string(stderr_file).unwrap();
     assert_eq!(stdout_full.trim().len(), 2013);
     assert_eq!(stderr_full.trim().len(), 2013);
     assert!(stdout_full.starts_with("AAAA"));
     assert!(stderr_full.starts_with("BBBB"));
+}
+
+#[test]
+fn test_default_output_limit_is_16_kib() {
+    let _guard = match ENV_MUTEX.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+
+    let mut req = make_helper_request();
+    assert_eq!(req.max_output_bytes, None);
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_ACTION".to_string(),
+        Some("large_output".to_string()),
+    );
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_COUNT".to_string(),
+        Some((DEFAULT_MAX_OUTPUT_BYTES + 100).to_string()),
+    );
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_STDOUT_CHAR".to_string(),
+        Some("C".to_string()),
+    );
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_STDERR_CHAR".to_string(),
+        Some("D".to_string()),
+    );
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_STDOUT_TAIL".to_string(),
+        Some("DEFAULT_STDOUT_TAIL".to_string()),
+    );
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_STDERR_TAIL".to_string(),
+        Some("DEFAULT_STDERR_TAIL".to_string()),
+    );
+
+    let res = rt.block_on(async { server.execute_launch_process(req).await });
+    assert!(matches!(res.status, LaunchProcessStatus::Completed));
+    for (inline, file) in [
+        (
+            res.stdout.as_ref().unwrap(),
+            res.stdout_file.as_ref().unwrap(),
+        ),
+        (
+            res.stderr.as_ref().unwrap(),
+            res.stderr_file.as_ref().unwrap(),
+        ),
+    ] {
+        let marker = format!("[... beginning truncated; full output available in {file} ...]\n");
+        let retained = inline.strip_prefix(&marker).unwrap();
+        assert_eq!(retained.len(), DEFAULT_MAX_OUTPUT_BYTES);
+    }
 }
 
 #[test]
@@ -2841,6 +2913,7 @@ fn test_gui_events_launch_process() {
         detached: false,
         timeout_ms: None,
         timeout_action: None,
+        max_output_bytes: None,
     });
 
     let call_res = rt.block_on(async { server2.launch_process(params).await });
@@ -2886,6 +2959,7 @@ fn launch_process_events_include_command_line_but_exclude_environment_and_output
         detached: false,
         timeout_ms: Some(1),
         timeout_action: None,
+        max_output_bytes: None,
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
