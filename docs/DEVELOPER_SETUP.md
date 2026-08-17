@@ -26,7 +26,7 @@ The application and the `tunnel-client` daemon both store configuration in the p
 | Automatic-start setting | `%APPDATA%\RemoteControlMCP\start-tunnel-automatically.txt` | `~/.config/RemoteControlMCP/start-tunnel-automatically.txt` | `~/.config/RemoteControlMCP/start-tunnel-automatically.txt` |
 | Runtime key file | `%APPDATA%\tunnel-client\remote-control-mcp.key` | `~/.config/tunnel-client/remote-control-mcp.key` | `~/.config/tunnel-client/remote-control-mcp.key` |
 | Tunnel profile | `%APPDATA%\tunnel-client\remote-control-mcp.yaml` | `~/.config/tunnel-client/remote-control-mcp.yaml` | `~/.config/tunnel-client/remote-control-mcp.yaml` |
-| Tunnel logs | `%TEMP%\RemoteControlMCP` | `$TMPDIR/RemoteControlMCP` (usually `/tmp`) | `/tmp/RemoteControlMCP` |
+| Tunnel logs | `%TEMP%\RemoteControlMCP` | `$TMPDIR/RemoteControlMCP` (normally beneath `/var/folders`) | `/tmp/RemoteControlMCP` |
 
 These are the same user-config locations the `tunnel-client` daemon uses for its own profiles, so the runtime key file is shared between the manual CLI flow and the GUI launch button. The tunnel client resolves its profile directory as `$XDG_CONFIG_HOME/tunnel-client` when that variable is set, otherwise `~/.config/tunnel-client`, and only falls back to the operating system's user-config directory (such as `%APPDATA%` on Windows) when `HOME` is unset. On macOS `HOME` is always set, so `~/.config` applies there too.
 
@@ -79,21 +79,39 @@ Before starting, ensure you have:
 The tunnel client CLI is distributed by OpenAI from two places:
 
 * The [Platform Tunnels console](https://platform.openai.com/settings/organization/tunnels): use the download link there, which always points at the currently supported release.
-* The [latest public release on GitHub](https://github.com/openai/tunnel-client/releases/latest): releases are tagged with plain semantic versions (such as `v0.0.10`) and ship archives for Linux (amd64/arm64), macOS (amd64/arm64), and Windows (amd64/arm64). On macOS the client is also published to the `openai/homebrew-tools` Homebrew tap.
+* The [latest public release on GitHub](https://github.com/openai/tunnel-client/releases/latest): releases are tagged with plain semantic versions and ship archives for Linux (amd64/arm64), macOS (amd64/arm64), and Windows (amd64/arm64). On macOS the client is also published in the official `openai/tools` Homebrew tap.
 
 The [official Secure MCP Tunnels guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) is the canonical reference for the whole flow.
 
-Download the client on the same machine that runs the local MCP application, then extract it and confirm it runs:
+Install the client on the same machine that runs the local MCP application.
+
+**macOS (recommended — Homebrew):**
+
+```bash
+brew install openai/tools/tunnel-client
+TunnelClient="$(command -v tunnel-client)"
+test -x "$TunnelClient"
+tunnel-client --version
+tunnel-client help quickstart
+```
+
+Homebrew installs the command at `/opt/homebrew/bin/tunnel-client` on Apple silicon and `/usr/local/bin/tunnel-client` on Intel Macs. Using `command -v` keeps the rest of this guide correct for either architecture. Upgrade it later with:
+
+```bash
+brew upgrade openai/tools/tunnel-client
+```
+
+If Homebrew is not installed, install it from [brew.sh](https://brew.sh), or use the macOS archive from the latest public release. For a manually downloaded macOS binary, make it executable with `chmod +x /path/to/tunnel-client`.
 
 **Windows:** the executable is `tunnel-client.exe`.
 
-**macOS / Linux:** the executable is `tunnel-client`. Make it executable first:
+**Linux:** extract the archive for the machine architecture, then make the executable runnable:
 
 ```bash
 chmod +x /path/to/tunnel-client
 ```
 
-In every case, confirm the binary works: `tunnel-client --version` prints the release version, and `tunnel-client help quickstart` is the official first-run command. Keep the absolute path to the binary handy, because section 6 records it for the GUI launch button.
+On Windows and Linux, confirm the downloaded binary works: `tunnel-client --version` prints the release version, and `tunnel-client help quickstart` is the official first-run command. Keep the absolute path to the binary handy, because section 6 records it for the GUI launch button.
 
 > [!NOTE]
 > If macOS shows a security prompt for a freshly downloaded binary, right-click it in Finder, select **Open**, and confirm once; subsequent launches run normally.
@@ -248,7 +266,29 @@ Set-Acl -LiteralPath $KeyFile -AclObject $keyAcl
 $KeyReference = "file:$KeyFile"
 ```
 
-### macOS and Linux (bash or zsh)
+### macOS (bash or zsh)
+
+Resolve the Homebrew-installed executable and define the tunnel settings:
+
+```bash
+TunnelClient="$(command -v tunnel-client)"
+TunnelId="tunnel_<your-tunnel-id>"
+McpEndpoint="http://127.0.0.1:61337/mcp"
+test -x "$TunnelClient"
+```
+
+Record that absolute Homebrew path for the GUI launch button:
+
+```bash
+LauncherConfigDirectory="$HOME/.config/RemoteControlMCP"
+TunnelClientPathFile="$LauncherConfigDirectory/tunnel-client-path.txt"
+mkdir -p "$LauncherConfigDirectory"
+printf '%s' "$TunnelClient" > "$TunnelClientPathFile"
+```
+
+On Apple silicon, the resulting file normally contains `/opt/homebrew/bin/tunnel-client`. On Intel Macs, it normally contains `/usr/local/bin/tunnel-client`.
+
+### Linux (bash or zsh)
 
 ```bash
 TunnelClient="/absolute/path/to/tunnel-client"
@@ -264,6 +304,8 @@ TunnelClientPathFile="$LauncherConfigDirectory/tunnel-client-path.txt"
 mkdir -p "$LauncherConfigDirectory"
 printf '%s' "$TunnelClient" > "$TunnelClientPathFile"
 ```
+
+### macOS and Linux runtime key file
 
 Next, prompt for the runtime API key, write it without a trailing newline, and restrict the file to the current user account:
 
@@ -285,6 +327,13 @@ KeyReference="file:$KeyFile"
 
 > [!NOTE]
 > On macOS `XDG_CONFIG_HOME` is normally unset, so these commands resolve to `~/.config`. The tunnel client resolves its config directory the same way on every platform where `HOME` is set (see the platform conventions table in section 1).
+
+On macOS, verify the launcher path and protected key without printing the key:
+
+```bash
+test -x "$(cat "$HOME/.config/RemoteControlMCP/tunnel-client-path.txt")"
+test "$(stat -f '%Lp' "$HOME/.config/tunnel-client/remote-control-mcp.key")" = "600"
+```
 
 > [!NOTE]
 > The key remains plaintext at rest so that `tunnel-client` can read it non-interactively, but the file's permissions are restricted to your account: a Windows ACL in the PowerShell flow above, and Unix mode 0600 in the macOS/Linux flow. The application checks that this exact non-empty file exists but never reads its contents. `tunnel-client` resolves the `file:` reference itself. The `read` builtin does not echo input and is not recorded in shell history.
@@ -538,6 +587,16 @@ When you are finished testing:
 ### Tunnel-client executable path is missing
 * **Symptom:** The GUI cannot launch `tunnel-client` (`tunnel-client.exe` on Windows) or reports that `tunnel-client-path.txt` is invalid.
 * **Fix:** If the binary is not installed yet, download it as described in [section 2](#downloading-the-tunnel-client). Then repeat the launcher-path commands in section 6. The file must contain one existing absolute path to the tunnel-client executable.
+
+On macOS with Homebrew, diagnose and repair the launcher path with:
+
+```bash
+brew list openai/tools/tunnel-client
+TunnelClient="$(command -v tunnel-client)"
+test -x "$TunnelClient"
+mkdir -p "$HOME/.config/RemoteControlMCP"
+printf '%s' "$TunnelClient" > "$HOME/.config/RemoteControlMCP/tunnel-client-path.txt"
+```
 
 ### Profile already exists
 * **Symptom:** `profile "remote-control-mcp" already exists`
