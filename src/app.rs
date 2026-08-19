@@ -38,6 +38,53 @@ fn busy_icon() -> Arc<egui::IconData> {
     }))
 }
 
+#[cfg(target_os = "macos")]
+fn set_macos_application_icon(icon: &egui::IconData) {
+    use objc2::{AnyThread as _, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSBitmapImageRep, NSDeviceRGBColorSpace, NSImage};
+    use objc2_foundation::NSSize;
+
+    let Some(main_thread_marker) = MainThreadMarker::new() else {
+        eprintln!("cannot update macOS application icon off the main thread");
+        return;
+    };
+
+    let mut planes = [icon.rgba.as_ptr().cast_mut()];
+    // Match eframe's native macOS app-icon path: build NSImage from raw RGBA data
+    // rather than decoding the embedded PNG again.
+    let Some(image_rep) = (unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            planes.as_mut_ptr(),
+            icon.width as isize,
+            icon.height as isize,
+            8,
+            4,
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            (icon.width * 4) as isize,
+            32,
+        )
+    }) else {
+        eprintln!("failed to create macOS application icon bitmap");
+        return;
+    };
+
+    let application_icon = NSImage::initWithSize(
+        NSImage::alloc(),
+        NSSize::new(icon.width as f64, icon.height as f64),
+    );
+    application_icon.addRepresentation(&image_rep);
+
+    let application = NSApplication::sharedApplication(main_thread_marker);
+    // SAFETY: the GUI runs on the macOS main thread and both Objective-C objects
+    // remain alive for the duration of this call.
+    unsafe {
+        application.setApplicationIconImage(Some(&application_icon));
+    }
+}
+
 struct AppIcons {
     normal: Arc<egui::IconData>,
     busy: Arc<egui::IconData>,
@@ -886,7 +933,10 @@ impl RemoteControlApp {
         } else {
             Arc::clone(&self.icons.normal)
         };
-        context.send_viewport_cmd(egui::ViewportCommand::Icon(Some(icon)));
+        context.send_viewport_cmd(egui::ViewportCommand::Icon(Some(Arc::clone(&icon))));
+
+        #[cfg(target_os = "macos")]
+        set_macos_application_icon(&icon);
 
         #[cfg(target_os = "windows")]
         if let Some(window) = _frame.winit_window() {
