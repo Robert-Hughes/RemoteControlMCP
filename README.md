@@ -192,9 +192,12 @@ Both tools have the same input schema:
 
 * **`path`** (string, required): Uses the same absolute, relative, UNC, literal-path, and ambiguous-Windows-path rules as `read_file`.
 * **`line`** (positive integer, required): An existing 1-based anchor line. Use the line numbers displayed by `read_file`.
+* **`expected_anchor_text`** (string, required): Exact current logical content of the anchor line, without the `<line_number>: ` prefix returned by `read_file` or a line terminator. Use an empty string for a blank anchor line. The encoded value is limited to 256 KiB.
 * **`text`** (non-empty string, required): UTF-8 text to insert, limited to 256 KiB when encoded. Supply file content only; never include the `<line_number>: ` presentation prefix returned by `read_file`.
 
-`insert_before_line` places `text` immediately before the anchor line. `insert_after_line` places it immediately after the anchor line. The anchor must exist; empty files and lines beyond EOF return `range_out_of_bounds`. These tools never create files.
+`insert_before_line` places `text` immediately before the anchor line. `insert_after_line` places it immediately after the anchor line. The anchor must exist; empty files and lines beyond EOF return `range_out_of_bounds`. If its logical content does not exactly equal `expected_anchor_text`, the result is `content_mismatch` and the original remains unchanged. These tools never create files.
+
+LF and CRLF terminators and a leading UTF-8 BOM are excluded from the comparison. The remaining anchor bytes must exactly match the UTF-8 bytes in `expected_anchor_text`; consequently, a line containing invalid UTF-8 cannot be used as an insertion anchor with these tools.
 
 The supplied `text` bytes are preserved. When a separator is required at a boundary and `text` does not already provide one, the server uses the anchor line's LF or CRLF terminator, falling back to LF for an unterminated anchor. A leading UTF-8 BOM remains at the beginning of the file. Untouched bytes, permissions, symlink targets, and final-newline state are otherwise handled like `write_file`.
 

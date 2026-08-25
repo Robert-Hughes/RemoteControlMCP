@@ -198,57 +198,13 @@ fn exact_copy_failure(
     }
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct SkippedLine {
+pub(super) struct MatchedLine {
     pub(super) exists: bool,
     pub(super) terminator: Option<&'static [u8]>,
+    pub(super) matches: bool,
 }
 
-pub(super) fn skip_line_with_terminator(
-    reader: &mut impl BufRead,
-    mut saw_bytes: bool,
-) -> std::io::Result<SkippedLine> {
-    let mut previous_byte = None;
-    loop {
-        let buffer = reader.fill_buf()?;
-        if buffer.is_empty() {
-            return Ok(SkippedLine {
-                exists: saw_bytes,
-                terminator: None,
-            });
-        }
-        saw_bytes = true;
-
-        if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
-            let byte_before_newline = if newline == 0 {
-                previous_byte
-            } else {
-                Some(buffer[newline - 1])
-            };
-            reader.consume(newline + 1);
-            return Ok(SkippedLine {
-                exists: true,
-                terminator: Some(if byte_before_newline == Some(b'\r') {
-                    b"\r\n"
-                } else {
-                    b"\n"
-                }),
-            });
-        }
-
-        previous_byte = buffer.last().copied();
-        let consumed = buffer.len();
-        reader.consume(consumed);
-    }
-}
-
-struct MatchedLine {
-    exists: bool,
-    terminator: Option<&'static [u8]>,
-    matches: bool,
-}
-
-fn consume_line_matching(
+pub(super) fn consume_line_matching(
     reader: &mut impl BufRead,
     expected: &[u8],
     mut saw_bytes: bool,

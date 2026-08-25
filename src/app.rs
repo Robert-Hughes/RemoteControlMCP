@@ -361,6 +361,10 @@ fn insert_file_presentation(
             RequestState::Failed,
             "Anchor line out of bounds".to_string(),
         ),
+        InsertFileStatus::ContentMismatch => (
+            RequestState::Failed,
+            "Expected anchor content did not match".to_string(),
+        ),
         InsertFileStatus::ReadFailed => (RequestState::Failed, "Read failed".to_string()),
         InsertFileStatus::WriteFailed => (RequestState::Failed, "Write failed".to_string()),
         InsertFileStatus::ReplaceFailed => (RequestState::Failed, "Replace failed".to_string()),

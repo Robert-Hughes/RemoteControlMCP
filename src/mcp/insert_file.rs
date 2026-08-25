@@ -1,8 +1,8 @@
 use crate::mcp::file_path::validate_line_file_path;
 use crate::mcp::read_file::post_edit_snippet;
 use crate::mcp::write_file::{
-    ExactCopyError, MAX_REPLACEMENT_BYTES, commit_replacement, copy_line_exact,
-    copy_remaining_exact, create_staged_file, skip_line_with_terminator,
+    ExactCopyError, MAX_REPLACEMENT_BYTES, commit_replacement, consume_line_matching,
+    copy_line_exact, copy_remaining_exact, create_staged_file,
 };
 use crate::mcp::{
     InsertFilePosition, InsertFileRequest, InsertFileResult, InsertFileStatus, McpServer,
@@ -14,6 +14,17 @@ use std::path::{Path, PathBuf};
 
 pub(crate) fn validate_insert_file_request(req: &InsertFileRequest) -> Result<PathBuf, String> {
     let path = validate_line_file_path(&req.path, req.line, req.line)?;
+    if req.expected_anchor_text.len() > MAX_REPLACEMENT_BYTES {
+        return Err(format!(
+            "expected_anchor_text cannot exceed {MAX_REPLACEMENT_BYTES} UTF-8 bytes"
+        ));
+    }
+    if req.expected_anchor_text.contains('\n') {
+        return Err(
+            "expected_anchor_text must contain exactly one logical line and cannot contain LF"
+                .to_string(),
+        );
+    }
     if req.text.is_empty() {
         return Err("text cannot be empty".to_string());
     }
@@ -79,9 +90,9 @@ fn preserve_leading_bom(
     path: &Path,
     reader: &mut impl BufRead,
     writer: &mut impl Write,
-) -> Result<(), Box<InsertFileResult>> {
+) -> Result<bool, Box<InsertFileResult>> {
     if req.line != 1 {
-        return Ok(());
+        return Ok(false);
     }
     let buffer = reader
         .fill_buf()
@@ -91,8 +102,9 @@ fn preserve_leading_bom(
             Box::new(io_failure(req, path, error, InsertFileStatus::WriteFailed))
         })?;
         reader.consume(3);
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn insert_existing_file(
@@ -159,19 +171,30 @@ fn insert_existing_file(
             }
         }
 
-        preserve_leading_bom(req, path, &mut reader, &mut writer)?;
+        let preserved_bom = preserve_leading_bom(req, path, &mut reader, &mut writer)?;
         let anchor_start = reader.stream_position().map_err(|error| {
             Box::new(io_failure(req, path, error, InsertFileStatus::ReadFailed))
         })?;
-        let anchor = skip_line_with_terminator(&mut reader, false).map_err(|error| {
-            Box::new(io_failure(req, path, error, InsertFileStatus::ReadFailed))
-        })?;
+        let anchor = consume_line_matching(
+            &mut reader,
+            req.expected_anchor_text.as_bytes(),
+            preserved_bom,
+        )
+        .map_err(|error| Box::new(io_failure(req, path, error, InsertFileStatus::ReadFailed)))?;
         if !anchor.exists {
             return Err(Box::new(failure_result(
                 req,
                 path,
                 InsertFileStatus::RangeOutOfBounds,
                 "The insertion anchor line is beyond the end of the file",
+            )));
+        }
+        if !anchor.matches {
+            return Err(Box::new(failure_result(
+                req,
+                path,
+                InsertFileStatus::ContentMismatch,
+                "The insertion anchor line does not match expected_anchor_text",
             )));
         }
         reader
@@ -300,6 +323,10 @@ pub(crate) fn insert_file_summary(
             "Insertion anchor line {} is outside {}.",
             result.requested_line, result.path
         ),
+        InsertFileStatus::ContentMismatch => format!(
+            "Anchor line {} did not match expected_anchor_text in {}.",
+            result.requested_line, result.path
+        ),
         InsertFileStatus::ReadFailed => format!("Reading {} for insertion failed.", result.path),
         InsertFileStatus::WriteFailed => format!("Writing {} failed.", result.path),
         InsertFileStatus::ReplaceFailed => {
@@ -321,7 +348,7 @@ impl McpServer {
                 Err(error) => {
                     return Ok(argument_error_result(missing_argument_message(
                         &error,
-                        &["path", "line", "text"],
+                        &["path", "line", "expected_anchor_text", "text"],
                     )));
                 }
             };
@@ -392,10 +419,16 @@ mod tests {
         ))
     }
 
-    fn request(path: &Path, line: u64, text: &str) -> InsertFileRequest {
+    fn request(
+        path: &Path,
+        line: u64,
+        expected_anchor_text: &str,
+        text: &str,
+    ) -> InsertFileRequest {
         InsertFileRequest {
             path: path.to_string_lossy().into_owned(),
             line,
+            expected_anchor_text: expected_anchor_text.to_string(),
             text: text.to_string(),
         }
     }
@@ -405,7 +438,7 @@ mod tests {
         let before_path = temp_path("before");
         std::fs::write(&before_path, b"alpha\nbravo\ncharlie\n").unwrap();
         let before = insert_file_blocking(
-            request(&before_path, 2, "NEW"),
+            request(&before_path, 2, "bravo", "NEW"),
             before_path.clone(),
             InsertFilePosition::Before,
         );
@@ -422,7 +455,7 @@ mod tests {
         let after_path = temp_path("after");
         std::fs::write(&after_path, b"alpha\nbravo\ncharlie\n").unwrap();
         let after = insert_file_blocking(
-            request(&after_path, 2, "NEW"),
+            request(&after_path, 2, "bravo", "NEW"),
             after_path.clone(),
             InsertFilePosition::After,
         );
@@ -441,7 +474,7 @@ mod tests {
         let before_path = temp_path("bom_crlf");
         std::fs::write(&before_path, b"\xEF\xBB\xBFalpha\r\nbravo\r\n").unwrap();
         let before = insert_file_blocking(
-            request(&before_path, 1, "NEW"),
+            request(&before_path, 1, "alpha", "NEW"),
             before_path.clone(),
             InsertFilePosition::Before,
         );
@@ -454,7 +487,7 @@ mod tests {
         let final_path = temp_path("final");
         std::fs::write(&final_path, b"alpha\nbravo").unwrap();
         let after = insert_file_blocking(
-            request(&final_path, 2, "NEW"),
+            request(&final_path, 2, "bravo", "NEW"),
             final_path.clone(),
             InsertFilePosition::After,
         );
@@ -468,10 +501,11 @@ mod tests {
     #[test]
     fn insertion_rejects_empty_text_missing_files_empty_files_and_stale_lines() {
         let path = temp_path("invalid");
-        assert!(validate_insert_file_request(&request(&path, 1, "")).is_err());
+        assert!(validate_insert_file_request(&request(&path, 1, "", "")).is_err());
+        assert!(validate_insert_file_request(&request(&path, 1, "one\ntwo", "NEW")).is_err());
 
         let missing = insert_file_blocking(
-            request(&path, 1, "NEW"),
+            request(&path, 1, "", "NEW"),
             path.clone(),
             InsertFilePosition::Before,
         );
@@ -479,7 +513,7 @@ mod tests {
 
         std::fs::write(&path, b"").unwrap();
         let empty = insert_file_blocking(
-            request(&path, 1, "NEW"),
+            request(&path, 1, "", "NEW"),
             path.clone(),
             InsertFilePosition::Before,
         );
@@ -488,12 +522,40 @@ mod tests {
 
         std::fs::write(&path, b"one\n").unwrap();
         let stale = insert_file_blocking(
-            request(&path, 2, "NEW"),
+            request(&path, 2, "", "NEW"),
             path.clone(),
             InsertFilePosition::After,
         );
         assert_eq!(stale.status, InsertFileStatus::RangeOutOfBounds);
         assert_eq!(std::fs::read(&path).unwrap(), b"one\n");
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn insertion_rejects_a_stale_anchor_without_changing_the_file() {
+        let path = temp_path("stale_anchor");
+        std::fs::write(&path, b"alpha\nbravo\ncharlie\ndelta\n").unwrap();
+
+        let shift = insert_file_blocking(
+            request(&path, 2, "bravo", "SHIFT"),
+            path.clone(),
+            InsertFilePosition::Before,
+        );
+        assert_eq!(shift.status, InsertFileStatus::Completed);
+
+        let stale = insert_file_blocking(
+            request(&path, 3, "charlie", "STALE"),
+            path.clone(),
+            InsertFilePosition::After,
+        );
+        assert_eq!(stale.status, InsertFileStatus::ContentMismatch);
+        assert_eq!(stale.inserted_bytes, 0);
+        assert!(stale.post_edit_text.is_empty());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"alpha\nSHIFT\nbravo\ncharlie\ndelta\n"
+        );
 
         std::fs::remove_file(path).unwrap();
     }

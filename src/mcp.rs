@@ -194,6 +194,7 @@ pub enum InsertFileStatus {
     AccessDenied,
     NotAFile,
     RangeOutOfBounds,
+    ContentMismatch,
     ReadFailed,
     WriteFailed,
     ReplaceFailed,
@@ -364,6 +365,8 @@ pub struct InsertFileRequest {
     /// Existing 1-based line used as the insertion anchor.
     #[schemars(schema_with = "positive_integer_schema")]
     pub line: u64,
+    /// Exact unnumbered logical content expected on the anchor line. The insertion is rejected if it differs. Do not include read_file's `<line_number>: ` prefix or a line terminator.
+    pub expected_anchor_text: String,
     /// Non-empty UTF-8 text to insert, limited to 256 KiB when encoded. Line-number prefixes returned by read_file must not be included.
     #[schemars(schema_with = "nonempty_string_schema")]
     pub text: String,
@@ -1120,7 +1123,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Insert non-empty text immediately before an existing 1-based line in a local regular file. Use the line numbers shown by read_file, but do not include read_file's `<line_number>: ` presentation prefixes in text. On success, inspect the bounded numbered post_edit_text excerpt for misplaced or duplicate lines.",
+        description = "Insert non-empty text immediately before an existing 1-based line in a local regular file only when expected_anchor_text exactly matches that line's current unnumbered logical content. Use line numbers shown by read_file, but remove read_file's `<line_number>: ` prefix from expected_anchor_text and do not include prefixes in text. On success, inspect the bounded numbered post_edit_text excerpt for misplaced or duplicate lines.",
         input_schema = input_schema_for::<InsertFileRequest>("insert_before_line"),
         output_schema = rmcp::handler::server::tool::schema_for_output::<InsertFileResult>(),
         annotations(
@@ -1139,7 +1142,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Insert non-empty text immediately after an existing 1-based line in a local regular file. Use the line numbers shown by read_file, but do not include read_file's `<line_number>: ` presentation prefixes in text. On success, inspect the bounded numbered post_edit_text excerpt for misplaced or duplicate lines.",
+        description = "Insert non-empty text immediately after an existing 1-based line in a local regular file only when expected_anchor_text exactly matches that line's current unnumbered logical content. Use line numbers shown by read_file, but remove read_file's `<line_number>: ` prefix from expected_anchor_text and do not include prefixes in text. On success, inspect the bounded numbered post_edit_text excerpt for misplaced or duplicate lines.",
         input_schema = input_schema_for::<InsertFileRequest>("insert_after_line"),
         output_schema = rmcp::handler::server::tool::schema_for_output::<InsertFileResult>(),
         annotations(

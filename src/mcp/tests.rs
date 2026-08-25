@@ -1679,7 +1679,7 @@ fn insertion_tools_metadata_schemas_handlers_and_events_are_explicit() {
         assert_eq!(annotations.open_world_hint, Some(false));
 
         let required = attr.input_schema["required"].as_array().unwrap();
-        for field in ["path", "line", "text"] {
+        for field in ["path", "line", "expected_anchor_text", "text"] {
             assert!(required.iter().any(|value| value == field));
             assert!(
                 attr.input_schema["properties"][field]["description"]
@@ -1689,6 +1689,12 @@ fn insertion_tools_metadata_schemas_handlers_and_events_are_explicit() {
         }
         assert_eq!(attr.input_schema["properties"]["line"]["minimum"], 1);
         assert_eq!(attr.input_schema["properties"]["text"]["minLength"], 1);
+        assert!(
+            attr.input_schema["properties"]["expected_anchor_text"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("line terminator")
+        );
         assert!(
             attr.input_schema["properties"]["text"]["description"]
                 .as_str()
@@ -1725,6 +1731,7 @@ fn insertion_tools_metadata_schemas_handlers_and_events_are_explicit() {
             "access_denied",
             "not_a_file",
             "range_out_of_bounds",
+            "content_mismatch",
             "read_failed",
             "write_failed",
             "replace_failed",
@@ -1743,6 +1750,7 @@ fn insertion_tools_metadata_schemas_handlers_and_events_are_explicit() {
     let before_request = InsertFileRequest {
         path: path.to_string_lossy().into_owned(),
         line: 2,
+        expected_anchor_text: "bravo".to_string(),
         text: "private-before".to_string(),
     };
     let before_call = rt
@@ -1762,6 +1770,7 @@ fn insertion_tools_metadata_schemas_handlers_and_events_are_explicit() {
     let after_request = InsertFileRequest {
         path: path.to_string_lossy().into_owned(),
         line: 3,
+        expected_anchor_text: "bravo".to_string(),
         text: "private-after".to_string(),
     };
     let after_call = rt
