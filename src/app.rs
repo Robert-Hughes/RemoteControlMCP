@@ -4,10 +4,12 @@ use crate::mcp::{
     ReadBinaryFileStatus, ReadFileStatus, RequestData, RequestId, RequestUpdate, UiEvent,
     UiEventKind, WriteFileStatus,
 };
+use crate::settings;
 use crate::tunnel::{self, TunnelLaunch, TunnelLaunchEvent};
 use chrono::{DateTime, Local, TimeZone};
 use eframe::egui;
 use std::fmt::Display;
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -335,7 +337,6 @@ fn write_file_presentation(
         pid: None,
     }
 }
-
 fn presentation_for_update(update: RequestUpdate) -> RequestPresentation {
     match update {
         RequestUpdate::PingCompleted => RequestPresentation {
@@ -392,6 +393,15 @@ fn presentation_for_update(update: RequestUpdate) -> RequestPresentation {
             replaced_line_count,
             inserted_bytes,
         } => write_file_presentation(status, error, replaced_line_count, inserted_bytes),
+        RequestUpdate::RequestTimedOut {
+            timeout_seconds,
+            error,
+        } => RequestPresentation {
+            state: RequestState::Failed,
+            status_text: format!("Request timed out · {timeout_seconds}s limit"),
+            detail_text: Some(error),
+            pid: None,
+        },
         RequestUpdate::Rejected { error } => RequestPresentation {
             state: RequestState::Rejected,
             status_text: "Invalid parameters".to_string(),
@@ -501,6 +511,7 @@ fn apply_request_event(requests: &mut Vec<RequestEntry>, event: UiEvent) {
                         | RequestUpdate::ReadFileResponded { .. }
                         | RequestUpdate::ReadBinaryFileResponded { .. }
                         | RequestUpdate::WriteFileResponded { .. }
+                        | RequestUpdate::RequestTimedOut { .. }
                         | RequestUpdate::Rejected { .. }
                         | RequestUpdate::InternalFailure { .. }
                 );
@@ -793,7 +804,6 @@ fn render_request_row(ui: &mut egui::Ui, request: &RequestEntry, current_elapsed
         });
     });
 }
-
 pub struct RemoteControlApp {
     rx: Receiver<UiEvent>,
     requests: Vec<RequestEntry>,
@@ -807,6 +817,9 @@ pub struct RemoteControlApp {
     tunnel_start_automatically: bool,
     automatic_tunnel_launch_pending: bool,
     tunnel_setting_error: Option<String>,
+    maximum_request_timeout_seconds: u64,
+    maximum_request_timeout_shared: Arc<AtomicU64>,
+    maximum_request_timeout_setting_error: Option<String>,
     active_http_connections: usize,
     active_mcp_sessions: usize,
     fatal_error: Option<String>,
@@ -816,7 +829,12 @@ pub struct RemoteControlApp {
 }
 
 impl RemoteControlApp {
-    pub fn new(rx: Receiver<UiEvent>, start_time: Instant) -> Self {
+    pub fn new(
+        rx: Receiver<UiEvent>,
+        start_time: Instant,
+        maximum_request_timeout_shared: Arc<AtomicU64>,
+        maximum_request_timeout_setting_error: Option<String>,
+    ) -> Self {
         let (tunnel_start_automatically, tunnel_setting_error) =
             match tunnel::load_start_automatically() {
                 Ok(enabled) => (enabled, None),
@@ -831,6 +849,8 @@ impl RemoteControlApp {
             start_time,
             tunnel_start_automatically,
             tunnel_setting_error,
+            maximum_request_timeout_shared,
+            maximum_request_timeout_setting_error,
         )
     }
 
@@ -839,7 +859,11 @@ impl RemoteControlApp {
         start_time: Instant,
         tunnel_start_automatically: bool,
         tunnel_setting_error: Option<String>,
+        maximum_request_timeout_shared: Arc<AtomicU64>,
+        maximum_request_timeout_setting_error: Option<String>,
     ) -> Self {
+        let maximum_request_timeout_seconds =
+            maximum_request_timeout_shared.load(Ordering::Relaxed);
         Self {
             rx,
             requests: Vec::new(),
@@ -853,6 +877,9 @@ impl RemoteControlApp {
             tunnel_start_automatically,
             automatic_tunnel_launch_pending: tunnel_start_automatically,
             tunnel_setting_error,
+            maximum_request_timeout_seconds,
+            maximum_request_timeout_shared,
+            maximum_request_timeout_setting_error,
             active_http_connections: 0,
             active_mcp_sessions: 0,
             fatal_error: None,
@@ -1032,7 +1059,9 @@ impl RemoteControlApp {
         let mut stop_clicked = false;
         let mut start_clicked = false;
         let mut automatic_setting_changed = false;
+        let mut maximum_request_timeout_setting_changed = false;
         let previous_automatic_setting = self.tunnel_start_automatically;
+        let previous_maximum_request_timeout_seconds = self.maximum_request_timeout_seconds;
 
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1132,6 +1161,24 @@ impl RemoteControlApp {
                         .on_hover_text(error);
                 }
             });
+
+            ui.horizontal(|ui| {
+                ui.strong("Maximum request timeout:");
+                let response = ui.add(
+                    egui::DragValue::new(&mut self.maximum_request_timeout_seconds)
+                        .speed(1.0)
+                        .suffix(" s"),
+                );
+                maximum_request_timeout_setting_changed = response.changed();
+                response.on_hover_text(
+                    "Maximum time allowed for an MCP tool request. Set to 0 to disable the local request timeout. When using ChatGPT's observed ~120 s outer limit, 110 s leaves time to return a useful local error.",
+                );
+                ui.weak("0 = disabled");
+                if let Some(error) = &self.maximum_request_timeout_setting_error {
+                    ui.colored_label(ui.visuals().error_fg_color, "Request-timeout setting error")
+                        .on_hover_text(error);
+                }
+            });
         });
 
         if automatic_setting_changed {
@@ -1152,6 +1199,29 @@ impl RemoteControlApp {
                         .log_tunnel("tunnel_auto_start_setting_save_failed", &error);
                     self.tunnel_start_automatically = previous_automatic_setting;
                     self.tunnel_setting_error = Some(error);
+                }
+            }
+        }
+
+        if maximum_request_timeout_setting_changed {
+            match settings::save_maximum_request_timeout_seconds(
+                self.maximum_request_timeout_seconds,
+            ) {
+                Ok(()) => {
+                    self.maximum_request_timeout_shared
+                        .store(self.maximum_request_timeout_seconds, Ordering::Relaxed);
+                    self.disk_log.log_tunnel(
+                        "maximum_request_timeout_setting_changed",
+                        format!("seconds={}", self.maximum_request_timeout_seconds),
+                    );
+                    self.maximum_request_timeout_setting_error = None;
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    self.disk_log
+                        .log_tunnel("maximum_request_timeout_setting_save_failed", &error);
+                    self.maximum_request_timeout_seconds = previous_maximum_request_timeout_seconds;
+                    self.maximum_request_timeout_setting_error = Some(error);
                 }
             }
         }
@@ -1213,7 +1283,14 @@ mod tests {
     use chrono::{FixedOffset, TimeZone};
 
     fn test_app(rx: Receiver<UiEvent>) -> RemoteControlApp {
-        RemoteControlApp::with_tunnel_setting(rx, Instant::now(), false, None)
+        RemoteControlApp::with_tunnel_setting(
+            rx,
+            Instant::now(),
+            false,
+            None,
+            Arc::new(AtomicU64::new(0)),
+            None,
+        )
     }
 
     fn started_event(id: u64, elapsed: Duration) -> UiEvent {

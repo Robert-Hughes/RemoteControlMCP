@@ -439,6 +439,10 @@ pub enum RequestUpdate {
         replaced_line_count: Option<u64>,
         inserted_bytes: u64,
     },
+    RequestTimedOut {
+        timeout_seconds: u64,
+        error: String,
+    },
     Rejected {
         error: String,
     },
@@ -494,6 +498,7 @@ pub struct McpServer {
     next_request_id: Arc<AtomicU64>,
     tool_router: ToolRouter<Self>,
     instructions: Arc<str>,
+    maximum_request_timeout_seconds: Arc<AtomicU64>,
     connection_guard: Option<Arc<ConnectionGuard>>,
 }
 
@@ -625,6 +630,12 @@ fn argument_error_result(message: impl Into<String>) -> rmcp::model::CallToolRes
     rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(message.into())])
 }
 
+pub(crate) fn request_timeout_message(timeout_seconds: u64) -> String {
+    format!(
+        "Request exceeded the configured Maximum request timeout of {timeout_seconds} seconds. Remote Control MCP is returning this local timeout error so the client receives a useful failure before any longer upstream timeout expires. Retry with a shorter operation. If this is long-running process work, use detached launch_process execution."
+    )
+}
+
 /// Turn a serde argument deserialisation error into an actionable message, naming
 /// the exact argument that was omitted so the model can correct the call.
 fn missing_argument_message(error: &rmcp::serde_json::Error, required: &[&str]) -> String {
@@ -649,10 +660,25 @@ impl McpServer {
         Self::new_with_instructions(tx, start_time, loaded.instructions)
     }
 
+    #[cfg(test)]
     fn new_with_instructions(
         tx: Sender<UiEvent>,
         start_time: Instant,
         instructions: Arc<str>,
+    ) -> Self {
+        Self::new_with_instructions_and_timeout(
+            tx,
+            start_time,
+            instructions,
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+
+    fn new_with_instructions_and_timeout(
+        tx: Sender<UiEvent>,
+        start_time: Instant,
+        instructions: Arc<str>,
+        maximum_request_timeout_seconds: Arc<AtomicU64>,
     ) -> Self {
         Self {
             tx,
@@ -660,6 +686,7 @@ impl McpServer {
             next_request_id: Arc::new(AtomicU64::new(1)),
             tool_router: Self::tool_router(),
             instructions,
+            maximum_request_timeout_seconds,
             connection_guard: None,
         }
     }
@@ -694,6 +721,39 @@ impl McpServer {
 
     fn update_request(&self, id: RequestId, update: RequestUpdate) {
         self.send_event(UiEventKind::RequestUpdated { id, update });
+    }
+
+    pub(crate) fn maximum_request_timeout_seconds(&self) -> u64 {
+        self.maximum_request_timeout_seconds.load(Ordering::Relaxed)
+    }
+
+    pub(crate) async fn run_request_with_timeout<F>(
+        &self,
+        id: RequestId,
+        future: F,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData>
+    where
+        F: std::future::Future<Output = Result<rmcp::model::CallToolResult, rmcp::ErrorData>>,
+    {
+        let timeout_seconds = self.maximum_request_timeout_seconds();
+        if timeout_seconds == 0 {
+            return future.await;
+        }
+
+        match tokio::time::timeout(Duration::from_secs(timeout_seconds), future).await {
+            Ok(result) => result,
+            Err(_) => {
+                let error = request_timeout_message(timeout_seconds);
+                self.update_request(
+                    id,
+                    RequestUpdate::RequestTimedOut {
+                        timeout_seconds,
+                        error: error.clone(),
+                    },
+                );
+                Ok(argument_error_result(error))
+            }
+        }
     }
 
     fn structured_result_with_content<T: Serialize>(
@@ -793,17 +853,20 @@ impl McpServer {
         _params: rmcp::handler::server::wrapper::Parameters<GetInstructionsRequest>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let id = self.start_request(RequestData::GetInstructions);
-        let instructions = self.instructions.to_string();
-        let result = GetInstructionsResult {
-            instructions: instructions.clone(),
-        };
-        self.finish_structured_request(
-            id,
-            instructions,
-            &result,
-            false,
-            RequestUpdate::GetInstructionsCompleted,
-        )
+        self.run_request_with_timeout(id, async {
+            let instructions = self.instructions.to_string();
+            let result = GetInstructionsResult {
+                instructions: instructions.clone(),
+            };
+            self.finish_structured_request(
+                id,
+                instructions,
+                &result,
+                false,
+                RequestUpdate::GetInstructionsCompleted,
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -818,13 +881,21 @@ impl McpServer {
     )]
     async fn ping(&self) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let id = self.start_request(RequestData::Ping);
-        let message = self.ping_impl().await;
-        let result = ping::PingResult {
-            message: message.clone(),
-        };
-        self.finish_structured_request(id, message, &result, false, RequestUpdate::PingCompleted)
+        self.run_request_with_timeout(id, async {
+            let message = self.ping_impl().await;
+            let result = ping::PingResult {
+                message: message.clone(),
+            };
+            self.finish_structured_request(
+                id,
+                message,
+                &result,
+                false,
+                RequestUpdate::PingCompleted,
+            )
+        })
+        .await
     }
-
     #[tool(
         description = "Launch a local process on the host machine with optional working directory, arguments, environment configuration, timeout, and detachment options.",
         input_schema = input_schema_for::<LaunchProcessRequest>("launch_process"),
@@ -949,12 +1020,18 @@ fn build_http_mcp_service(
     tx: Sender<UiEvent>,
     start_time: Instant,
     instructions: Arc<str>,
+    maximum_request_timeout_seconds: Arc<AtomicU64>,
 ) -> HttpMcpService {
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService,
     };
 
-    let service = McpServer::new_with_instructions(tx.clone(), start_time, instructions);
+    let service = McpServer::new_with_instructions_and_timeout(
+        tx.clone(),
+        start_time,
+        instructions,
+        maximum_request_timeout_seconds,
+    );
     let service_factory = move || Ok(service.for_http_session());
 
     StreamableHttpService::new(
@@ -964,7 +1041,11 @@ fn build_http_mcp_service(
     )
 }
 
-pub fn run_mcp_server(tx: Sender<UiEvent>, start_time: Instant) {
+pub fn run_mcp_server(
+    tx: Sender<UiEvent>,
+    start_time: Instant,
+    maximum_request_timeout_seconds: Arc<AtomicU64>,
+) {
     let rt = match build_mcp_runtime() {
         Ok(rt) => rt,
         Err(e) => {
@@ -984,11 +1065,15 @@ pub fn run_mcp_server(tx: Sender<UiEvent>, start_time: Instant) {
     });
 
     rt.block_on(async move {
-        run_http_mcp_server(tx, start_time).await;
+        run_http_mcp_server(tx, start_time, maximum_request_timeout_seconds).await;
     });
 }
 
-async fn run_http_mcp_server(tx: Sender<UiEvent>, start_time: Instant) {
+async fn run_http_mcp_server(
+    tx: Sender<UiEvent>,
+    start_time: Instant,
+    maximum_request_timeout_seconds: Arc<AtomicU64>,
+) {
     let send_event = |kind| {
         let _ = tx.send(UiEvent {
             elapsed: start_time.elapsed(),
@@ -1021,7 +1106,12 @@ async fn run_http_mcp_server(tx: Sender<UiEvent>, start_time: Instant) {
         tx: tx.clone(),
         start_time,
     };
-    let http_service = build_http_mcp_service(tx.clone(), start_time, instructions);
+    let http_service = build_http_mcp_service(
+        tx.clone(),
+        start_time,
+        instructions,
+        maximum_request_timeout_seconds,
+    );
     let router = axum::Router::new().nest_service("/mcp", http_service);
 
     send_event(UiEventKind::ServerListening {

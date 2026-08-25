@@ -46,18 +46,23 @@ The GUI retains at most 500 requests under normal conditions, pruning the oldest
 
 MCP protocol traffic no longer uses standard input or output. Application lifecycle diagnostics are sent to the GUI event channel or written to standard error (`stderr`).
 
+## Maximum request timeout
+
+The GUI exposes a persistent **Maximum request timeout** setting, expressed in whole seconds. Its default is `0`, which disables the local request deadline. The value is stored as `maximum-request-timeout.txt` in the `RemoteControlMCP` user-config directory and changes apply to subsequent MCP tool requests without restarting the server.
+
+When enabled, the limit applies to every exposed tool. If tool execution has not produced a result by the configured deadline, RemoteControlMCP returns an MCP `isError: true` result explaining that its own request timeout expired. This is useful when the MCP client or transport has a longer opaque timeout of its own: letting RemoteControlMCP fail first gives the model an actionable error instead of a generic transport exception. In the ChatGPT Secure MCP Tunnel setup documented below, an outer tool-call lifetime of approximately 120 seconds has been observed, so configuring RemoteControlMCP to **110 seconds** leaves a deliberate margin. See [Long-running `launch_process` calls fail near the tunnel response deadline](docs/DEVELOPER_SETUP.md#long-running-launch_process-calls-fail-near-the-tunnel-response-deadline).
+
+The generic watchdog is a response deadline, not a universal cancellation mechanism. File tools perform their operating-system work through Tokio `spawn_blocking`; once such blocking work has started, dropping the async wait cannot forcibly cancel the underlying OS operation. The bounded file operations may therefore finish in the background after a timeout. In particular, a `write_file` operation that was already in progress may still reach its atomic commit. Callers must not interpret a request-timeout result as proof that arbitrary blocking side effects were rolled back.
+
+`launch_process` receives additional cooperative handling because a foreground launch can intentionally remain alive for an arbitrary period and its blocking waiter owns a child process. Merely timing out the async wait could otherwise return an MCP error while leaving the foreground child and blocking worker running. For a foreground launch, RemoteControlMCP therefore calculates a process budget just below the request-wide limit, leaving up to one second of headroom for stop/detach cleanup and response construction. With a 110-second Maximum request timeout the cooperative process budget is **109 seconds**. If `timeout_ms` is omitted or is longer than that budget, the server clamps the effective process timeout to the cooperative budget; an explicitly supplied `timeout_action` is preserved, while an otherwise unbounded foreground launch defaults to `stop`. A shorter caller-supplied process timeout is left unchanged, and already-detached launches are not clamped because their MCP request returns immediately. The outer request watchdog remains active at the full configured limit as a final guard.
+
 ## Exposed Tools
 
-The application exposes four tools:
-1. `ping`
-2. `launch_process`
-3. `read_file`
-4. `write_file`
+The application exposes six tools: `get_instructions`, `ping`, `launch_process`, `read_file`, `read_binary_file`, and `write_file`.
 
 > [!WARNING]
 > The `launch_process` tool provides unrestricted local process execution under the user account running the MCP server. There is no security allowlist.
-> The `read_file` tool likewise has unrestricted read access to regular files that account can access; its relative-path base is a convenience, not a security boundary.
-> The `write_file` tool has unrestricted write access to regular files that account can modify and can explicitly create files.
+> The file tools likewise use the full regular-file access available to that account; relative-path handling is a convenience, not a security boundary.
 
 ---
 
@@ -89,7 +94,7 @@ Launch a local process on the host machine. There is no implicit shell execution
   * **`inherit`** (boolean, optional): Defaults to `true`, inheriting the parent process's environment variables. Explicitly setting it to `false` clears the inherited environment before applying `variables`.
   * **`variables`** (object, required): Key-value map of environment variables to add or configure. A `null` value removes that variable.
 * **`detached`** (boolean, required): If `true`, the MCP server spawns the process and returns immediately without waiting for it to complete.
-* **`timeout_ms`** (integer, optional): Bounded execution timeout. Requires `timeout_action`. When calls are routed through an OpenAI Secure MCP Tunnel, the usable foreground lifetime may be shorter than the requested process timeout; see [Long-running `launch_process` calls fail near the tunnel response deadline](docs/DEVELOPER_SETUP.md#long-running-launch_process-calls-fail-near-the-tunnel-response-deadline).
+* **`timeout_ms`** (integer, optional): Bounded child-process execution timeout. Requires `timeout_action`. When **Maximum request timeout** is enabled, a foreground value that would run too close to or beyond the request deadline is cooperatively reduced as described above; shorter caller-supplied timeouts retain their normal semantics. When calls are routed through an OpenAI Secure MCP Tunnel, see [Long-running `launch_process` calls fail near the tunnel response deadline](docs/DEVELOPER_SETUP.md#long-running-launch_process-calls-fail-near-the-tunnel-response-deadline).
 * **`timeout_action`** (string, optional): Can be either `"detach"` or `"stop"`.
   * `"detach"`: If the process exceeds the timeout, the MCP server returns immediately and lets the process continue in the background.
   * `"stop"`: If the process exceeds the timeout, the MCP server terminates the process.
@@ -235,7 +240,7 @@ This command works identically in PowerShell, bash, and zsh.
 ./target/debug/remote-control-mcp
 ```
 
-The application immediately starts its loopback-only Streamable HTTP endpoint at `http://127.0.0.1:61337/mcp`. Its compact status panel groups the server state with that endpoint, keeps the supervised tunnel state beside its action button, and independently shows the number of open HTTP connections and active MCP sessions. **Start Secure MCP Tunnel** launches the tunnel, **Cancel tunnel launch** terminates it while it is starting, and **Stop Secure MCP Tunnel** disconnects it without closing the application. The adjacent **Start automatically** setting is remembered across application restarts and launches the tunnel once the local listener is ready.
+The application immediately starts its loopback-only Streamable HTTP endpoint at `http://127.0.0.1:61337/mcp`. Its compact status panel groups the server state with that endpoint, keeps the supervised tunnel state beside its action button, and independently shows the number of open HTTP connections and active MCP sessions. **Start Secure MCP Tunnel** launches the tunnel, **Cancel tunnel launch** terminates it while it is starting, and **Stop Secure MCP Tunnel** disconnects it without closing the application. The adjacent **Start automatically** setting is remembered across application restarts and launches the tunnel once the local listener is ready. **Maximum request timeout** is also persisted; `0` disables it, and changes apply to subsequent tool calls immediately.
 
 The button requires the one-time launcher path, HTTP profile, and runtime-key file configuration documented in [DEVELOPER_SETUP.md](docs/DEVELOPER_SETUP.md). The fixed port allows the same profile to reconnect after application restarts without relaunching the application as a child process.
 

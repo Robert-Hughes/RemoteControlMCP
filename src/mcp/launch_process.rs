@@ -1,7 +1,7 @@
 use crate::mcp::{
     LaunchProcessRequest, LaunchProcessResult, LaunchProcessStatus, McpServer, RequestData,
     RequestId, RequestUpdate, TimeoutAction, UiEvent, UiEventKind, argument_error_result,
-    missing_argument_message,
+    missing_argument_message, request_timeout_message,
 };
 use std::sync::mpsc::Sender;
 use std::time::Instant;
@@ -15,6 +15,21 @@ static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 
 pub(crate) const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 * 1024;
 const OUTPUT_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+const MAXIMUM_REQUEST_TIMEOUT_LAUNCH_CLEANUP_MARGIN_MS: u64 = 1_000;
+
+pub(crate) fn cooperative_launch_timeout_ms(maximum_request_timeout_seconds: u64) -> u64 {
+    let request_timeout_ms = maximum_request_timeout_seconds.saturating_mul(1_000);
+    if request_timeout_ms == 0 {
+        return 0;
+    }
+
+    // A foreground process must reach its own timeout before the request-wide watchdog.
+    // Leave up to one second for stop/detach cleanup and result construction. For very
+    // small configured limits, preserve at least half of the request lifetime for work.
+    let cleanup_margin_ms =
+        MAXIMUM_REQUEST_TIMEOUT_LAUNCH_CLEANUP_MARGIN_MS.min(request_timeout_ms / 2);
+    request_timeout_ms.saturating_sub(cleanup_margin_ms).max(1)
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct OutputProgressSnapshot {
@@ -851,7 +866,7 @@ impl McpServer {
         &self,
         params: rmcp::handler::server::wrapper::Parameters<rmcp::model::JsonObject>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-        let req: LaunchProcessRequest =
+        let mut req: LaunchProcessRequest =
             match rmcp::serde_json::from_value(rmcp::serde_json::Value::Object(params.0)) {
                 Ok(req) => req,
                 Err(error) => {
@@ -861,12 +876,12 @@ impl McpServer {
                     )));
                 }
             };
-        let timeout_ms = req.timeout_ms;
+        let requested_timeout_ms = req.timeout_ms;
         let id = self.start_request(RequestData::LaunchProcess {
             command_line: command_line_for_display(&req),
             working_directory: req.working_directory.clone(),
             detached: req.detached,
-            timeout_ms,
+            timeout_ms: requested_timeout_ms,
             timeout_action: req.timeout_action,
         });
 
@@ -880,25 +895,82 @@ impl McpServer {
             return Ok(argument_error_result(err_msg));
         }
 
-        let result = self.execute_launch_process_for_request(req, id).await;
-        let update = RequestUpdate::LaunchProcessResponded {
-            status: result.status,
-            error: result.error.clone(),
-            pid: result.pid,
-            exit_code: result.exit_code,
-            stdout: result.stdout.clone(),
-            stderr: result.stderr.clone(),
-            stdout_file: result.stdout_file.clone(),
-            stderr_file: result.stderr_file.clone(),
-        };
+        let maximum_request_timeout_seconds = self.maximum_request_timeout_seconds();
+        let cooperative_timeout_ms = cooperative_launch_timeout_ms(maximum_request_timeout_seconds);
+        let request_timeout_controls_launch = !req.detached
+            && cooperative_timeout_ms != 0
+            && req
+                .timeout_ms
+                .is_none_or(|timeout_ms| timeout_ms > cooperative_timeout_ms);
+        if request_timeout_controls_launch {
+            req.timeout_ms = Some(cooperative_timeout_ms);
+            req.timeout_action = Some(req.timeout_action.unwrap_or(TimeoutAction::Stop));
+        }
 
-        let is_error = launch_status_is_error(result.status);
-        let summary = if is_error {
-            launch_process_failure_summary(&result, timeout_ms)
-        } else {
-            launch_process_summary(&result)
-        };
-        self.finish_structured_request(id, summary, &result, is_error, update)
+        self.run_request_with_timeout(id, async {
+            let result = self.execute_launch_process_for_request(req, id).await;
+
+            if request_timeout_controls_launch
+                && matches!(
+                    result.status,
+                    LaunchProcessStatus::TimedOutDetached
+                        | LaunchProcessStatus::TimedOutStopped
+                        | LaunchProcessStatus::StopFailed
+                )
+            {
+                let mut error = request_timeout_message(maximum_request_timeout_seconds);
+                match result.status {
+                    LaunchProcessStatus::TimedOutDetached => {
+                        error.push_str(
+                            " The foreground process was detached before the request limit to leave time to return the timeout result.",
+                        );
+                    }
+                    LaunchProcessStatus::TimedOutStopped => {
+                        error.push_str(
+                            " The foreground process was stopped before the request limit to leave time for cleanup and the timeout result.",
+                        );
+                    }
+                    LaunchProcessStatus::StopFailed => {
+                        error.push_str(
+                            " Remote Control MCP could not confirm that the foreground process stopped before the request limit.",
+                        );
+                    }
+                    _ => {}
+                }
+                if let Some(detail) = &result.error {
+                    error.push(' ');
+                    error.push_str(detail);
+                }
+                self.update_request(
+                    id,
+                    RequestUpdate::RequestTimedOut {
+                        timeout_seconds: maximum_request_timeout_seconds,
+                        error: error.clone(),
+                    },
+                );
+                return Ok(argument_error_result(error));
+            }
+
+            let update = RequestUpdate::LaunchProcessResponded {
+                status: result.status,
+                error: result.error.clone(),
+                pid: result.pid,
+                exit_code: result.exit_code,
+                stdout: result.stdout.clone(),
+                stderr: result.stderr.clone(),
+                stdout_file: result.stdout_file.clone(),
+                stderr_file: result.stderr_file.clone(),
+            };
+
+            let is_error = launch_status_is_error(result.status);
+            let summary = if is_error {
+                launch_process_failure_summary(&result, requested_timeout_ms)
+            } else {
+                launch_process_summary(&result)
+            };
+            self.finish_structured_request(id, summary, &result, is_error, update)
+        })
+        .await
     }
 
     #[cfg(test)]

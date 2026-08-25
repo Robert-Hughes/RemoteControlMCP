@@ -3,8 +3,11 @@
 mod app;
 mod disk_log;
 mod mcp;
+mod settings;
 mod tunnel;
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
@@ -12,17 +15,35 @@ use std::time::Instant;
 fn main() -> eframe::Result {
     let start_time = Instant::now();
     let (tx, rx) = mpsc::channel();
+    let (maximum_request_timeout_seconds, maximum_request_timeout_setting_error) =
+        match settings::load_maximum_request_timeout_seconds() {
+            Ok(seconds) => (seconds, None),
+            Err(error) => {
+                eprintln!("{error}");
+                (
+                    settings::DEFAULT_MAXIMUM_REQUEST_TIMEOUT_SECONDS,
+                    Some(error),
+                )
+            }
+        };
+    let maximum_request_timeout_seconds = Arc::new(AtomicU64::new(maximum_request_timeout_seconds));
+    let mcp_maximum_request_timeout_seconds = Arc::clone(&maximum_request_timeout_seconds);
 
     // The GUI stays on the main thread while the loopback HTTP MCP server owns
     // its single-threaded Tokio runtime on this dedicated worker thread.
     thread::Builder::new()
         .name("mcp_worker".to_string())
         .spawn(move || {
-            mcp::run_mcp_server(tx, start_time);
+            mcp::run_mcp_server(tx, start_time, mcp_maximum_request_timeout_seconds);
         })
         .expect("Failed to spawn background MCP worker thread");
 
-    let app = app::RemoteControlApp::new(rx, start_time);
+    let app = app::RemoteControlApp::new(
+        rx,
+        start_time,
+        maximum_request_timeout_seconds,
+        maximum_request_timeout_setting_error,
+    );
 
     #[cfg(windows)]
     let mut wgpu_options = eframe::WgpuConfiguration::default();

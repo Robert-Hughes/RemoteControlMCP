@@ -340,31 +340,34 @@ impl McpServer {
             }
         };
 
-        let fallback_req = req.clone();
-        let fallback_path = path.clone();
-        let result = match tokio::task::spawn_blocking(move || read_file_blocking(req, path)).await
-        {
-            Ok(result) => result,
-            Err(error) => failure_result(
-                &fallback_req,
-                &fallback_path,
-                ReadFileStatus::ReadFailed,
-                format!("Blocking file-read task failed: {error}"),
-            ),
-        };
+        self.run_request_with_timeout(id, async {
+            let fallback_req = req.clone();
+            let fallback_path = path.clone();
+            let result =
+                match tokio::task::spawn_blocking(move || read_file_blocking(req, path)).await {
+                    Ok(result) => result,
+                    Err(error) => failure_result(
+                        &fallback_req,
+                        &fallback_path,
+                        ReadFileStatus::ReadFailed,
+                        format!("Blocking file-read task failed: {error}"),
+                    ),
+                };
 
-        let update = RequestUpdate::ReadFileResponded {
-            status: result.status,
-            error: result.error.clone(),
-            actual_start_line: result.actual_start_line,
-            actual_end_line: result.actual_end_line,
-            next_start_line: result.next_start_line,
-            eof: result.eof,
-            text: result.text.clone(),
-        };
+            let update = RequestUpdate::ReadFileResponded {
+                status: result.status,
+                error: result.error.clone(),
+                actual_start_line: result.actual_start_line,
+                actual_end_line: result.actual_end_line,
+                next_start_line: result.next_start_line,
+                eof: result.eof,
+                text: result.text.clone(),
+            };
 
-        let summary = read_file_summary(&result);
-        self.finish_structured_request(id, summary, &result, false, update)
+            let summary = read_file_summary(&result);
+            self.finish_structured_request(id, summary, &result, false, update)
+        })
+        .await
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::mcp::file_path::{RegularFileOpenErrorKind, open_regular_file_with_metadata};
 use crate::mcp::launch_process::{
-    ChildOps, CleanupOutcome, DEFAULT_MAX_OUTPUT_BYTES,
+    ChildOps, CleanupOutcome, DEFAULT_MAX_OUTPUT_BYTES, cooperative_launch_timeout_ms,
     handle_background_wait_result_with_notifier, launch_process_failure_summary,
     launch_process_summary, output_progress_snapshot_for_test, perform_cleanup,
     read_and_truncate_file, report_background_error, validate_request,
@@ -130,6 +130,50 @@ fn mcp_runtime_supports_tokio_timers() {
 
         assert!(result.is_err(), "pending future should time out");
     });
+}
+
+#[test]
+fn cooperative_launch_timeout_leaves_cleanup_headroom() {
+    assert_eq!(cooperative_launch_timeout_ms(0), 0);
+    assert_eq!(cooperative_launch_timeout_ms(1), 500);
+    assert_eq!(cooperative_launch_timeout_ms(110), 109_000);
+}
+
+#[test]
+fn maximum_request_timeout_returns_a_tool_error_before_upstream_timeout() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    server
+        .maximum_request_timeout_seconds
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    let id = server.start_request(RequestData::Ping);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+
+    let started = Instant::now();
+    let result = rt
+        .block_on(server.run_request_with_timeout(id, async {
+            std::future::pending::<Result<rmcp::model::CallToolResult, rmcp::ErrorData>>().await
+        }))
+        .unwrap();
+
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(result.is_error, Some(true));
+    assert!(only_text_content(&result).contains("Maximum request timeout of 1 seconds"));
+    assert!(only_text_content(&result).contains("detached launch_process execution"));
+    assert!(rx.try_iter().any(|event| matches!(
+        event.kind,
+        UiEventKind::RequestUpdated {
+            id: event_id,
+            update: RequestUpdate::RequestTimedOut {
+                timeout_seconds: 1,
+                ..
+            },
+        } if event_id == id
+    )));
 }
 
 #[test]
@@ -1630,6 +1674,7 @@ fn ping_works_over_streamable_http_transport() {
             tx,
             start_time,
             Arc::from("HTTP transport test instructions"),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         );
         let router = axum::Router::new().nest_service("/mcp", service);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2889,6 +2934,67 @@ fn test_timeout_with_stop() {
 
     let res = rt.block_on(async { server.execute_launch_process(req).await });
     assert!(matches!(res.status, LaunchProcessStatus::Completed));
+}
+
+#[test]
+fn maximum_request_timeout_stops_unbounded_foreground_launch() {
+    let _guard = match ENV_MUTEX.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    server
+        .maximum_request_timeout_seconds
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+
+    let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+    test_hooks::register_completion_sender(completion_tx);
+
+    let marker_path = generate_temp_test_path("maximum_request_timeout_marker");
+    let mut req = make_helper_request();
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_ACTION".to_string(),
+        Some("sleep".to_string()),
+    );
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_SLEEP_MS".to_string(),
+        Some("5000".to_string()),
+    );
+    req.environment.variables.insert(
+        "RMCP_TEST_HELPER_MARKER".to_string(),
+        Some(marker_path.to_string_lossy().into_owned()),
+    );
+
+    let started = Instant::now();
+    let result = rt
+        .block_on(server.launch_process(parameters_of(&req)))
+        .expect("maximum request timeout should return a tool result");
+    assert!(started.elapsed() >= Duration::from_millis(400));
+    assert!(started.elapsed() < Duration::from_millis(950));
+    assert_eq!(result.is_error, Some(true));
+    assert!(only_text_content(&result).contains("Maximum request timeout of 1 seconds"));
+    assert!(only_text_content(&result).contains("stopped before the request limit"));
+
+    completion_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("request-timeout cleanup should reap the foreground child");
+    assert!(!marker_path.exists());
+
+    assert!(rx.try_iter().any(|event| matches!(
+        event.kind,
+        UiEventKind::RequestUpdated {
+            update: RequestUpdate::RequestTimedOut {
+                timeout_seconds: 1,
+                ..
+            },
+            ..
+        }
+    )));
 }
 
 #[test]
@@ -4584,6 +4690,52 @@ fn read_file_blocking_work_does_not_block_ping() {
         client.close().await.expect("close client");
         server_task.await.expect("server task");
     });
+
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn read_file_obeys_maximum_request_timeout_while_blocking_work_finishes_separately() {
+    let path = write_temp_test_file("read_request_timeout", b"eventual result\n");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    install_blocking_test_hook(path.clone(), started_tx, release_rx);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    server
+        .maximum_request_timeout_seconds
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    let request = make_read_file_request(&path, 1, 1);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let started = Instant::now();
+    let result = rt
+        .block_on(server.read_file(parameters_of(&request)))
+        .expect("read_file request timeout should return a tool result");
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(result.is_error, Some(true));
+    assert!(only_text_content(&result).contains("Maximum request timeout of 1 seconds"));
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("blocking read should have started before the request timed out");
+
+    release_tx.send(()).unwrap();
+    drop(rt);
+    assert!(rx.try_iter().any(|event| matches!(
+        event.kind,
+        UiEventKind::RequestUpdated {
+            update: RequestUpdate::RequestTimedOut {
+                timeout_seconds: 1,
+                ..
+            },
+            ..
+        }
+    )));
 
     std::fs::remove_file(path).unwrap();
 }

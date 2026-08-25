@@ -24,6 +24,7 @@ The application and the `tunnel-client` daemon both store configuration in the p
 | User config directory | `%APPDATA%` | `~/.config` | `${XDG_CONFIG_HOME:-$HOME/.config}` |
 | Launcher path file | `%APPDATA%\RemoteControlMCP\tunnel-client-path.txt` | `~/.config/RemoteControlMCP/tunnel-client-path.txt` | `~/.config/RemoteControlMCP/tunnel-client-path.txt` |
 | Automatic-start setting | `%APPDATA%\RemoteControlMCP\start-tunnel-automatically.txt` | `~/.config/RemoteControlMCP/start-tunnel-automatically.txt` | `~/.config/RemoteControlMCP/start-tunnel-automatically.txt` |
+| Maximum request timeout | `%APPDATA%\RemoteControlMCP\maximum-request-timeout.txt` | `~/.config/RemoteControlMCP/maximum-request-timeout.txt` | `~/.config/RemoteControlMCP/maximum-request-timeout.txt` |
 | Runtime key file | `%APPDATA%\tunnel-client\remote-control-mcp.key` | `~/.config/tunnel-client/remote-control-mcp.key` | `~/.config/tunnel-client/remote-control-mcp.key` |
 | Tunnel profile | `%APPDATA%\tunnel-client\remote-control-mcp.yaml` | `~/.config/tunnel-client/remote-control-mcp.yaml` | `~/.config/tunnel-client/remote-control-mcp.yaml` |
 | Tunnel logs | `%TEMP%\RemoteControlMCP` | `$TMPDIR/RemoteControlMCP` (normally beneath `/var/folders`) | `/tmp/RemoteControlMCP` |
@@ -489,6 +490,8 @@ Alternatively, select **Start Secure MCP Tunnel** in the already-running applica
 
 Select **Start automatically** beside the tunnel button to launch the tunnel once the local MCP listener is ready on future application starts. The preference is stored in the application configuration directory shown in the platform conventions table. Automatic launch is attempted once per application start; a failure remains visible and can be retried manually.
 
+For ChatGPT, set **Maximum request timeout** to **110 seconds** in the same GUI panel. The default `0` leaves the local request watchdog disabled. The value is stored in `maximum-request-timeout.txt` in the application configuration directory and applies to subsequent tool requests immediately; a server restart is not required. The rationale for 110 seconds and the special foreground `launch_process` handling are documented in the troubleshooting section below.
+
 * **Manual launch:** Leave the terminal pane open. The process must remain active to handle connection dispatches.
 * **GUI-button launch:** The tunnel client runs detached from the console and stops when the GUI closes.
 * **Structured Logs:** Manual launches write structured logs to the terminal. GUI-button launches write them beneath the system temporary directory.
@@ -624,7 +627,7 @@ printf '%s' "$TunnelClient" > "$HOME/.config/RemoteControlMCP/tunnel-client-path
 
 ### Long-running `launch_process` calls fail near the tunnel response deadline
 
-A foreground `launch_process` call has several independent timeout layers. They should not be confused:
+A foreground `launch_process` call can have several independent timeout layers. They should not be confused:
 
 ```text
 ChatGPT / tool caller
@@ -641,35 +644,44 @@ tunnel-client
         ▼
 RemoteControlMCP
         │
-        │ launch_process timeout_ms / timeout_action
+        │ Maximum request timeout (all MCP tools; 0 = disabled)
+        ▼
+launch_process cooperative child deadline
+        │
+        │ timeout_ms / timeout_action, possibly reduced by request limit
         ▼
 child process
 ```
 
-RemoteControlMCP's `timeout_ms` controls only the child-process operation. A foreground process can therefore request a timeout longer than the time available to return its MCP result through the tunnel.
+RemoteControlMCP therefore exposes **Maximum request timeout**, stored as `maximum-request-timeout.txt` in the application user-config directory. The default is `0`, meaning that RemoteControlMCP imposes no request-wide deadline. When a non-zero value is configured, every MCP tool call is bounded by that local deadline and expiration is returned as an MCP `isError: true` result with a useful explanation. This is deliberately preferable to allowing a longer upstream timeout to expire first, because the latter can surface to ChatGPT only as an opaque transport failure such as `ToolError: UNKNOWN` / `ExceptionGroup`.
 
-This was reproduced on 2026-08-25 with `/bin/sleep 180`, `timeout_ms = 130000`, and `timeout_action = "stop"`:
+For the ChatGPT setup tested here, configure **Maximum request timeout = 110 seconds**. ChatGPT and the Secure MCP Tunnel have both been observed to stop accepting a result at approximately 120 seconds, so 110 seconds leaves roughly ten seconds for RemoteControlMCP's error response to traverse the tunnel. The approximately-120-second value is an observed external limit, not an MCP protocol guarantee; if OpenAI changes that behaviour, reassess the local setting rather than treating 110 seconds as universally required.
+
+`launch_process` is special because the generic request watchdog alone is not sufficient cancellation. Foreground process execution runs in `spawn_blocking`; timing out and dropping the async wait does **not** stop the blocking worker or the child process it owns. RemoteControlMCP therefore cooperates with its existing process-timeout machinery:
+
+* It calculates a foreground process budget slightly below the Maximum request timeout, reserving up to one second for stop/detach cleanup and response construction. At a 110-second request limit this budget is **109 seconds**.
+* If foreground `timeout_ms` is omitted, the effective process timeout becomes that cooperative budget and `timeout_action` defaults to `stop`.
+* If a caller supplies a `timeout_ms` longer than the cooperative budget, it is reduced to the budget. An explicitly supplied `timeout_action` (`stop` or `detach`) is preserved.
+* A caller-supplied timeout that is already shorter than the cooperative budget is left unchanged and retains the ordinary `launch_process` timeout semantics.
+* `detached = true` launches are not clamped by this mechanism because the MCP request returns immediately; any explicit detached stop timeout remains a background process policy rather than a foreground request deadline.
+* The normal request-wide watchdog still runs at the full Maximum request timeout as a final guard in case process cleanup or response construction itself fails to finish in the reserved headroom.
+
+So this is **not quite a simple clamp to 110 seconds**. With a 110-second Maximum request timeout, an omitted or overly long foreground process timeout is clamped to 109 seconds so RemoteControlMCP can stop or detach the child and still return the helpful timeout error before the 110-second request watchdog expires.
+
+The generic watchdog on the file tools is a response deadline rather than a universal cancellation facility. Their bounded filesystem work also uses `spawn_blocking`, and an operating-system operation already in progress cannot be forcibly cancelled by dropping its async waiter. Such work may therefore finish in the background after the MCP timeout; in particular, callers should not interpret a timed-out `write_file` response as proof that an in-progress staged write could not subsequently reach its atomic commit.
+
+The need for this local safeguard was reproduced on 2026-08-25 with `/bin/sleep 180`, `timeout_ms = 130000`, and `timeout_action = "stop"`, before Maximum request timeout existed:
 
 * RemoteControlMCP started the request and, approximately 130 seconds later, correctly produced `TimedOutStopped` (`isError = true`).
 * With an unmodified tunnel client, the command's OpenAI-supplied `response_timeout` expired at approximately 120 seconds, so tunnel-client abandoned the in-flight command before the RemoteControlMCP result existed.
-* A deliberately experimental tunnel-client build was then used to ignore the command `response_timeout`. RemoteControlMCP still ran to its own 130-second timeout, proving that the local dispatcher deadline had been bypassed, but the ChatGPT tool invocation still failed at approximately 120 seconds with an opaque `ToolError: UNKNOWN` / `ExceptionGroup` rather than accepting the later result.
+* A deliberately experimental tunnel-client build was then used to ignore the command `response_timeout`. RemoteControlMCP still ran to its own 130-second timeout, proving that the local dispatcher deadline had been bypassed, but the ChatGPT tool invocation still failed at approximately 120 seconds with the same opaque caller-side failure rather than accepting the later result.
 * A 55-second control run returned RemoteControlMCP's normal `timed_out_stopped` error successfully, confirming that the structured timeout result itself works when it wins the race.
 
-The experiment therefore demonstrated two separate approximately-120-second boundaries: tunnel-client normally enforces the control-plane `response_timeout`, and the ChatGPT/tool-caller side also has an independent outer lifetime. Disabling only the tunnel-client enforcement does **not** make a foreground tool call usable beyond the outer caller lifetime.
+The experiment demonstrated two separate approximately-120-second boundaries: tunnel-client normally enforces the control-plane `response_timeout`, and the ChatGPT/tool-caller side also has an independent outer lifetime. Disabling only tunnel-client enforcement does **not** make a foreground call usable beyond the outer caller lifetime.
 
-A source audit found no second hidden approximately-120-second timeout in the normal `tunnel-client run` MCP forwarding path. Relevant local limits are:
+A source audit found no second hidden approximately-120-second timeout in the normal `tunnel-client run` MCP forwarding path. Relevant local limits include `mcp.connection-max-ttl` (10 minutes by default), an unset MCP `http.Client.Timeout`, zero `ResponseHeaderTimeout`, a 90-second idle-connection timeout that does not apply to active requests, and the separate control-plane polling/startup limits. None replaces the need for RemoteControlMCP to finish its own response before the external caller lifetime.
 
-* `mcp.connection-max-ttl`: 10 minutes by default. This bounds the MCP transport connection, not a 120-second tool call.
-* MCP `http.Client.Timeout`: unset; there is no whole-request HTTP timeout on the local MCP call.
-* Go HTTP `ResponseHeaderTimeout`: zero (disabled).
-* Go HTTP `IdleConnTimeout`: 90 seconds, but this applies only to unused keep-alive connections in the pool, not an active request waiting for its response.
-* Control-plane poll timeout: 30 seconds plus a 5-second guardrail; this bounds each long-poll request used to fetch commands, not an already-dispatched command.
-* Control-plane response POST: uses that control-plane HTTP client and its bounded request lifetime, but this timer begins only after RemoteControlMCP has produced a response to post.
-* MCP startup probe: 2 seconds; startup/readiness only.
-* `pkg/localproxy`'s 30-second response timeout belongs to development/local-proxy mode and is not used by normal `tunnel-client run` forwarding.
-* Harpoon has its own 120-second maximum request timeout, but that applies to Harpoon `call_target`, not RemoteControlMCP MCP forwarding.
-
-Until the outer caller lifetime is configurable, foreground `launch_process` work should finish comfortably before it. Long-running work should use detached execution and be inspected later. A RemoteControlMCP-side safeguard could also reject foreground timeout values too close to the known outer limit so that it can return a meaningful structured error before the transport fails; such a limit would be defensive policy rather than an MCP protocol limit and should retain a safety margin rather than assuming 120 seconds is a permanent OpenAI contract.
+For work expected to run longer than the configured request limit, use detached execution and inspect the returned stdout/stderr files later rather than extending a foreground timeout beyond the available MCP response lifetime.
 
 ---
 ## References

@@ -257,54 +257,59 @@ impl McpServer {
             }
         };
 
-        let fallback_path = path.clone();
-        let outcome =
-            match tokio::task::spawn_blocking(move || read_binary_file_blocking(req, path)).await {
-                Ok(outcome) => outcome,
-                Err(error) => failure_result(
-                    &fallback_path,
-                    ReadBinaryFileStatus::ReadFailed,
-                    format!("Blocking binary file-read task failed: {error}"),
-                    None,
-                ),
+        self.run_request_with_timeout(id, async {
+            let fallback_path = path.clone();
+            let outcome =
+                match tokio::task::spawn_blocking(move || read_binary_file_blocking(req, path))
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => failure_result(
+                        &fallback_path,
+                        ReadBinaryFileStatus::ReadFailed,
+                        format!("Blocking binary file-read task failed: {error}"),
+                        None,
+                    ),
+                };
+
+            let result = outcome.result;
+            let update = RequestUpdate::ReadBinaryFileResponded {
+                status: result.status,
+                error: result.error.clone(),
+                size: result.size,
+                mime_type: result.mime_type.clone(),
+                content_kind: result.content_kind,
             };
-
-        let result = outcome.result;
-        let update = RequestUpdate::ReadBinaryFileResponded {
-            status: result.status,
-            error: result.error.clone(),
-            size: result.size,
-            mime_type: result.mime_type.clone(),
-            content_kind: result.content_kind,
-        };
-        let summary = read_binary_file_summary(&result);
-        let mut content = vec![ContentBlock::text(summary)];
-        if let Some(bytes) = outcome.bytes {
-            let encoded = BASE64_STANDARD.encode(bytes);
-            match result.content_kind {
-                Some(ReadBinaryFileContentKind::Image) => content.push(ContentBlock::image(
-                    encoded,
-                    result
-                        .mime_type
-                        .as_deref()
-                        .unwrap_or("application/octet-stream"),
-                )),
-                Some(ReadBinaryFileContentKind::EmbeddedResource) => {
-                    let resource =
-                        ResourceContents::blob(encoded, file_resource_uri(&fallback_path))
-                            .with_mime_type(
-                                result
-                                    .mime_type
-                                    .as_deref()
-                                    .unwrap_or("application/octet-stream"),
-                            );
-                    content.push(ContentBlock::resource(resource));
+            let summary = read_binary_file_summary(&result);
+            let mut content = vec![ContentBlock::text(summary)];
+            if let Some(bytes) = outcome.bytes {
+                let encoded = BASE64_STANDARD.encode(bytes);
+                match result.content_kind {
+                    Some(ReadBinaryFileContentKind::Image) => content.push(ContentBlock::image(
+                        encoded,
+                        result
+                            .mime_type
+                            .as_deref()
+                            .unwrap_or("application/octet-stream"),
+                    )),
+                    Some(ReadBinaryFileContentKind::EmbeddedResource) => {
+                        let resource =
+                            ResourceContents::blob(encoded, file_resource_uri(&fallback_path))
+                                .with_mime_type(
+                                    result
+                                        .mime_type
+                                        .as_deref()
+                                        .unwrap_or("application/octet-stream"),
+                                );
+                        content.push(ContentBlock::resource(resource));
+                    }
+                    None => {}
                 }
-                None => {}
             }
-        }
 
-        self.finish_structured_request_with_content(id, content, &result, false, update)
+            self.finish_structured_request_with_content(id, content, &result, false, update)
+        })
+        .await
     }
 }
 
