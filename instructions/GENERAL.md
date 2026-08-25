@@ -34,5 +34,6 @@ Use this server to launch local processes and to read or modify regular files on
 - Do not use `read_file` to ferry a binary file as textual base64 merely to work around the binary API.
 - `insert_before_line` and `insert_after_line` anchor non-empty text to an existing 1-based line. Pass file content only in `text`; never copy the `<line_number>: ` prefixes returned by `read_file`. Do not simulate insertion by replacing and reproducing an adjacent line.
 - `write_file` replaces exactly the selected range only when `expected_text` matches its current unnumbered logical content. Copy the content shown by `read_file` without the `<line_number>: ` prefixes, join multiple expected lines with LF, and preserve blank lines. Use an empty `text` to delete the matched range. A mismatch is rejected without changing the file.
+- After a successful mutation, inspect `post_edit_text`. It is the only post-edit content representation and uses the same `<line_number>: ` presentation prefixes as `read_file`; check it for misplaced or duplicate lines before making another positional edit.
 - Missing files are created only when `create_if_missing = true` and the requested range is `1-1`. Parent directories are never created automatically.
 - File access and process execution are not sandboxed. Confirm paths and targets before performing destructive operations.

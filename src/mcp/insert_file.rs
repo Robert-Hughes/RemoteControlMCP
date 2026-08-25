@@ -1,4 +1,5 @@
 use crate::mcp::file_path::validate_line_file_path;
+use crate::mcp::read_file::post_edit_snippet;
 use crate::mcp::write_file::{
     ExactCopyError, MAX_REPLACEMENT_BYTES, commit_replacement, copy_line_exact,
     copy_remaining_exact, create_staged_file, skip_line_with_terminator,
@@ -36,6 +37,10 @@ fn failure_result(
         path: path.to_string_lossy().into_owned(),
         requested_line: req.line,
         inserted_bytes: 0,
+        post_edit_start_line: None,
+        post_edit_end_line: None,
+        post_edit_text: String::new(),
+        post_edit_truncated: false,
     }
 }
 
@@ -74,17 +79,17 @@ fn preserve_leading_bom(
     path: &Path,
     reader: &mut impl BufRead,
     writer: &mut impl Write,
-) -> Result<(), InsertFileResult> {
+) -> Result<(), Box<InsertFileResult>> {
     if req.line != 1 {
         return Ok(());
     }
     let buffer = reader
         .fill_buf()
-        .map_err(|error| io_failure(req, path, error, InsertFileStatus::ReadFailed))?;
+        .map_err(|error| Box::new(io_failure(req, path, error, InsertFileStatus::ReadFailed)))?;
     if buffer.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        writer
-            .write_all(&[0xEF, 0xBB, 0xBF])
-            .map_err(|error| io_failure(req, path, error, InsertFileStatus::WriteFailed))?;
+        writer.write_all(&[0xEF, 0xBB, 0xBF]).map_err(|error| {
+            Box::new(io_failure(req, path, error, InsertFileStatus::WriteFailed))
+        })?;
         reader.consume(3);
     }
     Ok(())
@@ -135,7 +140,7 @@ fn insert_existing_file(
     };
     let mut reader = std::io::BufReader::new(file);
 
-    let edit_result = (|| -> Result<(), InsertFileResult> {
+    let edit_result = (|| -> Result<(), Box<InsertFileResult>> {
         let stage_file = stage.file.as_mut().expect("staging file should be open");
         let mut writer = std::io::BufWriter::new(stage_file);
 
@@ -143,89 +148,99 @@ fn insert_existing_file(
             match copy_line_exact(&mut reader, &mut writer) {
                 Ok(true) => {}
                 Ok(false) => {
-                    return Err(failure_result(
+                    return Err(Box::new(failure_result(
                         req,
                         path,
                         InsertFileStatus::RangeOutOfBounds,
                         "The insertion anchor line is beyond the end of the file",
-                    ));
+                    )));
                 }
-                Err(error) => return Err(exact_copy_failure(req, path, error)),
+                Err(error) => return Err(Box::new(exact_copy_failure(req, path, error))),
             }
         }
 
         preserve_leading_bom(req, path, &mut reader, &mut writer)?;
-        let anchor_start = reader
-            .stream_position()
-            .map_err(|error| io_failure(req, path, error, InsertFileStatus::ReadFailed))?;
-        let anchor = skip_line_with_terminator(&mut reader, false)
-            .map_err(|error| io_failure(req, path, error, InsertFileStatus::ReadFailed))?;
+        let anchor_start = reader.stream_position().map_err(|error| {
+            Box::new(io_failure(req, path, error, InsertFileStatus::ReadFailed))
+        })?;
+        let anchor = skip_line_with_terminator(&mut reader, false).map_err(|error| {
+            Box::new(io_failure(req, path, error, InsertFileStatus::ReadFailed))
+        })?;
         if !anchor.exists {
-            return Err(failure_result(
+            return Err(Box::new(failure_result(
                 req,
                 path,
                 InsertFileStatus::RangeOutOfBounds,
                 "The insertion anchor line is beyond the end of the file",
-            ));
+            )));
         }
         reader
             .seek(std::io::SeekFrom::Start(anchor_start))
-            .map_err(|error| io_failure(req, path, error, InsertFileStatus::ReadFailed))?;
+            .map_err(|error| {
+                Box::new(io_failure(req, path, error, InsertFileStatus::ReadFailed))
+            })?;
 
         match position {
             InsertFilePosition::Before => {
-                writer
-                    .write_all(req.text.as_bytes())
-                    .map_err(|error| io_failure(req, path, error, InsertFileStatus::WriteFailed))?;
+                writer.write_all(req.text.as_bytes()).map_err(|error| {
+                    Box::new(io_failure(req, path, error, InsertFileStatus::WriteFailed))
+                })?;
                 if !req.text.as_bytes().ends_with(b"\n") {
                     writer
                         .write_all(anchor.terminator.unwrap_or(b"\n"))
                         .map_err(|error| {
-                            io_failure(req, path, error, InsertFileStatus::WriteFailed)
+                            Box::new(io_failure(req, path, error, InsertFileStatus::WriteFailed))
                         })?;
                 }
                 copy_remaining_exact(&mut reader, &mut writer)
-                    .map_err(|error| exact_copy_failure(req, path, error))?;
+                    .map_err(|error| Box::new(exact_copy_failure(req, path, error)))?;
             }
             InsertFilePosition::After => {
                 copy_line_exact(&mut reader, &mut writer)
-                    .map_err(|error| exact_copy_failure(req, path, error))?;
+                    .map_err(|error| Box::new(exact_copy_failure(req, path, error)))?;
                 if anchor.terminator.is_none() {
                     writer.write_all(b"\n").map_err(|error| {
-                        io_failure(req, path, error, InsertFileStatus::WriteFailed)
+                        Box::new(io_failure(req, path, error, InsertFileStatus::WriteFailed))
                     })?;
                 }
-                writer
-                    .write_all(req.text.as_bytes())
-                    .map_err(|error| io_failure(req, path, error, InsertFileStatus::WriteFailed))?;
+                writer.write_all(req.text.as_bytes()).map_err(|error| {
+                    Box::new(io_failure(req, path, error, InsertFileStatus::WriteFailed))
+                })?;
                 let suffix_exists = !reader
                     .fill_buf()
-                    .map_err(|error| io_failure(req, path, error, InsertFileStatus::ReadFailed))?
+                    .map_err(|error| {
+                        Box::new(io_failure(req, path, error, InsertFileStatus::ReadFailed))
+                    })?
                     .is_empty();
                 if suffix_exists && !req.text.as_bytes().ends_with(b"\n") {
                     writer
                         .write_all(anchor.terminator.unwrap_or(b"\n"))
                         .map_err(|error| {
-                            io_failure(req, path, error, InsertFileStatus::WriteFailed)
+                            Box::new(io_failure(req, path, error, InsertFileStatus::WriteFailed))
                         })?;
                 }
                 copy_remaining_exact(&mut reader, &mut writer)
-                    .map_err(|error| exact_copy_failure(req, path, error))?;
+                    .map_err(|error| Box::new(exact_copy_failure(req, path, error)))?;
             }
         }
-        writer
-            .flush()
-            .map_err(|error| io_failure(req, path, error, InsertFileStatus::WriteFailed))?;
+        writer.flush().map_err(|error| {
+            Box::new(io_failure(req, path, error, InsertFileStatus::WriteFailed))
+        })?;
         Ok(())
     })();
 
     drop(reader);
     if let Err(result) = edit_result {
-        return result;
+        return *result;
     }
     if let Err(error) = stage.close() {
         return io_failure(req, path, error, InsertFileStatus::WriteFailed);
     }
+    let focus_line = match position {
+        InsertFilePosition::Before => req.line,
+        InsertFilePosition::After => req.line.saturating_add(1),
+    };
+    let snippet = post_edit_snippet(&stage.path, focus_line);
     if let Err(error) = std::fs::set_permissions(&stage.path, opened_metadata.permissions()) {
         return io_failure(req, path, error, InsertFileStatus::WriteFailed);
     }
@@ -245,6 +260,10 @@ fn insert_existing_file(
         path: path.to_string_lossy().into_owned(),
         requested_line: req.line,
         inserted_bytes: req.text.len() as u64,
+        post_edit_start_line: snippet.start_line,
+        post_edit_end_line: snippet.end_line,
+        post_edit_text: snippet.text,
+        post_edit_truncated: snippet.truncated,
     }
 }
 
@@ -392,6 +411,10 @@ mod tests {
         );
         assert_eq!(before.status, InsertFileStatus::Completed);
         assert_eq!(
+            before.post_edit_text,
+            "1: alpha\n2: NEW\n3: bravo\n4: charlie"
+        );
+        assert_eq!(
             std::fs::read(&before_path).unwrap(),
             b"alpha\nNEW\nbravo\ncharlie\n"
         );
@@ -461,6 +484,7 @@ mod tests {
             InsertFilePosition::Before,
         );
         assert_eq!(empty.status, InsertFileStatus::RangeOutOfBounds);
+        assert!(empty.post_edit_text.is_empty());
 
         std::fs::write(&path, b"one\n").unwrap();
         let stale = insert_file_blocking(

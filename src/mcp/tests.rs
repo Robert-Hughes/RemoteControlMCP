@@ -1461,6 +1461,10 @@ fn write_file_returns_structured_result_and_privacy_safe_events() {
     assert_eq!(result.status, WriteFileStatus::Completed);
     assert_eq!(result.replaced_line_count, Some(1));
     assert_eq!(result.inserted_bytes, replacement.len() as u64);
+    assert_eq!(
+        result.post_edit_text,
+        "1: one\n2: private\n3: replacement\n4: three"
+    );
     assert_eq!(call.is_error, Some(false));
     assert_eq!(only_text_content(&call), write_file_summary(&result));
     assert!(!only_text_content(&call).contains(replacement));
@@ -1612,12 +1616,22 @@ fn write_file_metadata_and_schemas_are_explicit() {
         "requested_end_line",
         "replaced_line_count",
         "inserted_bytes",
+        "post_edit_start_line",
+        "post_edit_end_line",
+        "post_edit_text",
+        "post_edit_truncated",
     ] {
         assert!(
             properties.contains_key(field),
             "missing output field {field}"
         );
     }
+    assert!(
+        properties["post_edit_text"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("not file content")
+    );
 
     let encoded = output_schema.to_string();
     for status in [
@@ -1691,9 +1705,19 @@ fn insertion_tools_metadata_schemas_handlers_and_events_are_explicit() {
             "path",
             "requested_line",
             "inserted_bytes",
+            "post_edit_start_line",
+            "post_edit_end_line",
+            "post_edit_text",
+            "post_edit_truncated",
         ] {
             assert!(root["properties"].get(field).is_some());
         }
+        assert!(
+            root["properties"]["post_edit_text"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("not file content")
+        );
         let encoded = output_schema.to_string();
         for status in [
             "completed",
@@ -1727,6 +1751,10 @@ fn insertion_tools_metadata_schemas_handlers_and_events_are_explicit() {
     let before = insert_file_structured_result(&before_call);
     assert_eq!(before.status, InsertFileStatus::Completed);
     assert_eq!(
+        before.post_edit_text,
+        "1: alpha\n2: private-before\n3: bravo\n4: charlie"
+    );
+    assert_eq!(
         only_text_content(&before_call),
         insert_file_summary(&before, InsertFilePosition::Before)
     );
@@ -1739,9 +1767,11 @@ fn insertion_tools_metadata_schemas_handlers_and_events_are_explicit() {
     let after_call = rt
         .block_on(server.insert_after_line(parameters_of(&after_request)))
         .unwrap();
+    let after = insert_file_structured_result(&after_call);
+    assert_eq!(after.status, InsertFileStatus::Completed);
     assert_eq!(
-        insert_file_structured_result(&after_call).status,
-        InsertFileStatus::Completed
+        after.post_edit_text,
+        "1: alpha\n2: private-before\n3: bravo\n4: private-after\n5: charlie"
     );
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),

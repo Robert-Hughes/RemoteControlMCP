@@ -1,4 +1,5 @@
 use crate::mcp::file_path::validate_line_file_path;
+use crate::mcp::read_file::post_edit_snippet;
 use crate::mcp::{
     McpServer, RequestData, RequestTimeoutOutcome, RequestUpdate, WriteFileRequest,
     WriteFileResult, WriteFileStatus, argument_error_result, missing_argument_message,
@@ -51,6 +52,10 @@ fn failure_result(
         requested_end_line: req.end_line,
         replaced_line_count: None,
         inserted_bytes: 0,
+        post_edit_start_line: None,
+        post_edit_end_line: None,
+        post_edit_text: String::new(),
+        post_edit_truncated: false,
     }
 }
 
@@ -305,28 +310,39 @@ fn open_existing_regular_file(
     display_path: &Path,
     open_path: &Path,
     pathname_metadata: std::fs::Metadata,
-) -> Result<(std::fs::File, std::fs::Metadata), WriteFileResult> {
+) -> Result<(std::fs::File, std::fs::Metadata), Box<WriteFileResult>> {
     if !pathname_metadata.is_file() {
-        return Err(failure_result(
+        return Err(Box::new(failure_result(
             req,
             display_path,
             WriteFileStatus::NotAFile,
             "The resolved path is not a regular file",
-        ));
+        )));
     }
 
-    let file = std::fs::File::open(open_path)
-        .map_err(|error| io_failure(req, display_path, error, WriteFileStatus::ReadFailed))?;
-    let opened_metadata = file
-        .metadata()
-        .map_err(|error| io_failure(req, display_path, error, WriteFileStatus::ReadFailed))?;
+    let file = std::fs::File::open(open_path).map_err(|error| {
+        Box::new(io_failure(
+            req,
+            display_path,
+            error,
+            WriteFileStatus::ReadFailed,
+        ))
+    })?;
+    let opened_metadata = file.metadata().map_err(|error| {
+        Box::new(io_failure(
+            req,
+            display_path,
+            error,
+            WriteFileStatus::ReadFailed,
+        ))
+    })?;
     if !opened_metadata.is_file() {
-        return Err(failure_result(
+        return Err(Box::new(failure_result(
             req,
             display_path,
             WriteFileStatus::NotAFile,
             "The opened path is not a regular file",
-        ));
+        )));
     }
 
     Ok((file, opened_metadata))
@@ -457,6 +473,8 @@ fn create_missing_file(req: &WriteFileRequest, path: &Path) -> WriteFileResult {
         return io_failure(req, path, error, WriteFileStatus::WriteFailed);
     }
 
+    let snippet = post_edit_snippet(&stage.path, 1);
+
     if let Err(error) = commit_creation(&stage.path, path) {
         let status = if error.kind() == std::io::ErrorKind::PermissionDenied {
             WriteFileStatus::AccessDenied
@@ -475,6 +493,10 @@ fn create_missing_file(req: &WriteFileRequest, path: &Path) -> WriteFileResult {
         requested_end_line: req.end_line,
         replaced_line_count: None,
         inserted_bytes: req.text.len() as u64,
+        post_edit_start_line: snippet.start_line,
+        post_edit_end_line: snippet.end_line,
+        post_edit_text: snippet.text,
+        post_edit_truncated: snippet.truncated,
     }
 }
 
@@ -487,7 +509,7 @@ fn replace_existing_file(
     let (file, opened_metadata) =
         match open_existing_regular_file(req, path, target_path, pathname_metadata) {
             Ok(opened) => opened,
-            Err(result) => return result,
+            Err(result) => return *result,
         };
 
     let mut stage = match create_staged_file(target_path) {
@@ -496,7 +518,7 @@ fn replace_existing_file(
     };
     let mut reader = std::io::BufReader::new(file);
 
-    let edit_result = (|| -> Result<(), WriteFileResult> {
+    let edit_result = (|| -> Result<(), Box<WriteFileResult>> {
         let stage_file = stage.file.as_mut().expect("staging file should be open");
         let mut writer = std::io::BufWriter::new(stage_file);
 
@@ -504,22 +526,22 @@ fn replace_existing_file(
             match copy_line_exact(&mut reader, &mut writer) {
                 Ok(true) => {}
                 Ok(false) => {
-                    return Err(failure_result(
+                    return Err(Box::new(failure_result(
                         req,
                         path,
                         WriteFileStatus::RangeOutOfBounds,
                         "The requested line range extends beyond the end of the file",
-                    ));
+                    )));
                 }
-                Err(error) => return Err(exact_copy_failure(req, path, error)),
+                Err(error) => return Err(Box::new(exact_copy_failure(req, path, error))),
             }
         }
 
         let mut preserved_bom = false;
         if req.start_line == 1 {
-            let buffer = reader
-                .fill_buf()
-                .map_err(|error| io_failure(req, path, error, WriteFileStatus::ReadFailed))?;
+            let buffer = reader.fill_buf().map_err(|error| {
+                Box::new(io_failure(req, path, error, WriteFileStatus::ReadFailed))
+            })?;
             if buffer.starts_with(&[0xEF, 0xBB, 0xBF]) {
                 reader.consume(3);
                 preserved_bom = true;
@@ -535,24 +557,26 @@ fn replace_existing_file(
             let initial_bytes = preserved_bom && line_number == 1;
             let selected =
                 consume_line_matching(&mut reader, expected_line.as_bytes(), initial_bytes)
-                    .map_err(|error| io_failure(req, path, error, WriteFileStatus::ReadFailed))?;
+                    .map_err(|error| {
+                        Box::new(io_failure(req, path, error, WriteFileStatus::ReadFailed))
+                    })?;
             if !(selected.exists || empty_file_virtual_line && line_number == 1) {
-                return Err(failure_result(
+                return Err(Box::new(failure_result(
                     req,
                     path,
                     WriteFileStatus::RangeOutOfBounds,
                     "The requested line range extends beyond the end of the file",
-                ));
+                )));
             }
             if !selected.matches
                 && !(empty_file_virtual_line && line_number == 1 && expected_line.is_empty())
             {
-                return Err(failure_result(
+                return Err(Box::new(failure_result(
                     req,
                     path,
                     WriteFileStatus::ContentMismatch,
                     "The selected lines do not match expected_text",
-                ));
+                )));
             }
             if line_number == req.end_line {
                 selected_terminator = selected.terminator;
@@ -561,37 +585,40 @@ fn replace_existing_file(
 
         let suffix_exists = !reader
             .fill_buf()
-            .map_err(|error| io_failure(req, path, error, WriteFileStatus::ReadFailed))?
+            .map_err(|error| Box::new(io_failure(req, path, error, WriteFileStatus::ReadFailed)))?
             .is_empty();
 
         if preserved_bom {
-            writer
-                .write_all(&[0xEF, 0xBB, 0xBF])
-                .map_err(|error| io_failure(req, path, error, WriteFileStatus::WriteFailed))?;
+            writer.write_all(&[0xEF, 0xBB, 0xBF]).map_err(|error| {
+                Box::new(io_failure(req, path, error, WriteFileStatus::WriteFailed))
+            })?;
         }
-        writer
-            .write_all(req.text.as_bytes())
-            .map_err(|error| io_failure(req, path, error, WriteFileStatus::WriteFailed))?;
+        writer.write_all(req.text.as_bytes()).map_err(|error| {
+            Box::new(io_failure(req, path, error, WriteFileStatus::WriteFailed))
+        })?;
         if suffix_exists && !req.text.is_empty() && !req.text.as_bytes().ends_with(b"\n") {
             writer
                 .write_all(selected_terminator.unwrap_or(b"\n"))
-                .map_err(|error| io_failure(req, path, error, WriteFileStatus::WriteFailed))?;
+                .map_err(|error| {
+                    Box::new(io_failure(req, path, error, WriteFileStatus::WriteFailed))
+                })?;
         }
         copy_remaining_exact(&mut reader, &mut writer)
-            .map_err(|error| exact_copy_failure(req, path, error))?;
-        writer
-            .flush()
-            .map_err(|error| io_failure(req, path, error, WriteFileStatus::WriteFailed))?;
+            .map_err(|error| Box::new(exact_copy_failure(req, path, error)))?;
+        writer.flush().map_err(|error| {
+            Box::new(io_failure(req, path, error, WriteFileStatus::WriteFailed))
+        })?;
         Ok(())
     })();
 
     drop(reader);
     if let Err(result) = edit_result {
-        return result;
+        return *result;
     }
     if let Err(error) = stage.close() {
         return io_failure(req, path, error, WriteFileStatus::WriteFailed);
     }
+    let snippet = post_edit_snippet(&stage.path, req.start_line);
     if let Err(error) = std::fs::set_permissions(&stage.path, opened_metadata.permissions()) {
         return io_failure(req, path, error, WriteFileStatus::WriteFailed);
     }
@@ -613,6 +640,10 @@ fn replace_existing_file(
         requested_end_line: req.end_line,
         replaced_line_count: Some(req.end_line - req.start_line + 1),
         inserted_bytes: req.text.len() as u64,
+        post_edit_start_line: snippet.start_line,
+        post_edit_end_line: snippet.end_line,
+        post_edit_text: snippet.text,
+        post_edit_truncated: snippet.truncated,
     }
 }
 
@@ -984,6 +1015,7 @@ mod tests {
 
         assert_eq!(result.status, WriteFileStatus::Created);
         assert_eq!(result.replaced_line_count, None);
+        assert_eq!(result.post_edit_text, "1: created");
         assert_eq!(std::fs::read(&path).unwrap(), b"created");
         std::fs::remove_file(&path).unwrap();
 
@@ -1132,12 +1164,15 @@ mod tests {
         mismatch.expected_text = "one\nnot-blank".to_string();
         let mismatch_result = write_file_blocking(mismatch, path.clone());
         assert_eq!(mismatch_result.status, WriteFileStatus::ContentMismatch);
+        assert!(mismatch_result.post_edit_text.is_empty());
+        assert_eq!(mismatch_result.post_edit_start_line, None);
         assert_eq!(std::fs::read(&path).unwrap(), original);
 
         let mut exact = request(&path, 1, 2, "changed");
         exact.expected_text = "one\n".to_string();
         let exact_result = write_file_blocking(exact, path.clone());
         assert_eq!(exact_result.status, WriteFileStatus::Completed);
+        assert_eq!(exact_result.post_edit_text, "1: changed\n2: three");
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"\xEF\xBB\xBFchanged\r\nthree\n"

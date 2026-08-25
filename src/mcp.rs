@@ -345,6 +345,16 @@ pub struct WriteFileResult {
     pub replaced_line_count: Option<u64>,
     #[schemars(schema_with = "nonnegative_integer_schema")]
     pub inserted_bytes: u64,
+    /// First line in the bounded numbered post-edit excerpt; null when unavailable or no lines remain.
+    #[schemars(schema_with = "nullable_positive_integer_schema")]
+    pub post_edit_start_line: Option<u64>,
+    /// Last line in the bounded numbered post-edit excerpt; null when unavailable or no lines remain.
+    #[schemars(schema_with = "nullable_positive_integer_schema")]
+    pub post_edit_end_line: Option<u64>,
+    /// One bounded post-edit representation in `<line_number>: <content>` form. Prefixes are not file content.
+    pub post_edit_text: String,
+    /// Whether the post-edit excerpt omitted a complete line because of its 16 KiB byte limit.
+    pub post_edit_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -373,6 +383,16 @@ pub struct InsertFileResult {
     /// UTF-8 byte length supplied in text on success; zero on failure. Synthesized separators are excluded.
     #[schemars(schema_with = "nonnegative_integer_schema")]
     pub inserted_bytes: u64,
+    /// First line in the bounded numbered post-edit excerpt; null when unavailable or no lines remain.
+    #[schemars(schema_with = "nullable_positive_integer_schema")]
+    pub post_edit_start_line: Option<u64>,
+    /// Last line in the bounded numbered post-edit excerpt; null when unavailable or no lines remain.
+    #[schemars(schema_with = "nullable_positive_integer_schema")]
+    pub post_edit_end_line: Option<u64>,
+    /// One bounded post-edit representation in `<line_number>: <content>` form. Prefixes are not file content.
+    pub post_edit_text: String,
+    /// Whether the post-edit excerpt omitted a complete line because of its 16 KiB byte limit.
+    pub post_edit_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1100,7 +1120,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Insert non-empty text immediately before an existing 1-based line in a local regular file. Use the line numbers shown by read_file, but do not include read_file's `<line_number>: ` presentation prefixes in text.",
+        description = "Insert non-empty text immediately before an existing 1-based line in a local regular file. Use the line numbers shown by read_file, but do not include read_file's `<line_number>: ` presentation prefixes in text. On success, inspect the bounded numbered post_edit_text excerpt for misplaced or duplicate lines.",
         input_schema = input_schema_for::<InsertFileRequest>("insert_before_line"),
         output_schema = rmcp::handler::server::tool::schema_for_output::<InsertFileResult>(),
         annotations(
@@ -1119,7 +1139,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Insert non-empty text immediately after an existing 1-based line in a local regular file. Use the line numbers shown by read_file, but do not include read_file's `<line_number>: ` presentation prefixes in text.",
+        description = "Insert non-empty text immediately after an existing 1-based line in a local regular file. Use the line numbers shown by read_file, but do not include read_file's `<line_number>: ` presentation prefixes in text. On success, inspect the bounded numbered post_edit_text excerpt for misplaced or duplicate lines.",
         input_schema = input_schema_for::<InsertFileRequest>("insert_after_line"),
         output_schema = rmcp::handler::server::tool::schema_for_output::<InsertFileResult>(),
         annotations(
@@ -1138,7 +1158,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Replace or delete a strict 1-based inclusive line range in a local regular file only when expected_text exactly matches the current unnumbered logical content, or explicitly create a missing file when expected_text is empty. Use line numbers shown by read_file, but remove read_file's `<line_number>: ` prefixes from expected_text.",
+        description = "Replace or delete a strict 1-based inclusive line range in a local regular file only when expected_text exactly matches the current unnumbered logical content, or explicitly create a missing file when expected_text is empty. Use line numbers shown by read_file, but remove read_file's `<line_number>: ` prefixes from expected_text. On success, inspect the bounded numbered post_edit_text excerpt for misplaced or duplicate lines.",
         input_schema = input_schema_for::<WriteFileRequest>("write_file"),
         output_schema = rmcp::handler::server::tool::schema_for_output::<WriteFileResult>(),
         annotations(

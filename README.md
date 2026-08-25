@@ -198,7 +198,7 @@ Both tools have the same input schema:
 
 The supplied `text` bytes are preserved. When a separator is required at a boundary and `text` does not already provide one, the server uses the anchor line's LF or CRLF terminator, falling back to LF for an unterminated anchor. A leading UTF-8 BOM remains at the beginning of the file. Untouched bytes, permissions, symlink targets, and final-newline state are otherwise handled like `write_file`.
 
-Each tool returns `status`, optional `error`, resolved `path`, `requested_line`, and `inserted_bytes`. Runtime filesystem failures are structured non-error MCP results. Invalid parameters, including empty or oversized `text`, return MCP invalid-parameter errors.
+Each tool returns `status`, optional `error`, resolved `path`, `requested_line`, `inserted_bytes`, and the bounded post-edit fields described below for `write_file`. Runtime filesystem failures are structured non-error MCP results. Invalid parameters, including empty or oversized `text`, return MCP invalid-parameter errors.
 
 ---
 
@@ -230,7 +230,7 @@ Filesystem work runs through `spawn_blocking`. Existing files are rewritten to a
 
 #### Result shape
 
-`content` contains exactly one concise human-readable summary and never contains the replacement text. `structuredContent` contains:
+`content` contains exactly one concise human-readable summary and never contains file text. `structuredContent` contains:
 
 * **`status`**: `completed`, `created`, `not_found`, `parent_not_found`, `parent_not_a_directory`, `access_denied`, `not_a_file`, `range_out_of_bounds`, `content_mismatch`, `read_failed`, `write_failed`, or `replace_failed`.
 * **`error`**: Optional filesystem or operating-system detail.
@@ -238,6 +238,11 @@ Filesystem work runs through `spawn_blocking`. Existing files are rewritten to a
 * **`requested_start_line`** / **`requested_end_line`**: Original validated range.
 * **`replaced_line_count`**: Number of existing lines replaced, or `null` for creation and failures.
 * **`inserted_bytes`**: UTF-8 byte length inserted on success; zero for failed results.
+* **`post_edit_start_line`** / **`post_edit_end_line`**: Inclusive range of the returned post-edit excerpt, or `null` when no resulting line is available or the mutation failed.
+* **`post_edit_text`**: A single numbered view of the resulting file around the first affected line, using the same `<line_number>: ` presentation prefixes as `read_file`. It is empty on failures and when no lines remain.
+* **`post_edit_truncated`**: Whether the excerpt omitted a complete line because of its byte limit.
+
+Successful mutation results include at most 11 post-edit lines: the first affected line and up to five lines before and after it. The complete excerpt, including prefixes and separators, is limited to 16 KiB and never splits a line. The excerpt appears only once, in `structuredContent`; it is not duplicated in the textual summary. Callers should inspect it for misplaced or duplicate lines before issuing another positional mutation.
 
 Valid requests return ordinary non-error MCP tool results even for structured filesystem failures. Invalid paths, ranges, or oversized replacement text return MCP invalid-parameter errors.
 

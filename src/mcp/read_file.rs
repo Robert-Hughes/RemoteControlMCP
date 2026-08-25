@@ -10,6 +10,16 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 const MAX_FILE_BYTES: usize = 256 * 1024;
+const POST_EDIT_CONTEXT_LINES: u64 = 5;
+pub(crate) const MAX_POST_EDIT_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Default)]
+pub(crate) struct PostEditSnippet {
+    pub(crate) start_line: Option<u64>,
+    pub(crate) end_line: Option<u64>,
+    pub(crate) text: String,
+    pub(crate) truncated: bool,
+}
 
 #[cfg(test)]
 pub(crate) use test_hooks::install as install_blocking_test_hook;
@@ -272,6 +282,78 @@ fn read_file_blocking(req: ReadFileRequest, path: PathBuf) -> ReadFileResult {
     }
 }
 
+pub(crate) fn post_edit_snippet(path: &Path, focus_line: u64) -> PostEditSnippet {
+    let start_line = focus_line.saturating_sub(POST_EDIT_CONTEXT_LINES).max(1);
+    let end_line = focus_line.saturating_add(POST_EDIT_CONTEXT_LINES);
+    let Ok(file) = std::fs::File::open(path) else {
+        return PostEditSnippet::default();
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut line_number = 1_u64;
+    while line_number < start_line {
+        match skip_line(&mut reader) {
+            Ok(true) => line_number += 1,
+            Ok(false) | Err(_) => return PostEditSnippet::default(),
+        }
+    }
+
+    let mut selected = Vec::new();
+    let mut actual_start_line = None;
+    let mut actual_end_line = None;
+    let mut truncated = false;
+    while line_number <= end_line {
+        let maximum_line_bytes = MAX_POST_EDIT_BYTES + usize::from(line_number == 1) * 3;
+        let mut line = match read_line_bounded(&mut reader, maximum_line_bytes) {
+            Ok(BoundedLine::Eof) => break,
+            Ok(BoundedLine::Complete(line)) => line,
+            Ok(BoundedLine::TooLong) => {
+                truncated = true;
+                if line_number < focus_line {
+                    if skip_line(&mut reader).is_err() {
+                        break;
+                    }
+                    line_number += 1;
+                    continue;
+                }
+                break;
+            }
+            Err(_) => break,
+        };
+        if line_number == 1 && line.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            line.drain(..3);
+        }
+
+        let prefix = format!("{line_number}: ");
+        let separator_bytes = usize::from(actual_start_line.is_some());
+        let contribution = separator_bytes
+            .saturating_add(prefix.len())
+            .saturating_add(line.len());
+        if selected.len().saturating_add(contribution) > MAX_POST_EDIT_BYTES {
+            truncated = true;
+            if line_number < focus_line && actual_start_line.is_none() {
+                line_number += 1;
+                continue;
+            }
+            break;
+        }
+        if separator_bytes != 0 {
+            selected.push(b'\n');
+        }
+        selected.extend_from_slice(prefix.as_bytes());
+        selected.extend_from_slice(&line);
+        actual_start_line.get_or_insert(line_number);
+        actual_end_line = Some(line_number);
+        line_number += 1;
+    }
+
+    PostEditSnippet {
+        start_line: actual_start_line,
+        end_line: actual_end_line,
+        text: String::from_utf8_lossy(&selected).into_owned(),
+        truncated,
+    }
+}
+
 pub(crate) fn read_file_summary(result: &ReadFileResult) -> String {
     match result.status {
         ReadFileStatus::Completed => match (result.actual_start_line, result.actual_end_line) {
@@ -382,6 +464,51 @@ impl McpServer {
             },
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod snippet_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_path(prefix: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "remote_control_mcp_snippet_{prefix}_{}_{}",
+            std::process::id(),
+            id
+        ))
+    }
+
+    #[test]
+    fn post_edit_excerpt_is_numbered_context_bounded_and_byte_bounded() {
+        let path = temp_path("context");
+        let contents = (1..=20)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        std::fs::write(&path, contents).unwrap();
+        let excerpt = post_edit_snippet(&path, 10);
+        assert_eq!(excerpt.start_line, Some(5));
+        assert_eq!(excerpt.end_line, Some(15));
+        assert!(excerpt.text.starts_with("5: line 5\n"));
+        assert!(excerpt.text.ends_with("15: line 15"));
+        assert!(!excerpt.truncated);
+        assert!(excerpt.text.len() <= MAX_POST_EDIT_BYTES);
+        std::fs::remove_file(&path).unwrap();
+
+        let oversized_path = temp_path("oversized_context");
+        let mut oversized = vec![b'x'; MAX_POST_EDIT_BYTES + 1];
+        oversized.extend_from_slice(b"\nfocus\nafter\n");
+        std::fs::write(&oversized_path, oversized).unwrap();
+        let excerpt = post_edit_snippet(&oversized_path, 2);
+        assert_eq!(excerpt.start_line, Some(2));
+        assert_eq!(excerpt.end_line, Some(3));
+        assert_eq!(excerpt.text, "2: focus\n3: after");
+        assert!(excerpt.truncated);
+        assert!(excerpt.text.len() <= MAX_POST_EDIT_BYTES);
+        std::fs::remove_file(oversized_path).unwrap();
     }
 }
 
