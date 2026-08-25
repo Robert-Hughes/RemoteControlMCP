@@ -232,9 +232,12 @@ impl JsonSchema for ProcessIdSchema {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReadFileRequest {
+    /// Absolute path, or a path relative to the host temporary directory. The path is literal.
     pub path: String,
+    /// First line to return, using 1-based numbering.
     #[schemars(schema_with = "positive_integer_schema")]
     pub start_line: u64,
+    /// Last line to return, inclusive. The requested range may contain at most 500 lines.
     #[schemars(schema_with = "positive_integer_schema")]
     pub end_line: u64,
 }
@@ -252,6 +255,7 @@ pub struct ReadFileResult {
     pub actual_start_line: Option<u64>,
     #[schemars(schema_with = "nullable_positive_integer_schema")]
     pub actual_end_line: Option<u64>,
+    /// Selected logical lines in `<line_number>: <content>` form. Number prefixes are not file content.
     pub text: String,
     pub eof: Option<bool>,
     #[schemars(schema_with = "nullable_positive_integer_schema")]
@@ -989,7 +993,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Read a 1-based inclusive line range from a local regular file.",
+        description = "Read a 1-based inclusive line range from a local regular file. Each returned logical line is prefixed with `<line_number>: ` for reliable editing; the prefix is presentation metadata and is not part of the file.",
         input_schema = input_schema_for::<ReadFileRequest>("read_file"),
         output_schema = rmcp::handler::server::tool::schema_for_output::<ReadFileResult>(),
         annotations(

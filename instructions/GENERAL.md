@@ -28,7 +28,7 @@ Use this server to launch local processes and to read or modify regular files on
 - Prefer absolute paths. Relative file paths resolve against the host temporary directory.
 - File paths are interpreted literally. Environment-variable syntax, `~`, wildcards, and shell expressions are not expanded.
 - File tools accept regular files only and use the operating-system permissions of the account running the server.
-- `read_file` is for text. Line ranges are one-based and inclusive, and each request may cover at most 500 lines. When it returns `truncated`, continue from `next_start_line` while retaining the original end line.
+- `read_file` is for text. Line ranges are one-based and inclusive, and each request may cover at most 500 lines. Every returned logical line is prefixed with `<line_number>: `; this prefix is presentation metadata and is not part of the file. When it returns `truncated`, continue from `next_start_line` while retaining the original end line.
 - `read_binary_file` reads the complete binary file or rejects it; it never truncates silently. Its hard server limit is 100,000,000 bytes (100 MB). The optional `max_bytes` argument may request a smaller limit but cannot raise the server limit.
 - Do not use `read_file` to ferry a binary file as textual base64 merely to work around the binary API.
 - `write_file` replaces exactly the selected range. Use the narrowest correct range and read the relevant lines first when the current contents are not already known.

@@ -204,14 +204,19 @@ fn read_file_blocking(req: ReadFileRequest, path: PathBuf) -> ReadFileResult {
 
         let has_selected_line = actual_start_line.is_some();
         let separator_bytes = usize::from(has_selected_line);
-        let contribution = separator_bytes.saturating_add(line.len());
+        let prefix = format!("{line_number}: ");
+        let contribution = separator_bytes
+            .saturating_add(prefix.len())
+            .saturating_add(line.len());
         if selected.len().saturating_add(contribution) > MAX_FILE_BYTES {
-            if !has_selected_line && line.len() > MAX_FILE_BYTES {
+            if !has_selected_line {
                 return failure_result(
                     &req,
                     &path,
                     ReadFileStatus::LineTooLong,
-                    format!("Line {line_number} exceeds the {MAX_FILE_BYTES}-byte limit"),
+                    format!(
+                        "Numbered line {line_number} exceeds the {MAX_FILE_BYTES}-byte output limit"
+                    ),
                 );
             }
 
@@ -233,6 +238,7 @@ fn read_file_blocking(req: ReadFileRequest, path: PathBuf) -> ReadFileResult {
         if separator_bytes != 0 {
             selected.push(b'\n');
         }
+        selected.extend_from_slice(prefix.as_bytes());
         selected.extend_from_slice(&line);
         actual_start_line.get_or_insert(line_number);
         actual_end_line = Some(line_number);

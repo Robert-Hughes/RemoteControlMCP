@@ -976,7 +976,7 @@ fn read_file_preserves_logical_lines_and_newline_semantics() {
     assert_eq!(result.status, ReadFileStatus::Completed);
     assert_eq!(result.actual_start_line, Some(1));
     assert_eq!(result.actual_end_line, Some(4));
-    assert_eq!(result.text, "first\n\nthird\nlast");
+    assert_eq!(result.text, "1: first\n2: \n3: third\n4: last");
     assert_eq!(result.eof, Some(true));
     assert!(!result.lossy_utf8);
     assert_eq!(result.next_start_line, None);
@@ -1014,12 +1014,12 @@ fn read_file_preserves_logical_lines_and_newline_semantics() {
         UiEventKind::RequestUpdated {
             update: RequestUpdate::ReadFileResponded { text, .. },
             ..
-        } if text == "first\n\nthird\nlast"
+        } if text == "1: first\n2: \n3: third\n4: last"
     ));
 
     let (single_call, _) = call_read_file_direct(make_read_file_request(&path, 2, 2));
     let single = read_file_structured_result(&single_call);
-    assert_eq!(single.text, "");
+    assert_eq!(single.text, "2: ");
     assert_eq!(single.actual_start_line, Some(2));
     assert_eq!(single.actual_end_line, Some(2));
     assert_eq!(single.eof, Some(false));
@@ -1028,7 +1028,7 @@ fn read_file_preserves_logical_lines_and_newline_semantics() {
     let leading_blanks = read_file_structured_result(
         &call_read_file_direct(make_read_file_request(&leading_blanks_path, 1, 3)).0,
     );
-    assert_eq!(leading_blanks.text, "\n\nthird");
+    assert_eq!(leading_blanks.text, "1: \n2: \n3: third");
     assert_eq!(leading_blanks.actual_start_line, Some(1));
     assert_eq!(leading_blanks.actual_end_line, Some(3));
 
@@ -1036,7 +1036,7 @@ fn read_file_preserves_logical_lines_and_newline_semantics() {
     let (bom_call, _) = call_read_file_direct(make_read_file_request(&bom_elsewhere, 2, 2));
     assert_eq!(
         read_file_structured_result(&bom_call).text,
-        "\u{feff}second"
+        "2: \u{feff}second"
     );
 
     let lf_path = write_temp_test_file("lf", b"one\ntwo\n");
@@ -1070,13 +1070,13 @@ fn read_file_handles_eof_empty_files_unicode_and_lossy_utf8() {
 
     let past_end =
         read_file_structured_result(&call_read_file_direct(make_read_file_request(&path, 2, 10)).0);
-    assert_eq!(past_end.text, "two\nthree");
+    assert_eq!(past_end.text, "2: two\n3: three");
     assert_eq!(past_end.actual_end_line, Some(3));
     assert_eq!(past_end.eof, Some(true));
 
     let before_eof =
         read_file_structured_result(&call_read_file_direct(make_read_file_request(&path, 1, 2)).0);
-    assert_eq!(before_eof.text, "one\ntwo");
+    assert_eq!(before_eof.text, "1: one\n2: two");
     assert_eq!(before_eof.eof, Some(false));
 
     let empty_path = write_temp_test_file("empty", b"");
@@ -1091,14 +1091,14 @@ fn read_file_handles_eof_empty_files_unicode_and_lossy_utf8() {
     let unicode = read_file_structured_result(
         &call_read_file_direct(make_read_file_request(&unicode_path, 1, 2)).0,
     );
-    assert_eq!(unicode.text, "雪\n🙂");
+    assert_eq!(unicode.text, "1: 雪\n2: 🙂");
     assert!(!unicode.lossy_utf8);
 
     let invalid_path = write_temp_test_file("invalid_utf8", b"valid\n\xFF\xFE\n");
     let invalid = read_file_structured_result(
         &call_read_file_direct(make_read_file_request(&invalid_path, 2, 2)).0,
     );
-    assert_eq!(invalid.text, "\u{fffd}\u{fffd}");
+    assert_eq!(invalid.text, "2: \u{fffd}\u{fffd}");
     assert!(invalid.lossy_utf8);
 
     for path in [path, empty_path, unicode_path, invalid_path] {
@@ -1147,7 +1147,7 @@ fn read_file_resolves_absolute_relative_and_parent_paths() {
         &call_read_file_direct(make_read_file_request(&absolute_path, 1, 1)).0,
     );
     assert!(Path::new(&absolute.path).is_absolute());
-    assert_eq!(absolute.text, "absolute");
+    assert_eq!(absolute.text, "1: absolute");
 
     let relative_name = generate_temp_test_path("relative")
         .file_name()
@@ -1161,7 +1161,7 @@ fn read_file_resolves_absolute_relative_and_parent_paths() {
         end_line: 1,
     };
     let relative = read_file_structured_result(&call_read_file_direct(relative_request).0);
-    assert_eq!(relative.text, "relative");
+    assert_eq!(relative.text, "1: relative");
     assert!(Path::new(&relative.path).is_absolute());
 
     let parent_name = generate_temp_test_path("parent")
@@ -1182,7 +1182,7 @@ fn read_file_resolves_absolute_relative_and_parent_paths() {
         end_line: 1,
     };
     let parent = read_file_structured_result(&call_read_file_direct(parent_request).0);
-    assert_eq!(parent.text, "parent");
+    assert_eq!(parent.text, "1: parent");
 
     std::fs::remove_file(absolute_path).unwrap();
     std::fs::remove_file(relative_path).unwrap();
@@ -1331,13 +1331,13 @@ fn read_file_validates_metadata_from_the_opened_handle() {
 
 #[test]
 fn read_file_enforces_complete_line_byte_limit_and_continuation() {
-    let exact_path = write_temp_test_file("exact_limit", &vec![b'a'; 256 * 1024]);
+    let exact_path = write_temp_test_file("exact_limit", &vec![b'a'; 256 * 1024 - 3]);
     let exact_call = call_read_file_direct(make_read_file_request(&exact_path, 1, 1)).0;
     let exact = read_file_structured_result(&exact_call);
     assert_eq!(exact.status, ReadFileStatus::Completed);
     assert_eq!(exact.text.len(), 256 * 1024);
 
-    let below_path = write_temp_test_file("below_limit", &vec![b'b'; 256 * 1024 - 1]);
+    let below_path = write_temp_test_file("below_limit", &vec![b'b'; 256 * 1024 - 4]);
     let below = read_file_structured_result(
         &call_read_file_direct(make_read_file_request(&below_path, 1, 1)).0,
     );
@@ -1357,7 +1357,7 @@ fn read_file_enforces_complete_line_byte_limit_and_continuation() {
     assert_eq!(truncated.actual_end_line, Some(1));
     assert_eq!(truncated.next_start_line, Some(2));
     assert_eq!(truncated.eof, Some(false));
-    assert_eq!(truncated.text.len(), 200 * 1024);
+    assert_eq!(truncated.text.len(), 200 * 1024 + 3);
     assert_eq!(truncated_call.is_error, Some(false));
     assert!(!only_text_content(&truncated_call).contains(&"c".repeat(100)));
     assert!(matches!(
@@ -1388,8 +1388,12 @@ fn read_file_enforces_complete_line_byte_limit_and_continuation() {
     assert_eq!(continued.status, ReadFileStatus::Completed);
     assert_eq!(continued.actual_start_line, Some(2));
     assert_eq!(continued.actual_end_line, Some(3));
-    assert!(continued.text.starts_with(&"d".repeat(100)));
-    assert!(continued.text.ends_with("\nthird"));
+    assert!(
+        continued
+            .text
+            .starts_with(&format!("2: {}", "d".repeat(100)))
+    );
+    assert!(continued.text.ends_with("\n3: third"));
 
     let oversized_path = write_temp_test_file("oversized", &vec![b'e'; 256 * 1024 + 1]);
     let oversized_call = call_read_file_direct(make_read_file_request(&oversized_path, 1, 1)).0;
@@ -1399,7 +1403,7 @@ fn read_file_enforces_complete_line_byte_limit_and_continuation() {
     assert_eq!(oversized.actual_end_line, None);
     assert!(oversized.text.is_empty());
     assert_eq!(oversized.next_start_line, None);
-    assert!(oversized.error.as_deref().unwrap().contains("Line 1"));
+    assert!(oversized.error.as_deref().unwrap().contains("line 1"));
     assert_eq!(oversized_call.is_error, Some(false));
 
     let mut blank_then_oversized_bytes = vec![b'\n'];
@@ -1412,7 +1416,7 @@ fn read_file_enforces_complete_line_byte_limit_and_continuation() {
     assert_eq!(blank_then_oversized.status, ReadFileStatus::Truncated);
     assert_eq!(blank_then_oversized.actual_start_line, Some(1));
     assert_eq!(blank_then_oversized.actual_end_line, Some(1));
-    assert_eq!(blank_then_oversized.text, "");
+    assert_eq!(blank_then_oversized.text, "1: ");
     assert_eq!(blank_then_oversized.next_start_line, Some(2));
 
     for path in [
@@ -4634,6 +4638,12 @@ fn read_file_integration_test_over_duplex() {
             .iter()
             .find(|tool| tool.name == "read_file")
             .expect("read_file tool should be exposed");
+        assert!(
+            tool.description
+                .as_deref()
+                .unwrap()
+                .contains("<line_number>: ")
+        );
 
         let annotations = tool.annotations.as_ref().expect("read_file annotations");
         assert_eq!(annotations.read_only_hint, Some(true));
@@ -4650,9 +4660,19 @@ fn read_file_integration_test_over_duplex() {
             let schema = &input_properties[field];
             assert_eq!(schema["type"], "integer");
             assert_eq!(schema["minimum"], 1);
+            assert!(
+                schema["description"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+            );
             assert!(schema.get("format").is_none());
             assert!(schema.get("default").is_none());
         }
+        assert!(
+            input_properties["path"]["description"]
+                .as_str()
+                .is_some_and(|value| value.contains("literal"))
+        );
         let encoded_input_schema =
             rmcp::serde_json::Value::Object((*tool.input_schema).clone()).to_string();
         assert!(!encoded_input_schema.contains("\"default\":null"));
@@ -4682,6 +4702,11 @@ fn read_file_integration_test_over_duplex() {
                 "missing output field {field}"
             );
         }
+        assert!(
+            output_properties["text"]["description"]
+                .as_str()
+                .is_some_and(|value| value.contains("not file content"))
+        );
         let encoded_output_schema = output_schema.to_string();
         for status in [
             "completed",
@@ -4715,7 +4740,7 @@ fn read_file_integration_test_over_duplex() {
         assert_eq!(completed_call.content.len(), 1);
         let completed = read_file_structured_result(&completed_call);
         assert_eq!(completed.status, ReadFileStatus::Completed);
-        assert_eq!(completed.text, "beta\ngamma");
+        assert_eq!(completed.text, "2: beta\n3: gamma");
         assert!(!only_text_content(&completed_call).contains("beta"));
 
         let mut truncated_params = rmcp::model::CallToolRequestParams::new("read_file");

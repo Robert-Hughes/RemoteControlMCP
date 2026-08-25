@@ -158,9 +158,11 @@ The server uses normal filesystem permissions and does not sandbox reads. Relati
 
 Files are scanned incrementally by LF boundaries rather than loaded in full. A selected line loses its terminating LF and an immediately preceding CR, so LF and CRLF files produce the same logical text. Blank lines and an unterminated final line are preserved. A UTF-8 BOM is removed only at the start of line 1.
 
+Each returned logical line is prefixed with `<line_number>: `, for example `170: let value = 1;`. The prefix is presentation metadata and is not part of the file. Blank line 171 is returned as `171: `. This is the only representation of the selected content; the server does not duplicate it in an unnumbered field.
+
 Returned bytes use lossy UTF-8 conversion. The `lossy_utf8` result field reports whether replacement characters were needed in the selected range.
 
-At most 256 KiB (`256 * 1024` raw logical-line bytes) is returned, and lines are never split. If the next complete line would exceed the limit after one or more lines have fitted, `status` is `truncated` and `next_start_line` identifies the first omitted line for a continuation call using the original `end_line`. If the first requested line itself exceeds the limit, the result has `status = line_too_long` and contains no partial text.
+At most 256 KiB (`256 * 1024` bytes), including line-number prefixes and separators, is returned, and lines are never split. If the next complete numbered line would exceed the limit after one or more lines have fitted, `status` is `truncated` and `next_start_line` identifies the first omitted line for a continuation call using the original `end_line`. If the first requested numbered line itself exceeds the limit, the result has `status = line_too_long` and contains no partial text.
 
 #### Result shape
 
@@ -171,7 +173,7 @@ At most 256 KiB (`256 * 1024` raw logical-line bytes) is returned, and lines are
 * **`path`**: Resolved absolute path.
 * **`requested_start_line`** / **`requested_end_line`**: Original validated range.
 * **`actual_start_line`** / **`actual_end_line`**: Returned inclusive range, or `null` when no line was returned.
-* **`text`**: Unnumbered selected file text, with logical lines joined by LF.
+* **`text`**: Selected logical lines joined by LF and prefixed with `<line_number>: `. Prefixes are presentation metadata, not file content.
 * **`eof`**: Whether EOF was reached for a successful read; `null` for runtime failures.
 * **`next_start_line`**: Continuation line for `truncated`, otherwise `null`.
 * **`lossy_utf8`**: Whether returned bytes required lossy replacement.
