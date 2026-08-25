@@ -54,7 +54,7 @@ When enabled, the limit applies to every exposed tool. If tool execution has not
 
 Timeout results use one consistent message shape: they state which timeout expired and include an `Outcome:` sentence describing what RemoteControlMCP actually did. Server-wide Maximum request timeout failures identify the configured per-request limit and tool; ordinary `launch_process timeout_ms` failures use the same `Outcome:` vocabulary while identifying the caller-configured process timeout instead. Pure async work is reported as cancelled; file-tool timeouts explain that blocking filesystem work may still finish; foreground process timeouts distinguish detached/still-running, stopped, and unconfirmed-stop outcomes. Cooperative `launch_process` timeout results also retain the structured `LaunchProcessResult` (including PID and output-file paths when available), so a detached process can be followed up rather than becoming anonymous background work.
 
-The generic watchdog is a response deadline, not a universal cancellation mechanism. File tools perform their operating-system work through Tokio `spawn_blocking`; once such blocking work has started, dropping the async wait cannot forcibly cancel the underlying OS operation. The bounded file operations may therefore finish in the background after a timeout. In particular, a `write_file` operation that was already in progress may still reach its atomic commit. Callers must not interpret a request-timeout result as proof that arbitrary blocking side effects were rolled back.
+The generic watchdog is a response deadline, not a universal cancellation mechanism. File tools perform their operating-system work through Tokio `spawn_blocking`; once such blocking work has started, dropping the async wait cannot forcibly cancel the underlying OS operation. The bounded file operations may therefore finish in the background after a timeout. In particular, a mutating file operation that was already in progress may still reach its atomic commit. Callers must not interpret a request-timeout result as proof that arbitrary blocking side effects were rolled back.
 
 `launch_process` receives additional cooperative handling because a foreground launch can intentionally remain alive for an arbitrary period and its blocking waiter owns a child process. Merely timing out the async wait could otherwise return an MCP error while leaving the foreground child and blocking worker running. For a foreground launch, RemoteControlMCP therefore calculates a process budget just below the request-wide limit, leaving up to one second of headroom for stop/detach cleanup and response construction. With a 110-second Maximum request timeout the cooperative process budget is **109 seconds**. If `timeout_ms` is omitted or is longer than that budget, the server clamps the effective process timeout to the cooperative budget; an explicitly supplied `timeout_action` is preserved, while an otherwise unbounded foreground launch defaults to `detach`. A shorter caller-supplied process timeout is left unchanged, and already-detached launches are not clamped because their MCP request returns immediately. The outer request watchdog remains active at the full configured limit as a final guard.
 
@@ -210,10 +210,13 @@ Replace a strict, 1-based inclusive line range in a local regular file. The repl
 
 * **`path`** (string, required): Uses the same absolute, relative, UNC, literal-path, and ambiguous-Windows-path rules as `read_file`.
 * **`start_line`** / **`end_line`** (positive integers, required): Inclusive range containing at most 500 lines.
+* **`expected_text`** (string, required): Exact current logical content of the selected range, without the `<line_number>: ` prefixes returned by `read_file`. Join multiple expected lines with LF and retain empty components for blank lines. The encoded value is limited to 256 KiB.
 * **`text`** (string, required): UTF-8 replacement text, limited to 256 KiB when encoded.
-* **`create_if_missing`** (boolean, required): Missing files are created only when this is `true` and the requested range is exactly `1-1`.
+* **`create_if_missing`** (boolean, required): Missing files are created only when this is `true`, the requested range is exactly `1-1`, and `expected_text` is empty.
 
-For an existing non-empty file, every requested line must exist. A range extending beyond EOF returns `range_out_of_bounds` and leaves the original unchanged. An empty existing file has one virtual editable line, so range `1-1` can populate it.
+For an existing non-empty file, every requested line must exist. A range extending beyond EOF returns `range_out_of_bounds` and leaves the original unchanged. If the selected logical lines do not exactly equal `expected_text`, the result is `content_mismatch` and the original remains unchanged. An empty existing file has one virtual editable line whose expected content is empty, so range `1-1` can populate it.
+
+Line terminators are normalized only for the precondition: LF and CRLF both separate expected logical lines and are represented by LF in `expected_text`. A leading UTF-8 BOM is excluded. Each selected file line must otherwise match the UTF-8 bytes in the corresponding expected line exactly. Consequently, a range containing invalid UTF-8 cannot be edited with `write_file`; use another local editing mechanism.
 
 Creation never creates parent directories. A missing parent returns `parent_not_found`; a parent path that is not a directory returns `parent_not_a_directory`. A missing file with `create_if_missing = false` returns `not_found`.
 
@@ -229,7 +232,7 @@ Filesystem work runs through `spawn_blocking`. Existing files are rewritten to a
 
 `content` contains exactly one concise human-readable summary and never contains the replacement text. `structuredContent` contains:
 
-* **`status`**: `completed`, `created`, `not_found`, `parent_not_found`, `parent_not_a_directory`, `access_denied`, `not_a_file`, `range_out_of_bounds`, `read_failed`, `write_failed`, or `replace_failed`.
+* **`status`**: `completed`, `created`, `not_found`, `parent_not_found`, `parent_not_a_directory`, `access_denied`, `not_a_file`, `range_out_of_bounds`, `content_mismatch`, `read_failed`, `write_failed`, or `replace_failed`.
 * **`error`**: Optional filesystem or operating-system detail.
 * **`path`**: Resolved absolute request path.
 * **`requested_start_line`** / **`requested_end_line`**: Original validated range.
@@ -312,7 +315,7 @@ When you run this command:
 1. The Inspector web UI launches.
 2. In the Inspector, choose **Streamable HTTP**, enter `http://127.0.0.1:61337/mcp`, and connect.
 3. The Inspector connects to the already-running application over loopback TCP.
-4. The Inspector UI shows the `get_instructions`, `ping`, `launch_process`, `read_file`, `read_binary_file`, and `write_file` tools.
+4. The Inspector UI shows the `get_instructions`, `ping`, `launch_process`, `read_file`, `read_binary_file`, `insert_before_line`, `insert_after_line`, and `write_file` tools.
 5. You can invoke any tool and inspect outputs.
 
 ### CLI Mode
@@ -356,7 +359,7 @@ Recognised images are returned as native MCP image content. Other binary files a
 
 **Call the `write_file` tool:**
 ```sh
-npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transport http --method tools/call --tool-name write_file --tool-arg path=RemoteControlMCP/example.txt --tool-arg start_line=1 --tool-arg end_line=1 --tool-arg text=updated --tool-arg create_if_missing=true
+npx -y @modelcontextprotocol/inspector --cli http://127.0.0.1:61337/mcp --transport http --method tools/call --tool-name write_file --tool-arg path=RemoteControlMCP/example.txt --tool-arg start_line=1 --tool-arg end_line=1 --tool-arg expected_text= --tool-arg text=updated --tool-arg create_if_missing=true
 ```
 
 Relative paths resolve beneath the system temporary directory (`%TEMP%` on Windows, `$TMPDIR` on macOS and Linux); Windows also accepts backslash separators.

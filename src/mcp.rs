@@ -180,6 +180,7 @@ pub enum WriteFileStatus {
     AccessDenied,
     NotAFile,
     RangeOutOfBounds,
+    ContentMismatch,
     ReadFailed,
     WriteFailed,
     ReplaceFailed,
@@ -315,12 +316,19 @@ pub struct ReadBinaryFileResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WriteFileRequest {
+    /// Absolute path, or a path relative to the host temporary directory. The path is literal.
     pub path: String,
+    /// First existing line to replace, using 1-based numbering.
     #[schemars(schema_with = "positive_integer_schema")]
     pub start_line: u64,
+    /// Last existing line to replace, inclusive. The selected range may contain at most 500 lines.
     #[schemars(schema_with = "positive_integer_schema")]
     pub end_line: u64,
+    /// Exact unnumbered logical content expected in the selected range, with lines joined by LF. The edit is rejected if it differs. Do not include read_file's `<line_number>: ` prefixes.
+    pub expected_text: String,
+    /// UTF-8 replacement text, limited to 256 KiB when encoded. An empty value deletes the selected range.
     pub text: String,
+    /// Whether a missing file may be created. Creation requires range 1-1 and empty expected_text.
     pub create_if_missing: bool,
 }
 
@@ -1130,7 +1138,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Replace a strict 1-based inclusive line range in a local regular file, or explicitly create a missing file.",
+        description = "Replace or delete a strict 1-based inclusive line range in a local regular file only when expected_text exactly matches the current unnumbered logical content, or explicitly create a missing file when expected_text is empty. Use line numbers shown by read_file, but remove read_file's `<line_number>: ` prefixes from expected_text.",
         input_schema = input_schema_for::<WriteFileRequest>("write_file"),
         output_schema = rmcp::handler::server::tool::schema_for_output::<WriteFileResult>(),
         annotations(

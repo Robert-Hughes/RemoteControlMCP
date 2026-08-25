@@ -33,6 +33,6 @@ Use this server to launch local processes and to read or modify regular files on
 - `read_binary_file` reads the complete binary file or rejects it; it never truncates silently. Its hard server limit is 100,000,000 bytes (100 MB). The optional `max_bytes` argument may request a smaller limit but cannot raise the server limit.
 - Do not use `read_file` to ferry a binary file as textual base64 merely to work around the binary API.
 - `insert_before_line` and `insert_after_line` anchor non-empty text to an existing 1-based line. Pass file content only in `text`; never copy the `<line_number>: ` prefixes returned by `read_file`. Do not simulate insertion by replacing and reproducing an adjacent line.
-- `write_file` replaces exactly the selected range. Use the narrowest correct range and read the relevant lines first when the current contents are not already known.
+- `write_file` replaces exactly the selected range only when `expected_text` matches its current unnumbered logical content. Copy the content shown by `read_file` without the `<line_number>: ` prefixes, join multiple expected lines with LF, and preserve blank lines. Use an empty `text` to delete the matched range. A mismatch is rejected without changing the file.
 - Missing files are created only when `create_if_missing = true` and the requested range is `1-1`. Parent directories are never created automatically.
 - File access and process execution are not sandboxed. Confirm paths and targets before performing destructive operations.

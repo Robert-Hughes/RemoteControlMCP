@@ -670,7 +670,7 @@ For the ChatGPT setup tested here, configure **Maximum request timeout = 110 sec
 
 So this is **not quite a simple clamp to 110 seconds**. With a 110-second Maximum request timeout, an omitted or overly long foreground process timeout is clamped to 109 seconds so RemoteControlMCP can stop or detach the child and still return the helpful timeout error before the 110-second request watchdog expires.
 
-The generic watchdog on the file tools is a response deadline rather than a universal cancellation facility. Their bounded filesystem work also uses `spawn_blocking`, and an operating-system operation already in progress cannot be forcibly cancelled by dropping its async waiter. Such work may therefore finish in the background after the MCP timeout; in particular, callers should not interpret a timed-out `write_file` response as proof that an in-progress staged write could not subsequently reach its atomic commit.
+The generic watchdog on the file tools is a response deadline rather than a universal cancellation facility. Their bounded filesystem work also uses `spawn_blocking`, and an operating-system operation already in progress cannot be forcibly cancelled by dropping its async waiter. Such work may therefore finish in the background after the MCP timeout; in particular, callers should not interpret a timed-out mutating file-tool response as proof that an in-progress staged write could not subsequently reach its atomic commit.
 
 The need for this local safeguard was reproduced on 2026-08-25 with `/bin/sleep 180`, `timeout_ms = 130000`, and `timeout_action = "stop"`, before Maximum request timeout existed:
 

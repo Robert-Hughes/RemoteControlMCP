@@ -628,6 +628,7 @@ fn make_write_file_request(
     path: &std::path::Path,
     start_line: u64,
     end_line: u64,
+    expected_text: &str,
     text: &str,
     create_if_missing: bool,
 ) -> WriteFileRequest {
@@ -635,6 +636,7 @@ fn make_write_file_request(
         path: path.to_string_lossy().into_owned(),
         start_line,
         end_line,
+        expected_text: expected_text.to_string(),
         text: text.to_string(),
         create_if_missing,
     }
@@ -1446,8 +1448,14 @@ fn read_file_enforces_complete_line_byte_limit_and_continuation() {
 fn write_file_returns_structured_result_and_privacy_safe_events() {
     let path = write_temp_test_file("write_direct", b"one\ntwo\nthree\n");
     let replacement = "private\nreplacement";
-    let (call, events) =
-        call_write_file_direct(make_write_file_request(&path, 2, 2, replacement, false));
+    let (call, events) = call_write_file_direct(make_write_file_request(
+        &path,
+        2,
+        2,
+        "two",
+        replacement,
+        false,
+    ));
     let result = write_file_structured_result(&call);
 
     assert_eq!(result.status, WriteFileStatus::Completed);
@@ -1500,7 +1508,7 @@ fn write_file_returns_structured_result_and_privacy_safe_events() {
 fn write_file_validation_rejection_has_one_privacy_safe_lifecycle() {
     let path = generate_temp_test_path("write_rejected");
     let replacement = "secret".repeat(50_000);
-    let req = make_write_file_request(&path, 1, 1, &replacement, true);
+    let req = make_write_file_request(&path, 1, 1, "", &replacement, true);
     let validation_error = validate_write_file_request(&req).unwrap_err();
     assert!(validation_error.contains("262144"));
 
@@ -1552,6 +1560,7 @@ fn write_file_metadata_and_schemas_are_explicit() {
         "path",
         "start_line",
         "end_line",
+        "expected_text",
         "text",
         "create_if_missing",
     ] {
@@ -1562,6 +1571,30 @@ fn write_file_metadata_and_schemas_are_explicit() {
         assert_eq!(input_properties[field]["type"], "integer");
         assert_eq!(input_properties[field]["minimum"], 1);
         assert!(input_properties[field].get("format").is_none());
+        assert!(
+            input_properties[field]["description"]
+                .as_str()
+                .is_some_and(|description| !description.is_empty())
+        );
+    }
+    assert!(
+        attr.description
+            .as_deref()
+            .unwrap()
+            .contains("expected_text exactly matches")
+    );
+    assert!(
+        input_properties["expected_text"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("<line_number>: ")
+    );
+    for field in ["path", "text", "create_if_missing"] {
+        assert!(
+            input_properties[field]["description"]
+                .as_str()
+                .is_some_and(|description| !description.is_empty())
+        );
     }
 
     let output_schema = attr
@@ -1596,6 +1629,7 @@ fn write_file_metadata_and_schemas_are_explicit() {
         "access_denied",
         "not_a_file",
         "range_out_of_bounds",
+        "content_mismatch",
         "read_failed",
         "write_failed",
         "replace_failed",
@@ -4285,6 +4319,7 @@ fn write_file_integration_test_over_duplex() {
                 "path": path.to_string_lossy(),
                 "start_line": 2,
                 "end_line": 2,
+                "expected_text": "two",
                 "text": replacement,
                 "create_if_missing": false
             })
@@ -4312,6 +4347,7 @@ fn write_file_integration_test_over_duplex() {
                 "path": created_path.to_string_lossy(),
                 "start_line": 1,
                 "end_line": 1,
+                "expected_text": "",
                 "text": "created body",
                 "create_if_missing": true
             })
@@ -4336,6 +4372,7 @@ fn write_file_integration_test_over_duplex() {
                 "path": path.to_string_lossy(),
                 "start_line": 20,
                 "end_line": 20,
+                "expected_text": "",
                 "text": "must not appear",
                 "create_if_missing": false
             })
@@ -4359,6 +4396,7 @@ fn write_file_integration_test_over_duplex() {
                 "path": path.to_string_lossy(),
                 "start_line": 1,
                 "end_line": 501,
+                "expected_text": "",
                 "text": "",
                 "create_if_missing": false
             })
@@ -4434,6 +4472,7 @@ fn write_file_blocking_work_does_not_block_ping() {
                     "path": write_path.to_string_lossy(),
                     "start_line": 1,
                     "end_line": 1,
+                    "expected_text": "before",
                     "text": "after",
                     "create_if_missing": false
                 })

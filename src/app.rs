@@ -323,6 +323,10 @@ fn write_file_presentation(
         WriteFileStatus::RangeOutOfBounds => {
             (RequestState::Failed, "Line range out of bounds".to_string())
         }
+        WriteFileStatus::ContentMismatch => (
+            RequestState::Failed,
+            "Expected content did not match".to_string(),
+        ),
         WriteFileStatus::ReadFailed => (RequestState::Failed, "Read failed".to_string()),
         WriteFileStatus::WriteFailed => (RequestState::Failed, "Write failed".to_string()),
         WriteFileStatus::ReplaceFailed => (
@@ -1931,6 +1935,7 @@ mod tests {
             WriteFileStatus::AccessDenied,
             WriteFileStatus::NotAFile,
             WriteFileStatus::RangeOutOfBounds,
+            WriteFileStatus::ContentMismatch,
             WriteFileStatus::ReadFailed,
             WriteFileStatus::WriteFailed,
             WriteFileStatus::ReplaceFailed,

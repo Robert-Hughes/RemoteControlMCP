@@ -17,6 +17,18 @@ pub(crate) use test_hooks::install as install_blocking_test_hook;
 
 pub(crate) fn validate_write_file_request(req: &WriteFileRequest) -> Result<PathBuf, String> {
     let path = validate_line_file_path(&req.path, req.start_line, req.end_line)?;
+    if req.expected_text.len() > MAX_REPLACEMENT_BYTES {
+        return Err(format!(
+            "expected_text cannot exceed {MAX_REPLACEMENT_BYTES} UTF-8 bytes"
+        ));
+    }
+    let expected_line_count = req.expected_text.split('\n').count() as u64;
+    let requested_line_count = req.end_line - req.start_line + 1;
+    if expected_line_count != requested_line_count {
+        return Err(format!(
+            "expected_text must contain exactly {requested_line_count} logical lines for the requested range"
+        ));
+    }
     if req.text.len() > MAX_REPLACEMENT_BYTES {
         return Err(format!(
             "text cannot exceed {MAX_REPLACEMENT_BYTES} UTF-8 bytes"
@@ -225,6 +237,69 @@ pub(super) fn skip_line_with_terminator(
     }
 }
 
+struct MatchedLine {
+    exists: bool,
+    terminator: Option<&'static [u8]>,
+    matches: bool,
+}
+
+fn consume_line_matching(
+    reader: &mut impl BufRead,
+    expected: &[u8],
+    mut saw_bytes: bool,
+) -> std::io::Result<MatchedLine> {
+    let mut pending_byte = None;
+    let mut expected_index = 0;
+    let mut matches = true;
+
+    let compare_byte = |byte: u8, expected_index: &mut usize, matches: &mut bool| {
+        if expected.get(*expected_index) != Some(&byte) {
+            *matches = false;
+        }
+        *expected_index = expected_index.saturating_add(1);
+    };
+
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            if let Some(byte) = pending_byte {
+                compare_byte(byte, &mut expected_index, &mut matches);
+            }
+            return Ok(MatchedLine {
+                exists: saw_bytes,
+                terminator: None,
+                matches: matches && expected_index == expected.len(),
+            });
+        }
+
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(buffer.len(), |index| index + 1);
+        for byte in buffer[..consumed].iter().copied() {
+            saw_bytes = true;
+            if byte == b'\n' {
+                let terminator = if pending_byte == Some(b'\r') {
+                    b"\r\n" as &'static [u8]
+                } else {
+                    if let Some(previous) = pending_byte {
+                        compare_byte(previous, &mut expected_index, &mut matches);
+                    }
+                    b"\n"
+                };
+                reader.consume(consumed);
+                return Ok(MatchedLine {
+                    exists: true,
+                    terminator: Some(terminator),
+                    matches: matches && expected_index == expected.len(),
+                });
+            }
+            if let Some(previous) = pending_byte.replace(byte) {
+                compare_byte(previous, &mut expected_index, &mut matches);
+            }
+        }
+        reader.consume(consumed);
+    }
+}
+
 fn open_existing_regular_file(
     req: &WriteFileRequest,
     display_path: &Path,
@@ -326,6 +401,14 @@ fn create_missing_file(req: &WriteFileRequest, path: &Path) -> WriteFileResult {
             path,
             WriteFileStatus::RangeOutOfBounds,
             "A missing file can only be created with the line range 1-1",
+        );
+    }
+    if !req.expected_text.is_empty() {
+        return failure_result(
+            req,
+            path,
+            WriteFileStatus::ContentMismatch,
+            "expected_text must be empty when creating a missing file",
         );
     }
 
@@ -446,11 +529,14 @@ fn replace_existing_file(
         let empty_file_virtual_line =
             opened_metadata.len() == 0 && req.start_line == 1 && req.end_line == 1;
         let mut selected_terminator = None;
-        for line_number in req.start_line..=req.end_line {
+        for (line_number, expected_line) in
+            (req.start_line..=req.end_line).zip(req.expected_text.split('\n'))
+        {
             let initial_bytes = preserved_bom && line_number == 1;
-            let skipped = skip_line_with_terminator(&mut reader, initial_bytes)
-                .map_err(|error| io_failure(req, path, error, WriteFileStatus::ReadFailed))?;
-            if !(skipped.exists || empty_file_virtual_line && line_number == 1) {
+            let selected =
+                consume_line_matching(&mut reader, expected_line.as_bytes(), initial_bytes)
+                    .map_err(|error| io_failure(req, path, error, WriteFileStatus::ReadFailed))?;
+            if !(selected.exists || empty_file_virtual_line && line_number == 1) {
                 return Err(failure_result(
                     req,
                     path,
@@ -458,8 +544,18 @@ fn replace_existing_file(
                     "The requested line range extends beyond the end of the file",
                 ));
             }
+            if !selected.matches
+                && !(empty_file_virtual_line && line_number == 1 && expected_line.is_empty())
+            {
+                return Err(failure_result(
+                    req,
+                    path,
+                    WriteFileStatus::ContentMismatch,
+                    "The selected lines do not match expected_text",
+                ));
+            }
             if line_number == req.end_line {
-                selected_terminator = skipped.terminator;
+                selected_terminator = selected.terminator;
             }
         }
 
@@ -617,6 +713,10 @@ pub(crate) fn write_file_summary(result: &WriteFileResult) -> String {
             "Line range {}-{} is outside {}.",
             result.requested_start_line, result.requested_end_line, result.path
         ),
+        WriteFileStatus::ContentMismatch => format!(
+            "Selected content did not match expected_text in {}.",
+            result.path
+        ),
         WriteFileStatus::ReadFailed => format!("Reading {} for editing failed.", result.path),
         WriteFileStatus::WriteFailed => format!("Writing {} failed.", result.path),
         WriteFileStatus::ReplaceFailed => {
@@ -640,6 +740,7 @@ impl McpServer {
                             "path",
                             "start_line",
                             "end_line",
+                            "expected_text",
                             "text",
                             "create_if_missing",
                         ],
@@ -752,10 +853,15 @@ mod tests {
     }
 
     fn request(path: &Path, start_line: u64, end_line: u64, text: &str) -> WriteFileRequest {
+        let expected_text = end_line
+            .checked_sub(start_line)
+            .and_then(|separators| usize::try_from(separators).ok())
+            .map_or_else(String::new, |separators| "\n".repeat(separators));
         WriteFileRequest {
             path: path.to_string_lossy().into_owned(),
             start_line,
             end_line,
+            expected_text,
             text: text.to_string(),
             create_if_missing: false,
         }
@@ -776,7 +882,9 @@ mod tests {
         let path = temp_path("replace");
         std::fs::write(&path, b"\xEF\xBB\xBFone\r\ntwo\r\n\xFFthree").unwrap();
 
-        let result = write_file_blocking(request(&path, 2, 2, "new\nextra"), path.clone());
+        let mut req = request(&path, 2, 2, "new\nextra");
+        req.expected_text = "two".to_string();
+        let result = write_file_blocking(req, path.clone());
 
         assert_eq!(result.status, WriteFileStatus::Completed);
         assert_eq!(result.replaced_line_count, Some(1));
@@ -793,14 +901,18 @@ mod tests {
         let path = temp_path("bom_delete");
         std::fs::write(&path, b"\xEF\xBB\xBFone\ntwo\nthree\n").unwrap();
 
-        let first = write_file_blocking(request(&path, 1, 1, "first"), path.clone());
+        let mut first_req = request(&path, 1, 1, "first");
+        first_req.expected_text = "one".to_string();
+        let first = write_file_blocking(first_req, path.clone());
         assert_eq!(first.status, WriteFileStatus::Completed);
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"\xEF\xBB\xBFfirst\ntwo\nthree\n"
         );
 
-        let deleted = write_file_blocking(request(&path, 2, 2, ""), path.clone());
+        let mut delete_req = request(&path, 2, 2, "");
+        delete_req.expected_text = "two".to_string();
+        let deleted = write_file_blocking(delete_req, path.clone());
         assert_eq!(deleted.status, WriteFileStatus::Completed);
         assert_eq!(std::fs::read(&path).unwrap(), b"\xEF\xBB\xBFfirst\nthree\n");
         std::fs::remove_file(path).unwrap();
@@ -811,7 +923,9 @@ mod tests {
         let path = temp_path("final");
         std::fs::write(&path, b"one\ntwo\n").unwrap();
 
-        let result = write_file_blocking(request(&path, 2, 2, "last"), path.clone());
+        let mut req = request(&path, 2, 2, "last");
+        req.expected_text = "two".to_string();
+        let result = write_file_blocking(req, path.clone());
 
         assert_eq!(result.status, WriteFileStatus::Completed);
         assert_eq!(std::fs::read(&path).unwrap(), b"one\nlast");
@@ -824,7 +938,9 @@ mod tests {
         let original = b"one\ntwo\n";
         std::fs::write(&path, original).unwrap();
 
-        let result = write_file_blocking(request(&path, 2, 3, "replacement"), path.clone());
+        let mut req = request(&path, 2, 3, "replacement");
+        req.expected_text = "two\n".to_string();
+        let result = write_file_blocking(req, path.clone());
 
         assert_eq!(result.status, WriteFileStatus::RangeOutOfBounds);
         assert_eq!(std::fs::read(&path).unwrap(), original);
@@ -870,6 +986,13 @@ mod tests {
         assert_eq!(result.replaced_line_count, None);
         assert_eq!(std::fs::read(&path).unwrap(), b"created");
         std::fs::remove_file(&path).unwrap();
+
+        let mut stale_creation = request(&path, 1, 1, "no");
+        stale_creation.expected_text = "stale content".to_string();
+        stale_creation.create_if_missing = true;
+        let stale = write_file_blocking(stale_creation, path.clone());
+        assert_eq!(stale.status, WriteFileStatus::ContentMismatch);
+        assert!(!path.exists());
 
         let mut invalid_range = request(&path, 2, 2, "no");
         invalid_range.create_if_missing = true;
@@ -940,7 +1063,9 @@ mod tests {
             panic!("failed to create test symlink: {error}");
         }
 
-        let result = write_file_blocking(request(&link, 2, 2, "changed"), link.clone());
+        let mut req = request(&link, 2, 2, "changed");
+        req.expected_text = "two".to_string();
+        let result = write_file_blocking(req, link.clone());
 
         assert_eq!(result.status, WriteFileStatus::Completed);
         assert_eq!(std::fs::read(&target).unwrap(), b"one\nchanged");
@@ -969,15 +1094,55 @@ mod tests {
 
         req.start_line = u64::MAX;
         req.end_line = u64::MAX;
+        req.expected_text.clear();
         assert!(validate_write_file_request(&req).is_ok());
 
         req.start_line = 1;
         req.end_line = 1;
+        req.expected_text = "one\ntwo".to_string();
+        assert!(
+            validate_write_file_request(&req)
+                .unwrap_err()
+                .contains("exactly 1 logical lines")
+        );
+
+        req.expected_text = "x".repeat(MAX_REPLACEMENT_BYTES + 1);
+        assert!(
+            validate_write_file_request(&req)
+                .unwrap_err()
+                .contains("expected_text")
+        );
+
+        req.expected_text.clear();
         req.text = "x".repeat(MAX_REPLACEMENT_BYTES + 1);
         assert!(
             validate_write_file_request(&req)
                 .unwrap_err()
                 .contains("262144")
         );
+    }
+
+    #[test]
+    fn content_precondition_is_exact_logical_text_and_failure_is_atomic() {
+        let path = temp_path("precondition");
+        let original = b"\xEF\xBB\xBFone\r\n\r\nthree\n";
+        std::fs::write(&path, original).unwrap();
+
+        let mut mismatch = request(&path, 1, 2, "changed");
+        mismatch.expected_text = "one\nnot-blank".to_string();
+        let mismatch_result = write_file_blocking(mismatch, path.clone());
+        assert_eq!(mismatch_result.status, WriteFileStatus::ContentMismatch);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        let mut exact = request(&path, 1, 2, "changed");
+        exact.expected_text = "one\n".to_string();
+        let exact_result = write_file_blocking(exact, path.clone());
+        assert_eq!(exact_result.status, WriteFileStatus::Completed);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"\xEF\xBB\xBFchanged\r\nthree\n"
+        );
+
+        std::fs::remove_file(path).unwrap();
     }
 }
