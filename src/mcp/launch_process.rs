@@ -1,7 +1,7 @@
 use crate::mcp::{
     LaunchProcessRequest, LaunchProcessResult, LaunchProcessStatus, McpServer, RequestData,
-    RequestId, RequestTimeoutOutcome, RequestUpdate, TimeoutAction, UiEvent, UiEventKind,
-    argument_error_result, missing_argument_message, request_timeout_message,
+    RequestId, RequestTimeoutOutcome, RequestUpdate, TimeoutAction, TimeoutCause, UiEvent,
+    UiEventKind, argument_error_result, missing_argument_message, timeout_message,
 };
 use std::sync::mpsc::Sender;
 use std::time::Instant;
@@ -915,34 +915,15 @@ impl McpServer {
                 let result = self.execute_launch_process_for_request(req, id).await;
 
                 if request_timeout_controls_launch
-                    && matches!(
-                        result.status,
-                        LaunchProcessStatus::TimedOutDetached
-                            | LaunchProcessStatus::TimedOutStopped
-                            | LaunchProcessStatus::StopFailed
-                    )
+                    && launch_process_timeout_outcome(result.status).is_some()
                 {
-                    let outcome = match result.status {
-                        LaunchProcessStatus::TimedOutDetached => {
-                            RequestTimeoutOutcome::ForegroundProcessDetached
-                        }
-                        LaunchProcessStatus::TimedOutStopped => {
-                            RequestTimeoutOutcome::ForegroundProcessStopped
-                        }
-                        LaunchProcessStatus::StopFailed => {
-                            RequestTimeoutOutcome::ForegroundProcessStopUnconfirmed
-                        }
-                        _ => unreachable!("filtered by request-timeout status match"),
-                    };
-                    let mut error = request_timeout_message(
-                        maximum_request_timeout_seconds,
-                        "launch_process",
-                        outcome,
+                    let error = launch_process_timeout_summary(
+                        TimeoutCause::MaximumRequest {
+                            timeout_seconds: maximum_request_timeout_seconds,
+                            tool_name: "launch_process",
+                        },
+                        &result,
                     );
-                    if let Some(detail) = &result.error {
-                        error.push(' ');
-                        error.push_str(detail);
-                    }
                     self.update_request(
                         id,
                         RequestUpdate::RequestTimedOut {
@@ -1067,35 +1048,69 @@ fn launch_status_is_error(status: LaunchProcessStatus) -> bool {
     )
 }
 
-/// Text summary for failed launches: the concise status line plus the timeout that was
-/// configured, the underlying error, and the output-file locations so the model can
-/// inspect partial output and decide how to retry.
+fn launch_process_timeout_outcome(status: LaunchProcessStatus) -> Option<RequestTimeoutOutcome> {
+    match status {
+        LaunchProcessStatus::TimedOutDetached => {
+            Some(RequestTimeoutOutcome::ForegroundProcessDetached)
+        }
+        LaunchProcessStatus::TimedOutStopped => {
+            Some(RequestTimeoutOutcome::ForegroundProcessStopped)
+        }
+        LaunchProcessStatus::StopFailed => {
+            Some(RequestTimeoutOutcome::ForegroundProcessStopUnconfirmed)
+        }
+        _ => None,
+    }
+}
+
+fn append_launch_output_locations(text: &mut String, result: &LaunchProcessResult) {
+    if let (Some(stdout_file), Some(stderr_file)) = (&result.stdout_file, &result.stderr_file) {
+        text.push_str(&format!(
+            " Output was written to {stdout_file} (stdout) and {stderr_file} (stderr)."
+        ));
+    }
+}
+
+/// Build the common human-readable result for either kind of foreground process
+/// timeout. The cause identifies which deadline expired; the `Outcome:` vocabulary
+/// and ancillary result details are shared by ordinary process timeouts and the
+/// server-wide Maximum request timeout.
+pub(crate) fn launch_process_timeout_summary(
+    cause: TimeoutCause,
+    result: &LaunchProcessResult,
+) -> String {
+    let outcome = launch_process_timeout_outcome(result.status)
+        .expect("launch_process_timeout_summary requires a timeout status");
+    let mut text = timeout_message(cause, outcome);
+
+    // A successful stop already has a complete outcome sentence. StopFailed carries
+    // useful cleanup diagnostics explaining why termination could not be confirmed.
+    if result.status == LaunchProcessStatus::StopFailed
+        && let Some(error) = &result.error
+    {
+        text.push(' ');
+        text.push_str(error);
+        if !text.ends_with('.') {
+            text.push('.');
+        }
+    }
+    append_launch_output_locations(&mut text, result);
+    text
+}
+
+/// Text summary for failed launches. Process-timeout failures use the common timeout
+/// formatter above; other launch failures retain their concise status summary.
 pub(crate) fn launch_process_failure_summary(
     result: &LaunchProcessResult,
     timeout_ms: Option<u64>,
 ) -> String {
+    if let Some(timeout_ms) = timeout_ms
+        && launch_process_timeout_outcome(result.status).is_some()
+    {
+        return launch_process_timeout_summary(TimeoutCause::LaunchProcess { timeout_ms }, result);
+    }
+
     let mut text = launch_process_summary(result);
-    if let Some(ms) = timeout_ms {
-        text.push_str(&format!(" The process was allowed {ms} ms to exit."));
-    }
-    match result.status {
-        LaunchProcessStatus::TimedOutDetached => {
-            text.push_str(
-                " The process may still be running; retry with a larger timeout_ms if it must \
-                 complete before this call returns.",
-            );
-        }
-        LaunchProcessStatus::TimedOutStopped => {
-            text.push_str(
-                " The process was terminated at the timeout; descendant processes may still be \
-                 running.",
-            );
-        }
-        LaunchProcessStatus::StopFailed => {
-            text.push_str(" The process may still be running.");
-        }
-        _ => {}
-    }
     if let Some(error) = &result.error {
         text.push(' ');
         text.push_str(error);
@@ -1103,11 +1118,7 @@ pub(crate) fn launch_process_failure_summary(
             text.push('.');
         }
     }
-    if let (Some(stdout_file), Some(stderr_file)) = (&result.stdout_file, &result.stderr_file) {
-        text.push_str(&format!(
-            " Output was written to {stdout_file} (stdout) and {stderr_file} (stderr)."
-        ));
-    }
+    append_launch_output_locations(&mut text, result);
     text
 }
 

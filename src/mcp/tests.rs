@@ -2,8 +2,8 @@ use crate::mcp::file_path::{RegularFileOpenErrorKind, open_regular_file_with_met
 use crate::mcp::launch_process::{
     ChildOps, CleanupOutcome, DEFAULT_MAX_OUTPUT_BYTES, cooperative_launch_timeout_ms,
     handle_background_wait_result_with_notifier, launch_process_failure_summary,
-    launch_process_summary, output_progress_snapshot_for_test, perform_cleanup,
-    read_and_truncate_file, report_background_error, validate_request,
+    launch_process_summary, launch_process_timeout_summary, output_progress_snapshot_for_test,
+    perform_cleanup, read_and_truncate_file, report_background_error, validate_request,
 };
 use crate::mcp::ping::PingResult;
 use crate::mcp::read_binary_file::{
@@ -21,10 +21,11 @@ use crate::mcp::{
     LaunchProcessResult, LaunchProcessStatus, LocalInstructionsDiagnostic,
     MACHINE_INSTRUCTIONS_HEADING, McpServer, ReadBinaryFileContentKind, ReadBinaryFileRequest,
     ReadBinaryFileResult, ReadBinaryFileStatus, ReadFileRequest, ReadFileResult, ReadFileStatus,
-    RequestData, RequestId, RequestTimeoutOutcome, RequestUpdate, TimeoutAction, TrackedHttpIo,
-    UiEventKind, WriteFileRequest, WriteFileResult, WriteFileStatus, build_http_mcp_service,
-    build_mcp_runtime, compose_instructions, load_server_instructions_from_path,
-    read_local_instructions, request_timeout_message, run_mcp_server_loop, test_hooks,
+    RequestData, RequestId, RequestTimeoutOutcome, RequestUpdate, TimeoutAction, TimeoutCause,
+    TrackedHttpIo, UiEventKind, WriteFileRequest, WriteFileResult, WriteFileStatus,
+    build_http_mcp_service, build_mcp_runtime, compose_instructions,
+    load_server_instructions_from_path, read_local_instructions, run_mcp_server_loop, test_hooks,
+    timeout_message,
 };
 use rmcp::ServerHandler;
 use std::path::{Path, PathBuf};
@@ -175,7 +176,7 @@ fn maximum_request_timeout_messages_are_consistent_and_outcome_specific() {
         (
             "launch_process",
             RequestTimeoutOutcome::ForegroundProcessStopped,
-            "RemoteControlMCP is configured with a Maximum request timeout of 110 seconds for each request. The `launch_process` request exceeded that limit. Outcome: The foreground process was stopped.",
+            "RemoteControlMCP is configured with a Maximum request timeout of 110 seconds for each request. The `launch_process` request exceeded that limit. Outcome: The foreground process was stopped; descendant processes may still be running.",
         ),
         (
             "launch_process",
@@ -185,7 +186,58 @@ fn maximum_request_timeout_messages_are_consistent_and_outcome_specific() {
     ];
 
     for (tool, outcome, expected) in cases {
-        assert_eq!(request_timeout_message(110, tool, outcome), expected);
+        assert_eq!(
+            timeout_message(
+                TimeoutCause::MaximumRequest {
+                    timeout_seconds: 110,
+                    tool_name: tool,
+                },
+                outcome,
+            ),
+            expected
+        );
+    }
+}
+
+#[test]
+fn launch_process_timeout_messages_use_shared_outcome_vocabulary() {
+    let cases = [
+        (
+            LaunchProcessStatus::TimedOutDetached,
+            RequestTimeoutOutcome::ForegroundProcessDetached,
+            "RemoteControlMCP is enforcing a process timeout of 60000 ms for this `launch_process` request. The foreground process exceeded that limit. Outcome: The foreground process was detached and is still running.",
+        ),
+        (
+            LaunchProcessStatus::TimedOutStopped,
+            RequestTimeoutOutcome::ForegroundProcessStopped,
+            "RemoteControlMCP is enforcing a process timeout of 60000 ms for this `launch_process` request. The foreground process exceeded that limit. Outcome: The foreground process was stopped; descendant processes may still be running.",
+        ),
+        (
+            LaunchProcessStatus::StopFailed,
+            RequestTimeoutOutcome::ForegroundProcessStopUnconfirmed,
+            "RemoteControlMCP is enforcing a process timeout of 60000 ms for this `launch_process` request. The foreground process exceeded that limit. Outcome: RemoteControlMCP could not confirm that the foreground process stopped; it may still be running.",
+        ),
+    ];
+
+    for (status, outcome, expected) in cases {
+        let result = LaunchProcessResult {
+            status,
+            error: None,
+            pid: Some(1234),
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            stdout_file: None,
+            stderr_file: None,
+        };
+        assert_eq!(
+            launch_process_failure_summary(&result, Some(60_000)),
+            expected
+        );
+        assert_eq!(
+            launch_process_failure_summary(&result, Some(60_000)),
+            timeout_message(TimeoutCause::LaunchProcess { timeout_ms: 60_000 }, outcome)
+        );
     }
 }
 
@@ -219,7 +271,13 @@ fn maximum_request_timeout_returns_a_tool_error_before_upstream_timeout() {
     assert_eq!(result.is_error, Some(true));
     assert_eq!(
         only_text_content(&result),
-        request_timeout_message(1, "ping", RequestTimeoutOutcome::Cancelled)
+        timeout_message(
+            TimeoutCause::MaximumRequest {
+                timeout_seconds: 1,
+                tool_name: "ping",
+            },
+            RequestTimeoutOutcome::Cancelled,
+        )
     );
     assert!(rx.try_iter().any(|event| matches!(
         event.kind,
@@ -3034,14 +3092,6 @@ fn maximum_request_timeout_detaches_unbounded_foreground_launch() {
     assert!(started.elapsed() >= Duration::from_millis(400));
     assert!(started.elapsed() < Duration::from_millis(950));
     assert_eq!(result.is_error, Some(true));
-    assert_eq!(
-        only_text_content(&result),
-        request_timeout_message(
-            1,
-            "launch_process",
-            RequestTimeoutOutcome::ForegroundProcessDetached
-        )
-    );
     let structured: LaunchProcessResult = rmcp::serde_json::from_value(
         result
             .structured_content
@@ -3049,6 +3099,16 @@ fn maximum_request_timeout_detaches_unbounded_foreground_launch() {
             .expect("structured timeout result"),
     )
     .unwrap();
+    assert_eq!(
+        only_text_content(&result),
+        launch_process_timeout_summary(
+            TimeoutCause::MaximumRequest {
+                timeout_seconds: 1,
+                tool_name: "launch_process",
+            },
+            &structured,
+        )
+    );
     assert_eq!(structured.status, LaunchProcessStatus::TimedOutDetached);
     assert!(structured.pid.is_some());
     assert!(structured.stdout_file.is_some());
@@ -3112,14 +3172,6 @@ fn maximum_request_timeout_preserves_explicit_stop_for_foreground_launch() {
         .block_on(server.launch_process(parameters_of(&req)))
         .expect("maximum request timeout should return a tool result");
     assert_eq!(result.is_error, Some(true));
-    assert_eq!(
-        only_text_content(&result),
-        request_timeout_message(
-            1,
-            "launch_process",
-            RequestTimeoutOutcome::ForegroundProcessStopped
-        )
-    );
     let structured: LaunchProcessResult = rmcp::serde_json::from_value(
         result
             .structured_content
@@ -3127,6 +3179,16 @@ fn maximum_request_timeout_preserves_explicit_stop_for_foreground_launch() {
             .expect("structured timeout result"),
     )
     .unwrap();
+    assert_eq!(
+        only_text_content(&result),
+        launch_process_timeout_summary(
+            TimeoutCause::MaximumRequest {
+                timeout_seconds: 1,
+                tool_name: "launch_process",
+            },
+            &structured,
+        )
+    );
     assert_eq!(structured.status, LaunchProcessStatus::TimedOutStopped);
     assert!(structured.pid.is_some());
 
@@ -3909,7 +3971,7 @@ fn launch_process_mcp_summaries_cover_nonzero_detach_timeouts_and_failure() {
             launch_process_failure_summary(&timeout_detach, Some(50))
         );
         assert!(only_text_content(&timeout_detach_call).contains("50 ms"));
-        assert!(only_text_content(&timeout_detach_call).contains("may still be running"));
+        assert!(only_text_content(&timeout_detach_call).contains("detached and is still running"));
 
         let mut timeout_stop_params = rmcp::model::CallToolRequestParams::new("launch_process");
         timeout_stop_params.arguments = Some(
@@ -3943,7 +4005,10 @@ fn launch_process_mcp_summaries_cover_nonzero_detach_timeouts_and_failure() {
             only_text_content(&timeout_stop_call),
             launch_process_failure_summary(&timeout_stop, Some(50))
         );
-        assert!(only_text_content(&timeout_stop_call).contains("terminated at the timeout"));
+        assert!(
+            only_text_content(&timeout_stop_call)
+                .contains("stopped; descendant processes may still be running")
+        );
 
         let mut failure_params = rmcp::model::CallToolRequestParams::new("launch_process");
         failure_params.arguments = Some(
@@ -4860,7 +4925,13 @@ fn read_file_obeys_maximum_request_timeout_while_blocking_work_finishes_separate
     assert_eq!(result.is_error, Some(true));
     assert_eq!(
         only_text_content(&result),
-        request_timeout_message(1, "read_file", RequestTimeoutOutcome::ReadFileMayContinue)
+        timeout_message(
+            TimeoutCause::MaximumRequest {
+                timeout_seconds: 1,
+                tool_name: "read_file",
+            },
+            RequestTimeoutOutcome::ReadFileMayContinue,
+        )
     );
     started_rx
         .recv_timeout(Duration::from_secs(1))

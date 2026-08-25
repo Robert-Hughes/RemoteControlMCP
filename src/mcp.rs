@@ -661,7 +661,9 @@ impl RequestTimeoutOutcome {
             Self::ForegroundProcessDetached => {
                 "The foreground process was detached and is still running."
             }
-            Self::ForegroundProcessStopped => "The foreground process was stopped.",
+            Self::ForegroundProcessStopped => {
+                "The foreground process was stopped; descendant processes may still be running."
+            }
             Self::ForegroundProcessStopUnconfirmed => {
                 "RemoteControlMCP could not confirm that the foreground process stopped; it may still be running."
             }
@@ -669,15 +671,30 @@ impl RequestTimeoutOutcome {
     }
 }
 
-pub(crate) fn request_timeout_message(
-    timeout_seconds: u64,
-    tool_name: &str,
-    outcome: RequestTimeoutOutcome,
-) -> String {
-    format!(
-        "RemoteControlMCP is configured with a Maximum request timeout of {timeout_seconds} seconds for each request. The `{tool_name}` request exceeded that limit. Outcome: {}",
-        outcome.description()
-    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimeoutCause {
+    MaximumRequest {
+        timeout_seconds: u64,
+        tool_name: &'static str,
+    },
+    LaunchProcess {
+        timeout_ms: u64,
+    },
+}
+
+pub(crate) fn timeout_message(cause: TimeoutCause, outcome: RequestTimeoutOutcome) -> String {
+    let cause = match cause {
+        TimeoutCause::MaximumRequest {
+            timeout_seconds,
+            tool_name,
+        } => format!(
+            "RemoteControlMCP is configured with a Maximum request timeout of {timeout_seconds} seconds for each request. The `{tool_name}` request exceeded that limit."
+        ),
+        TimeoutCause::LaunchProcess { timeout_ms } => format!(
+            "RemoteControlMCP is enforcing a process timeout of {timeout_ms} ms for this `launch_process` request. The foreground process exceeded that limit."
+        ),
+    };
+    format!("{cause} Outcome: {}", outcome.description())
 }
 
 /// Turn a serde argument deserialisation error into an actionable message, naming
@@ -789,7 +806,13 @@ impl McpServer {
         match tokio::time::timeout(Duration::from_secs(timeout_seconds), future).await {
             Ok(result) => result,
             Err(_) => {
-                let error = request_timeout_message(timeout_seconds, tool_name, timeout_outcome);
+                let error = timeout_message(
+                    TimeoutCause::MaximumRequest {
+                        timeout_seconds,
+                        tool_name,
+                    },
+                    timeout_outcome,
+                );
                 self.update_request(
                     id,
                     RequestUpdate::RequestTimedOut {
