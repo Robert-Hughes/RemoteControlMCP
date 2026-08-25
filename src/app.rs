@@ -337,6 +337,37 @@ fn write_file_presentation(
         pid: None,
     }
 }
+
+fn insert_file_presentation(
+    status: crate::mcp::InsertFileStatus,
+    error: Option<String>,
+    inserted_bytes: u64,
+) -> RequestPresentation {
+    use crate::mcp::InsertFileStatus;
+
+    let (state, status_text) = match status {
+        InsertFileStatus::Completed => (
+            RequestState::Completed,
+            format!("Completed \u{00b7} inserted {inserted_bytes} bytes"),
+        ),
+        InsertFileStatus::NotFound => (RequestState::Failed, "File not found".to_string()),
+        InsertFileStatus::AccessDenied => (RequestState::Failed, "Access denied".to_string()),
+        InsertFileStatus::NotAFile => (RequestState::Failed, "Not a regular file".to_string()),
+        InsertFileStatus::RangeOutOfBounds => (
+            RequestState::Failed,
+            "Anchor line out of bounds".to_string(),
+        ),
+        InsertFileStatus::ReadFailed => (RequestState::Failed, "Read failed".to_string()),
+        InsertFileStatus::WriteFailed => (RequestState::Failed, "Write failed".to_string()),
+        InsertFileStatus::ReplaceFailed => (RequestState::Failed, "Replace failed".to_string()),
+    };
+    RequestPresentation {
+        state,
+        status_text,
+        detail_text: (state == RequestState::Failed).then_some(error).flatten(),
+        pid: None,
+    }
+}
 fn presentation_for_update(update: RequestUpdate) -> RequestPresentation {
     match update {
         RequestUpdate::PingCompleted => RequestPresentation {
@@ -393,6 +424,11 @@ fn presentation_for_update(update: RequestUpdate) -> RequestPresentation {
             replaced_line_count,
             inserted_bytes,
         } => write_file_presentation(status, error, replaced_line_count, inserted_bytes),
+        RequestUpdate::InsertFileResponded {
+            status,
+            error,
+            inserted_bytes,
+        } => insert_file_presentation(status, error, inserted_bytes),
         RequestUpdate::RequestTimedOut {
             timeout_seconds,
             error,
@@ -511,6 +547,7 @@ fn apply_request_event(requests: &mut Vec<RequestEntry>, event: UiEvent) {
                         | RequestUpdate::ReadFileResponded { .. }
                         | RequestUpdate::ReadBinaryFileResponded { .. }
                         | RequestUpdate::WriteFileResponded { .. }
+                        | RequestUpdate::InsertFileResponded { .. }
                         | RequestUpdate::RequestTimedOut { .. }
                         | RequestUpdate::Rejected { .. }
                         | RequestUpdate::InternalFailure { .. }
@@ -591,6 +628,10 @@ fn request_tool_name(request: &RequestData) -> &'static str {
         RequestData::ReadFile { .. } => "read_file",
         RequestData::ReadBinaryFile { .. } => "read_binary_file",
         RequestData::WriteFile { .. } => "write_file",
+        RequestData::InsertFile { position, .. } => match position {
+            crate::mcp::InsertFilePosition::Before => "insert_before_line",
+            crate::mcp::InsertFilePosition::After => "insert_after_line",
+        },
     }
 }
 
@@ -635,6 +676,20 @@ fn request_summary(request: &RequestEntry) -> String {
             };
             format!(
                 "{path} \u{00b7} requested lines {start_line}\u{2013}{end_line} \u{00b7} {replacement_bytes}-byte replacement{create_suffix}"
+            )
+        }
+        RequestData::InsertFile {
+            path,
+            line,
+            position,
+            insertion_bytes,
+        } => {
+            let relation = match position {
+                crate::mcp::InsertFilePosition::Before => "before",
+                crate::mcp::InsertFilePosition::After => "after",
+            };
+            format!(
+                "{path} \u{00b7} insert {relation} line {line} \u{00b7} {insertion_bytes} bytes"
             )
         }
     }

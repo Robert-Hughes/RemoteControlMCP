@@ -9,6 +9,7 @@ Use this server to launch local processes and to read or modify regular files on
 - Use `launch_process` to start an executable. The server does not add a shell implicitly; select a shell executable explicitly when the command needs shell syntax, built-ins, pipes, redirection, or variable expansion.
 - Use `read_file` for text files when line-oriented access is useful.
 - Use `read_binary_file` for images and other bounded binary files. Recognised images are returned as native MCP image content; other binary files are returned as native embedded resources.
+- Use `insert_before_line` or `insert_after_line` to add text without replacing or reproducing an existing line.
 - Use `write_file` to replace a precise range of lines in a regular file, or to create a missing file when creation is explicitly enabled.
 
 ## Launching processes
@@ -31,6 +32,7 @@ Use this server to launch local processes and to read or modify regular files on
 - `read_file` is for text. Line ranges are one-based and inclusive, and each request may cover at most 500 lines. Every returned logical line is prefixed with `<line_number>: `; this prefix is presentation metadata and is not part of the file. When it returns `truncated`, continue from `next_start_line` while retaining the original end line.
 - `read_binary_file` reads the complete binary file or rejects it; it never truncates silently. Its hard server limit is 100,000,000 bytes (100 MB). The optional `max_bytes` argument may request a smaller limit but cannot raise the server limit.
 - Do not use `read_file` to ferry a binary file as textual base64 merely to work around the binary API.
+- `insert_before_line` and `insert_after_line` anchor non-empty text to an existing 1-based line. Pass file content only in `text`; never copy the `<line_number>: ` prefixes returned by `read_file`. Do not simulate insertion by replacing and reproducing an adjacent line.
 - `write_file` replaces exactly the selected range. Use the narrowest correct range and read the relevant lines first when the current contents are not already known.
 - Missing files are created only when `create_if_missing = true` and the requested range is `1-1`. Parent directories are never created automatically.
 - File access and process execution are not sandboxed. Confirm paths and targets before performing destructive operations.

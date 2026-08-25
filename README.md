@@ -60,7 +60,7 @@ The generic watchdog is a response deadline, not a universal cancellation mechan
 
 ## Exposed Tools
 
-The application exposes six tools: `get_instructions`, `ping`, `launch_process`, `read_file`, `read_binary_file`, and `write_file`.
+The application exposes eight tools: `get_instructions`, `ping`, `launch_process`, `read_file`, `read_binary_file`, `insert_before_line`, `insert_after_line`, and `write_file`.
 
 > [!WARNING]
 > The `launch_process` tool provides unrestricted local process execution under the user account running the MCP server. There is no security allowlist.
@@ -182,7 +182,27 @@ Valid requests return ordinary non-error MCP tool results even for structured fi
 
 ---
 
-### 4. `write_file`
+### 4. `insert_before_line` and `insert_after_line`
+
+Insert non-empty text next to an existing 1-based anchor line without replacing or reproducing that line. Use these tools for insertion instead of manufacturing an insertion with `write_file`.
+
+#### Parameters and paths
+
+Both tools have the same input schema:
+
+* **`path`** (string, required): Uses the same absolute, relative, UNC, literal-path, and ambiguous-Windows-path rules as `read_file`.
+* **`line`** (positive integer, required): An existing 1-based anchor line. Use the line numbers displayed by `read_file`.
+* **`text`** (non-empty string, required): UTF-8 text to insert, limited to 256 KiB when encoded. Supply file content only; never include the `<line_number>: ` presentation prefix returned by `read_file`.
+
+`insert_before_line` places `text` immediately before the anchor line. `insert_after_line` places it immediately after the anchor line. The anchor must exist; empty files and lines beyond EOF return `range_out_of_bounds`. These tools never create files.
+
+The supplied `text` bytes are preserved. When a separator is required at a boundary and `text` does not already provide one, the server uses the anchor line's LF or CRLF terminator, falling back to LF for an unterminated anchor. A leading UTF-8 BOM remains at the beginning of the file. Untouched bytes, permissions, symlink targets, and final-newline state are otherwise handled like `write_file`.
+
+Each tool returns `status`, optional `error`, resolved `path`, `requested_line`, and `inserted_bytes`. Runtime filesystem failures are structured non-error MCP results. Invalid parameters, including empty or oversized `text`, return MCP invalid-parameter errors.
+
+---
+
+### 5. `write_file`
 
 Replace a strict, 1-based inclusive line range in a local regular file. The replacement may contain fewer lines, more lines, or no lines. An empty `text` therefore deletes the selected range.
 

@@ -1,4 +1,5 @@
 use crate::mcp::file_path::{RegularFileOpenErrorKind, open_regular_file_with_metadata};
+use crate::mcp::insert_file::{insert_file_summary, validate_insert_file_request};
 use crate::mcp::launch_process::{
     ChildOps, CleanupOutcome, DEFAULT_MAX_OUTPUT_BYTES, cooperative_launch_timeout_ms,
     handle_background_wait_result_with_notifier, launch_process_failure_summary,
@@ -17,7 +18,8 @@ use crate::mcp::write_file::{
     validate_write_file_request, write_file_summary,
 };
 use crate::mcp::{
-    BOOTSTRAP_INSTRUCTIONS, EnvironmentConfig, GENERAL_INSTRUCTIONS, LaunchProcessRequest,
+    BOOTSTRAP_INSTRUCTIONS, EnvironmentConfig, GENERAL_INSTRUCTIONS, InsertFilePosition,
+    InsertFileRequest, InsertFileResult, InsertFileStatus, LaunchProcessRequest,
     LaunchProcessResult, LaunchProcessStatus, LocalInstructionsDiagnostic,
     MACHINE_INSTRUCTIONS_HEADING, McpServer, ReadBinaryFileContentKind, ReadBinaryFileRequest,
     ReadBinaryFileResult, ReadBinaryFileStatus, ReadFileRequest, ReadFileResult, ReadFileStatus,
@@ -659,6 +661,16 @@ fn write_file_structured_result(result: &rmcp::model::CallToolResult) -> WriteFi
             .structured_content
             .clone()
             .expect("write_file should return structured content"),
+    )
+    .unwrap()
+}
+
+fn insert_file_structured_result(result: &rmcp::model::CallToolResult) -> InsertFileResult {
+    rmcp::serde_json::from_value(
+        result
+            .structured_content
+            .clone()
+            .expect("insert file should return structured content"),
     )
     .unwrap()
 }
@@ -1595,6 +1607,150 @@ fn write_file_metadata_and_schemas_are_explicit() {
 }
 
 #[test]
+fn insertion_tools_metadata_schemas_handlers_and_events_are_explicit() {
+    for (attr, expected_name) in [
+        (
+            McpServer::insert_before_line_tool_attr(),
+            "insert_before_line",
+        ),
+        (
+            McpServer::insert_after_line_tool_attr(),
+            "insert_after_line",
+        ),
+    ] {
+        assert_eq!(attr.name, expected_name);
+        assert!(
+            attr.description
+                .as_deref()
+                .is_some_and(|description| description.contains("<line_number>: "))
+        );
+        let annotations = attr.annotations.as_ref().expect("insert annotations");
+        assert_eq!(annotations.read_only_hint, Some(false));
+        assert_eq!(annotations.destructive_hint, Some(true));
+        assert_eq!(annotations.idempotent_hint, Some(false));
+        assert_eq!(annotations.open_world_hint, Some(false));
+
+        let required = attr.input_schema["required"].as_array().unwrap();
+        for field in ["path", "line", "text"] {
+            assert!(required.iter().any(|value| value == field));
+            assert!(
+                attr.input_schema["properties"][field]["description"]
+                    .as_str()
+                    .is_some_and(|description| !description.is_empty())
+            );
+        }
+        assert_eq!(attr.input_schema["properties"]["line"]["minimum"], 1);
+        assert_eq!(attr.input_schema["properties"]["text"]["minLength"], 1);
+        assert!(
+            attr.input_schema["properties"]["text"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("must not be included")
+        );
+
+        let output_schema = attr.output_schema.as_ref().expect("insert output schema");
+        let output_schema = rmcp::serde_json::Value::Object((**output_schema).clone());
+        let root = resolve_local_schema_ref(&output_schema, &output_schema);
+        for field in [
+            "status",
+            "error",
+            "path",
+            "requested_line",
+            "inserted_bytes",
+        ] {
+            assert!(root["properties"].get(field).is_some());
+        }
+        let encoded = output_schema.to_string();
+        for status in [
+            "completed",
+            "not_found",
+            "access_denied",
+            "not_a_file",
+            "range_out_of_bounds",
+            "read_failed",
+            "write_failed",
+            "replace_failed",
+        ] {
+            assert!(encoded.contains(status));
+        }
+    }
+
+    let path = write_temp_test_file("insert_handlers", b"alpha\nbravo\ncharlie\n");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = McpServer::new(tx, Instant::now());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+
+    let before_request = InsertFileRequest {
+        path: path.to_string_lossy().into_owned(),
+        line: 2,
+        text: "private-before".to_string(),
+    };
+    let before_call = rt
+        .block_on(server.insert_before_line(parameters_of(&before_request)))
+        .unwrap();
+    let before = insert_file_structured_result(&before_call);
+    assert_eq!(before.status, InsertFileStatus::Completed);
+    assert_eq!(
+        only_text_content(&before_call),
+        insert_file_summary(&before, InsertFilePosition::Before)
+    );
+
+    let after_request = InsertFileRequest {
+        path: path.to_string_lossy().into_owned(),
+        line: 3,
+        text: "private-after".to_string(),
+    };
+    let after_call = rt
+        .block_on(server.insert_after_line(parameters_of(&after_request)))
+        .unwrap();
+    assert_eq!(
+        insert_file_structured_result(&after_call).status,
+        InsertFileStatus::Completed
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "alpha\nprivate-before\nbravo\nprivate-after\ncharlie\n"
+    );
+
+    let events = rx.try_iter().map(|event| event.kind).collect::<Vec<_>>();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        UiEventKind::RequestStarted {
+            request: RequestData::InsertFile {
+                position: InsertFilePosition::Before,
+                line: 2,
+                ..
+            },
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        UiEventKind::RequestUpdated {
+            update: RequestUpdate::InsertFileResponded {
+                status: InsertFileStatus::Completed,
+                ..
+            },
+            ..
+        }
+    )));
+    for sensitive in ["private-before", "private-after"] {
+        assert!(!format!("{events:?}").contains(sensitive));
+        assert!(!only_text_content(&before_call).contains(sensitive));
+        assert!(!only_text_content(&after_call).contains(sensitive));
+    }
+
+    let empty = InsertFileRequest {
+        text: String::new(),
+        ..before_request
+    };
+    assert!(validate_insert_file_request(&empty).is_err());
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn ping_metadata_is_read_only_and_idempotent() {
     let attr = McpServer::ping_tool_attr();
     assert_eq!(attr.name, "ping");
@@ -1676,7 +1832,7 @@ fn ping_works_over_mcp_duplex_transport() {
         assert_eq!(transmitted_instructions, BOOTSTRAP_INSTRUCTIONS);
         // 1. Tool discovery through tools/list
         let tools = client.list_all_tools().await.expect("Failed to list tools");
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 8);
         let tool = tools
             .iter()
             .find(|t| t.name == "ping")
@@ -3511,7 +3667,7 @@ fn launch_process_integration_test_over_duplex() {
 
         // 1. Tool discovery integration test
         let tools = client.list_all_tools().await.expect("Failed to list tools");
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 8);
 
         let launch_tool = tools
             .iter()
@@ -4111,7 +4267,7 @@ fn write_file_integration_test_over_duplex() {
         use rmcp::ServiceExt;
         let mut client = ().serve(client_transport).await.expect("serve client");
         let tools = client.list_all_tools().await.expect("list tools");
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 8);
         let tool = tools
             .iter()
             .find(|tool| tool.name == "write_file")
@@ -4345,7 +4501,7 @@ fn read_binary_file_integration_returns_native_content_over_duplex() {
         use rmcp::ServiceExt;
         let mut client = ().serve(client_transport).await.expect("serve client");
         let tools = client.list_all_tools().await.expect("list tools");
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 8);
         let tool = tools
             .iter()
             .find(|tool| tool.name == "read_binary_file")
@@ -4633,7 +4789,7 @@ fn read_file_integration_test_over_duplex() {
         use rmcp::ServiceExt;
         let mut client = ().serve(client_transport).await.expect("serve client");
         let tools = client.list_all_tools().await.expect("list tools");
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 8);
         let tool = tools
             .iter()
             .find(|tool| tool.name == "read_file")

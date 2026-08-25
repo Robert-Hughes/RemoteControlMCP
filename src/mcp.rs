@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 mod file_path;
+mod insert_file;
 mod launch_process;
 mod ping;
 mod read_binary_file;
@@ -184,6 +185,25 @@ pub enum WriteFileStatus {
     ReplaceFailed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InsertFileStatus {
+    Completed,
+    NotFound,
+    AccessDenied,
+    NotAFile,
+    RangeOutOfBounds,
+    ReadFailed,
+    WriteFailed,
+    ReplaceFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertFilePosition {
+    Before,
+    After,
+}
+
 fn positive_integer_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({ "type": "integer", "minimum": 1 })
 }
@@ -199,6 +219,10 @@ fn nullable_positive_integer_schema(_: &mut schemars::SchemaGenerator) -> schema
 
 fn nonnegative_integer_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({ "type": "integer", "minimum": 0 })
+}
+
+fn nonempty_string_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": "string", "minLength": 1 })
 }
 
 fn nullable_nonnegative_integer_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -316,6 +340,34 @@ pub struct WriteFileResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct InsertFileRequest {
+    /// Absolute path, or a path relative to the host temporary directory. The path is literal.
+    pub path: String,
+    /// Existing 1-based line used as the insertion anchor.
+    #[schemars(schema_with = "positive_integer_schema")]
+    pub line: u64,
+    /// Non-empty UTF-8 text to insert, limited to 256 KiB when encoded. Line-number prefixes returned by read_file must not be included.
+    #[schemars(schema_with = "nonempty_string_schema")]
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct InsertFileResult {
+    /// Completed on success; otherwise identifies the runtime failure category.
+    pub status: InsertFileStatus,
+    /// Filesystem or operating-system detail for a runtime failure; null on success.
+    pub error: Option<String>,
+    /// Resolved absolute request path.
+    pub path: String,
+    /// Original validated 1-based insertion anchor.
+    #[schemars(schema_with = "positive_integer_schema")]
+    pub requested_line: u64,
+    /// UTF-8 byte length supplied in text on success; zero on failure. Synthesized separators are excluded.
+    #[schemars(schema_with = "nonnegative_integer_schema")]
+    pub inserted_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EnvironmentConfig {
     #[serde(default = "default_inherit_environment")]
     #[schemars(default = "default_inherit_environment")]
@@ -398,6 +450,12 @@ pub enum RequestData {
         replacement_bytes: u64,
         create_if_missing: bool,
     },
+    InsertFile {
+        path: String,
+        line: u64,
+        position: InsertFilePosition,
+        insertion_bytes: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -441,6 +499,11 @@ pub enum RequestUpdate {
         status: WriteFileStatus,
         error: Option<String>,
         replaced_line_count: Option<u64>,
+        inserted_bytes: u64,
+    },
+    InsertFileResponded {
+        status: InsertFileStatus,
+        error: Option<String>,
         inserted_bytes: u64,
     },
     RequestTimedOut {
@@ -1026,6 +1089,44 @@ impl McpServer {
         params: rmcp::handler::server::wrapper::Parameters<rmcp::model::JsonObject>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         self.read_binary_file_impl(params).await
+    }
+
+    #[tool(
+        description = "Insert non-empty text immediately before an existing 1-based line in a local regular file. Use the line numbers shown by read_file, but do not include read_file's `<line_number>: ` presentation prefixes in text.",
+        input_schema = input_schema_for::<InsertFileRequest>("insert_before_line"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<InsertFileResult>(),
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn insert_before_line(
+        &self,
+        params: rmcp::handler::server::wrapper::Parameters<rmcp::model::JsonObject>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        self.insert_file_impl(params, InsertFilePosition::Before, "insert_before_line")
+            .await
+    }
+
+    #[tool(
+        description = "Insert non-empty text immediately after an existing 1-based line in a local regular file. Use the line numbers shown by read_file, but do not include read_file's `<line_number>: ` presentation prefixes in text.",
+        input_schema = input_schema_for::<InsertFileRequest>("insert_after_line"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<InsertFileResult>(),
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn insert_after_line(
+        &self,
+        params: rmcp::handler::server::wrapper::Parameters<rmcp::model::JsonObject>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        self.insert_file_impl(params, InsertFilePosition::After, "insert_after_line")
+            .await
     }
 
     #[tool(

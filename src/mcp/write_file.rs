@@ -7,7 +7,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const MAX_REPLACEMENT_BYTES: usize = 256 * 1024;
+pub(super) const MAX_REPLACEMENT_BYTES: usize = 256 * 1024;
 const STAGE_FILE_ATTEMPTS: usize = 100;
 
 static NEXT_STAGE_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -61,21 +61,21 @@ fn io_failure(
     failure_result(req, path, status, error.to_string())
 }
 
-struct StagedFile {
-    path: PathBuf,
-    file: Option<std::fs::File>,
+pub(super) struct StagedFile {
+    pub(super) path: PathBuf,
+    pub(super) file: Option<std::fs::File>,
     committed: bool,
 }
 
 impl StagedFile {
-    fn close(&mut self) -> std::io::Result<()> {
+    pub(super) fn close(&mut self) -> std::io::Result<()> {
         if let Some(file) = self.file.take() {
             file.sync_all()?;
         }
         Ok(())
     }
 
-    fn mark_committed(&mut self) {
+    pub(super) fn mark_committed(&mut self) {
         self.committed = true;
     }
 }
@@ -89,7 +89,7 @@ impl Drop for StagedFile {
     }
 }
 
-fn create_staged_file(target: &Path) -> std::io::Result<StagedFile> {
+pub(super) fn create_staged_file(target: &Path) -> std::io::Result<StagedFile> {
     let parent = target.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -127,12 +127,12 @@ fn create_staged_file(target: &Path) -> std::io::Result<StagedFile> {
 }
 
 #[derive(Debug)]
-enum ExactCopyError {
+pub(super) enum ExactCopyError {
     Read(std::io::Error),
     Write(std::io::Error),
 }
 
-fn copy_line_exact(
+pub(super) fn copy_line_exact(
     reader: &mut impl BufRead,
     writer: &mut impl Write,
 ) -> Result<bool, ExactCopyError> {
@@ -155,7 +155,7 @@ fn copy_line_exact(
     }
 }
 
-fn copy_remaining_exact(
+pub(super) fn copy_remaining_exact(
     reader: &mut impl BufRead,
     writer: &mut impl Write,
 ) -> Result<(), ExactCopyError> {
@@ -182,12 +182,12 @@ fn exact_copy_failure(
 }
 
 #[derive(Clone, Copy)]
-struct SkippedLine {
-    exists: bool,
-    terminator: Option<&'static [u8]>,
+pub(super) struct SkippedLine {
+    pub(super) exists: bool,
+    pub(super) terminator: Option<&'static [u8]>,
 }
 
-fn skip_line_with_terminator(
+pub(super) fn skip_line_with_terminator(
     reader: &mut impl BufRead,
     mut saw_bytes: bool,
 ) -> std::io::Result<SkippedLine> {
@@ -258,7 +258,7 @@ fn open_existing_regular_file(
 }
 
 #[cfg(target_os = "windows")]
-fn commit_replacement(stage: &Path, target: &Path) -> std::io::Result<()> {
+pub(super) fn commit_replacement(stage: &Path, target: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "Kernel32")]
@@ -301,7 +301,7 @@ fn commit_replacement(stage: &Path, target: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn commit_replacement(stage: &Path, target: &Path) -> std::io::Result<()> {
+pub(super) fn commit_replacement(stage: &Path, target: &Path) -> std::io::Result<()> {
     std::fs::rename(stage, target)
 }
 
