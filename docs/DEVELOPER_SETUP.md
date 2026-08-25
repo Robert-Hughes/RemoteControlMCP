@@ -622,8 +622,56 @@ printf '%s' "$TunnelClient" > "$HOME/.config/RemoteControlMCP/tunnel-client-path
 ### Large volume of startup logs
 * **Explanation:** Verbose structured logging is normal when the tunnel client initiates. Check the doctor status and the status of your Rust GUI rather than relying on log volume as a health indicator.
 
----
+### Long-running `launch_process` calls fail near the tunnel response deadline
 
+A foreground `launch_process` call has several independent timeout layers. They should not be confused:
+
+```text
+ChatGPT / tool caller
+        │
+        │ observed outer tool-call lifetime ≈120s
+        ▼
+OpenAI tunnel control plane
+        │
+        │ command includes response_timeout
+        ▼
+tunnel-client
+        │
+        │ normally converts response_timeout to a local deadline
+        ▼
+RemoteControlMCP
+        │
+        │ launch_process timeout_ms / timeout_action
+        ▼
+child process
+```
+
+RemoteControlMCP's `timeout_ms` controls only the child-process operation. A foreground process can therefore request a timeout longer than the time available to return its MCP result through the tunnel.
+
+This was reproduced on 2026-08-25 with `/bin/sleep 180`, `timeout_ms = 130000`, and `timeout_action = "stop"`:
+
+* RemoteControlMCP started the request and, approximately 130 seconds later, correctly produced `TimedOutStopped` (`isError = true`).
+* With an unmodified tunnel client, the command's OpenAI-supplied `response_timeout` expired at approximately 120 seconds, so tunnel-client abandoned the in-flight command before the RemoteControlMCP result existed.
+* A deliberately experimental tunnel-client build was then used to ignore the command `response_timeout`. RemoteControlMCP still ran to its own 130-second timeout, proving that the local dispatcher deadline had been bypassed, but the ChatGPT tool invocation still failed at approximately 120 seconds with an opaque `ToolError: UNKNOWN` / `ExceptionGroup` rather than accepting the later result.
+* A 55-second control run returned RemoteControlMCP's normal `timed_out_stopped` error successfully, confirming that the structured timeout result itself works when it wins the race.
+
+The experiment therefore demonstrated two separate approximately-120-second boundaries: tunnel-client normally enforces the control-plane `response_timeout`, and the ChatGPT/tool-caller side also has an independent outer lifetime. Disabling only the tunnel-client enforcement does **not** make a foreground tool call usable beyond the outer caller lifetime.
+
+A source audit found no second hidden approximately-120-second timeout in the normal `tunnel-client run` MCP forwarding path. Relevant local limits are:
+
+* `mcp.connection-max-ttl`: 10 minutes by default. This bounds the MCP transport connection, not a 120-second tool call.
+* MCP `http.Client.Timeout`: unset; there is no whole-request HTTP timeout on the local MCP call.
+* Go HTTP `ResponseHeaderTimeout`: zero (disabled).
+* Go HTTP `IdleConnTimeout`: 90 seconds, but this applies only to unused keep-alive connections in the pool, not an active request waiting for its response.
+* Control-plane poll timeout: 30 seconds plus a 5-second guardrail; this bounds each long-poll request used to fetch commands, not an already-dispatched command.
+* Control-plane response POST: uses that control-plane HTTP client and its bounded request lifetime, but this timer begins only after RemoteControlMCP has produced a response to post.
+* MCP startup probe: 2 seconds; startup/readiness only.
+* `pkg/localproxy`'s 30-second response timeout belongs to development/local-proxy mode and is not used by normal `tunnel-client run` forwarding.
+* Harpoon has its own 120-second maximum request timeout, but that applies to Harpoon `call_target`, not RemoteControlMCP MCP forwarding.
+
+Until the outer caller lifetime is configurable, foreground `launch_process` work should finish comfortably before it. Long-running work should use detached execution and be inspected later. A RemoteControlMCP-side safeguard could also reject foreground timeout values too close to the known outer limit so that it can return a meaningful structured error before the transport fails; such a limit would be defensive policy rather than an MCP protocol limit and should retain a safety margin rather than assuming 120 seconds is a permanent OpenAI contract.
+
+---
 ## References
 
 * [OpenAI Secure MCP Tunnels Guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)

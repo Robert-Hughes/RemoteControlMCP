@@ -89,7 +89,7 @@ Launch a local process on the host machine. There is no implicit shell execution
   * **`inherit`** (boolean, optional): Defaults to `true`, inheriting the parent process's environment variables. Explicitly setting it to `false` clears the inherited environment before applying `variables`.
   * **`variables`** (object, required): Key-value map of environment variables to add or configure. A `null` value removes that variable.
 * **`detached`** (boolean, required): If `true`, the MCP server spawns the process and returns immediately without waiting for it to complete.
-* **`timeout_ms`** (integer, optional): Bounded execution timeout. Requires `timeout_action`.
+* **`timeout_ms`** (integer, optional): Bounded execution timeout. Requires `timeout_action`. When calls are routed through an OpenAI Secure MCP Tunnel, the usable foreground lifetime may be shorter than the requested process timeout; see [Long-running `launch_process` calls fail near the tunnel response deadline](docs/DEVELOPER_SETUP.md#long-running-launch_process-calls-fail-near-the-tunnel-response-deadline).
 * **`timeout_action`** (string, optional): Can be either `"detach"` or `"stop"`.
   * `"detach"`: If the process exceeds the timeout, the MCP server returns immediately and lets the process continue in the background.
   * `"stop"`: If the process exceeds the timeout, the MCP server terminates the process.
