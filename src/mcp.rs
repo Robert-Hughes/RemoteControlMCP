@@ -630,9 +630,53 @@ fn argument_error_result(message: impl Into<String>) -> rmcp::model::CallToolRes
     rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(message.into())])
 }
 
-pub(crate) fn request_timeout_message(timeout_seconds: u64) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestTimeoutOutcome {
+    Cancelled,
+    ReadFileMayContinue,
+    ReadBinaryFileMayContinue,
+    WriteFileMayContinue,
+    ForegroundProcessMayStillBeRunning,
+    ForegroundProcessDetached,
+    ForegroundProcessStopped,
+    ForegroundProcessStopUnconfirmed,
+}
+
+impl RequestTimeoutOutcome {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Cancelled => "The request was cancelled locally.",
+            Self::ReadFileMayContinue => {
+                "RemoteControlMCP stopped waiting for the file read. The underlying blocking read may still be running, but it has no file side effects."
+            }
+            Self::ReadBinaryFileMayContinue => {
+                "RemoteControlMCP stopped waiting for the binary file read. The underlying blocking read may still be running, but it has no file side effects."
+            }
+            Self::WriteFileMayContinue => {
+                "RemoteControlMCP stopped waiting for the file write. The underlying blocking write may still be running and may still commit its atomic file update; do not assume the write was rolled back."
+            }
+            Self::ForegroundProcessMayStillBeRunning => {
+                "RemoteControlMCP stopped waiting for the foreground launch before cleanup completed. The process state is uncertain and it may still be running."
+            }
+            Self::ForegroundProcessDetached => {
+                "The foreground process was detached and is still running."
+            }
+            Self::ForegroundProcessStopped => "The foreground process was stopped.",
+            Self::ForegroundProcessStopUnconfirmed => {
+                "RemoteControlMCP could not confirm that the foreground process stopped; it may still be running."
+            }
+        }
+    }
+}
+
+pub(crate) fn request_timeout_message(
+    timeout_seconds: u64,
+    tool_name: &str,
+    outcome: RequestTimeoutOutcome,
+) -> String {
     format!(
-        "Request exceeded the configured Maximum request timeout of {timeout_seconds} seconds. Remote Control MCP is returning this local timeout error so the client receives a useful failure before any longer upstream timeout expires. Retry with a shorter operation. If this is long-running process work, use detached launch_process execution."
+        "RemoteControlMCP is configured with a Maximum request timeout of {timeout_seconds} seconds for each request. The `{tool_name}` request exceeded that limit. Outcome: {}",
+        outcome.description()
     )
 }
 
@@ -730,6 +774,8 @@ impl McpServer {
     pub(crate) async fn run_request_with_timeout<F>(
         &self,
         id: RequestId,
+        tool_name: &'static str,
+        timeout_outcome: RequestTimeoutOutcome,
         future: F,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData>
     where
@@ -743,7 +789,7 @@ impl McpServer {
         match tokio::time::timeout(Duration::from_secs(timeout_seconds), future).await {
             Ok(result) => result,
             Err(_) => {
-                let error = request_timeout_message(timeout_seconds);
+                let error = request_timeout_message(timeout_seconds, tool_name, timeout_outcome);
                 self.update_request(
                     id,
                     RequestUpdate::RequestTimedOut {
@@ -853,19 +899,24 @@ impl McpServer {
         _params: rmcp::handler::server::wrapper::Parameters<GetInstructionsRequest>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let id = self.start_request(RequestData::GetInstructions);
-        self.run_request_with_timeout(id, async {
-            let instructions = self.instructions.to_string();
-            let result = GetInstructionsResult {
-                instructions: instructions.clone(),
-            };
-            self.finish_structured_request(
-                id,
-                instructions,
-                &result,
-                false,
-                RequestUpdate::GetInstructionsCompleted,
-            )
-        })
+        self.run_request_with_timeout(
+            id,
+            "get_instructions",
+            RequestTimeoutOutcome::Cancelled,
+            async {
+                let instructions = self.instructions.to_string();
+                let result = GetInstructionsResult {
+                    instructions: instructions.clone(),
+                };
+                self.finish_structured_request(
+                    id,
+                    instructions,
+                    &result,
+                    false,
+                    RequestUpdate::GetInstructionsCompleted,
+                )
+            },
+        )
         .await
     }
 
@@ -881,7 +932,7 @@ impl McpServer {
     )]
     async fn ping(&self) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let id = self.start_request(RequestData::Ping);
-        self.run_request_with_timeout(id, async {
+        self.run_request_with_timeout(id, "ping", RequestTimeoutOutcome::Cancelled, async {
             let message = self.ping_impl().await;
             let result = ping::PingResult {
                 message: message.clone(),

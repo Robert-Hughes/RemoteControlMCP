@@ -3,8 +3,8 @@ use crate::mcp::file_path::{
     validate_line_file_path,
 };
 use crate::mcp::{
-    McpServer, ReadFileRequest, ReadFileResult, ReadFileStatus, RequestData, RequestUpdate,
-    argument_error_result, missing_argument_message,
+    McpServer, ReadFileRequest, ReadFileResult, ReadFileStatus, RequestData, RequestTimeoutOutcome,
+    RequestUpdate, argument_error_result, missing_argument_message,
 };
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -340,11 +340,18 @@ impl McpServer {
             }
         };
 
-        self.run_request_with_timeout(id, async {
-            let fallback_req = req.clone();
-            let fallback_path = path.clone();
-            let result =
-                match tokio::task::spawn_blocking(move || read_file_blocking(req, path)).await {
+        self.run_request_with_timeout(
+            id,
+            "read_file",
+            RequestTimeoutOutcome::ReadFileMayContinue,
+            async {
+                let fallback_req = req.clone();
+                let fallback_path = path.clone();
+                let result = match tokio::task::spawn_blocking(move || {
+                    read_file_blocking(req, path)
+                })
+                .await
+                {
                     Ok(result) => result,
                     Err(error) => failure_result(
                         &fallback_req,
@@ -354,19 +361,20 @@ impl McpServer {
                     ),
                 };
 
-            let update = RequestUpdate::ReadFileResponded {
-                status: result.status,
-                error: result.error.clone(),
-                actual_start_line: result.actual_start_line,
-                actual_end_line: result.actual_end_line,
-                next_start_line: result.next_start_line,
-                eof: result.eof,
-                text: result.text.clone(),
-            };
+                let update = RequestUpdate::ReadFileResponded {
+                    status: result.status,
+                    error: result.error.clone(),
+                    actual_start_line: result.actual_start_line,
+                    actual_end_line: result.actual_end_line,
+                    next_start_line: result.next_start_line,
+                    eof: result.eof,
+                    text: result.text.clone(),
+                };
 
-            let summary = read_file_summary(&result);
-            self.finish_structured_request(id, summary, &result, false, update)
-        })
+                let summary = read_file_summary(&result);
+                self.finish_structured_request(id, summary, &result, false, update)
+            },
+        )
         .await
     }
 }

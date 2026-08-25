@@ -655,12 +655,14 @@ child process
 
 RemoteControlMCP therefore exposes **Maximum request timeout**, stored as `maximum-request-timeout.txt` in the application user-config directory. The default is `0`, meaning that RemoteControlMCP imposes no request-wide deadline. When a non-zero value is configured, every MCP tool call is bounded by that local deadline and expiration is returned as an MCP `isError: true` result with a useful explanation. This is deliberately preferable to allowing a longer upstream timeout to expire first, because the latter can surface to ChatGPT only as an opaque transport failure such as `ToolError: UNKNOWN` / `ExceptionGroup`.
 
+Every locally generated request-timeout result follows the same message format: it names the configured limit and tool, then reports an `Outcome:` describing the resulting state. For file tools this explicitly warns when already-started blocking work may still finish; for `launch_process` it distinguishes a detached and still-running child, a stopped child, and a child whose stop could not be confirmed. Cooperative `launch_process` timeout responses retain the normal structured launch result, including PID and stdout/stderr file paths when available.
+
 For the ChatGPT setup tested here, configure **Maximum request timeout = 110 seconds**. ChatGPT and the Secure MCP Tunnel have both been observed to stop accepting a result at approximately 120 seconds, so 110 seconds leaves roughly ten seconds for RemoteControlMCP's error response to traverse the tunnel. The approximately-120-second value is an observed external limit, not an MCP protocol guarantee; if OpenAI changes that behaviour, reassess the local setting rather than treating 110 seconds as universally required.
 
 `launch_process` is special because the generic request watchdog alone is not sufficient cancellation. Foreground process execution runs in `spawn_blocking`; timing out and dropping the async wait does **not** stop the blocking worker or the child process it owns. RemoteControlMCP therefore cooperates with its existing process-timeout machinery:
 
 * It calculates a foreground process budget slightly below the Maximum request timeout, reserving up to one second for stop/detach cleanup and response construction. At a 110-second request limit this budget is **109 seconds**.
-* If foreground `timeout_ms` is omitted, the effective process timeout becomes that cooperative budget and `timeout_action` defaults to `stop`.
+* If foreground `timeout_ms` is omitted, the effective process timeout becomes that cooperative budget and `timeout_action` defaults to `detach`.
 * If a caller supplies a `timeout_ms` longer than the cooperative budget, it is reduced to the budget. An explicitly supplied `timeout_action` (`stop` or `detach`) is preserved.
 * A caller-supplied timeout that is already shorter than the cooperative budget is left unchanged and retains the ordinary `launch_process` timeout semantics.
 * `detached = true` launches are not clamped by this mechanism because the MCP request returns immediately; any explicit detached stop timeout remains a background process policy rather than a foreground request deadline.

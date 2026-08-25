@@ -17,10 +17,10 @@ Use this server to launch local processes and to read or modify regular files on
 - Subprocess standard input is unavailable. Do not rely on interactive terminal prompts.
 - Use detached execution for work that must continue after the tool call returns. The result provides `stdout_file` and `stderr_file` paths that can be inspected later with `read_file`.
 - For bounded foreground execution, provide both `timeout_ms` and `timeout_action`. Do not combine `detached = true` with `timeout_action = "detach"`.
-- The server may be configured with a Maximum request timeout for all tool calls. For foreground launches it cooperatively shortens an omitted or overly long process timeout so process cleanup can finish before that request deadline. Use detached execution when work must run longer than the request limit.
+- The server may be configured with a Maximum request timeout for all tool calls. For foreground launches it cooperatively shortens an omitted or overly long process timeout so process cleanup can finish before that request deadline. If no process timeout/action was supplied, reaching this server limit detaches the process by default so it can continue running. Use detached execution deliberately when work is expected to outlive the request limit.
 - Inspect the returned status, exit code, stdout, and stderr. A non-zero process exit code is reported as a completed tool invocation rather than as an MCP protocol error.
 - A foreground launch that reaches either its own process timeout or the server request limit is returned with `isError = true` and an actionable summary. Increasing `timeout_ms` only helps when the configured Maximum request timeout still leaves enough foreground time.
-- A foreground launch that reaches either its own process timeout or the server request limit is returned with `isError = true` and an actionable summary. Increasing `timeout_ms` only helps when the configured Maximum request timeout still leaves enough foreground time.
+- Server-generated Maximum request timeout errors name the tool and include an `Outcome:` describing whether work was cancelled, detached/still running, stopped, or may still be completing in blocking filesystem code.
 - A stop timeout terminates only the immediate child process; descendant processes may continue running.
 
 ## Reading and writing files

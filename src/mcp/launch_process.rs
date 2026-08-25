@@ -1,7 +1,7 @@
 use crate::mcp::{
     LaunchProcessRequest, LaunchProcessResult, LaunchProcessStatus, McpServer, RequestData,
-    RequestId, RequestUpdate, TimeoutAction, UiEvent, UiEventKind, argument_error_result,
-    missing_argument_message, request_timeout_message,
+    RequestId, RequestTimeoutOutcome, RequestUpdate, TimeoutAction, UiEvent, UiEventKind,
+    argument_error_result, missing_argument_message, request_timeout_message,
 };
 use std::sync::mpsc::Sender;
 use std::time::Instant;
@@ -904,72 +904,75 @@ impl McpServer {
                 .is_none_or(|timeout_ms| timeout_ms > cooperative_timeout_ms);
         if request_timeout_controls_launch {
             req.timeout_ms = Some(cooperative_timeout_ms);
-            req.timeout_action = Some(req.timeout_action.unwrap_or(TimeoutAction::Stop));
+            req.timeout_action = Some(req.timeout_action.unwrap_or(TimeoutAction::Detach));
         }
 
-        self.run_request_with_timeout(id, async {
-            let result = self.execute_launch_process_for_request(req, id).await;
+        self.run_request_with_timeout(
+            id,
+            "launch_process",
+            RequestTimeoutOutcome::ForegroundProcessMayStillBeRunning,
+            async {
+                let result = self.execute_launch_process_for_request(req, id).await;
 
-            if request_timeout_controls_launch
-                && matches!(
-                    result.status,
-                    LaunchProcessStatus::TimedOutDetached
-                        | LaunchProcessStatus::TimedOutStopped
-                        | LaunchProcessStatus::StopFailed
-                )
-            {
-                let mut error = request_timeout_message(maximum_request_timeout_seconds);
-                match result.status {
-                    LaunchProcessStatus::TimedOutDetached => {
-                        error.push_str(
-                            " The foreground process was detached before the request limit to leave time to return the timeout result.",
-                        );
+                if request_timeout_controls_launch
+                    && matches!(
+                        result.status,
+                        LaunchProcessStatus::TimedOutDetached
+                            | LaunchProcessStatus::TimedOutStopped
+                            | LaunchProcessStatus::StopFailed
+                    )
+                {
+                    let outcome = match result.status {
+                        LaunchProcessStatus::TimedOutDetached => {
+                            RequestTimeoutOutcome::ForegroundProcessDetached
+                        }
+                        LaunchProcessStatus::TimedOutStopped => {
+                            RequestTimeoutOutcome::ForegroundProcessStopped
+                        }
+                        LaunchProcessStatus::StopFailed => {
+                            RequestTimeoutOutcome::ForegroundProcessStopUnconfirmed
+                        }
+                        _ => unreachable!("filtered by request-timeout status match"),
+                    };
+                    let mut error = request_timeout_message(
+                        maximum_request_timeout_seconds,
+                        "launch_process",
+                        outcome,
+                    );
+                    if let Some(detail) = &result.error {
+                        error.push(' ');
+                        error.push_str(detail);
                     }
-                    LaunchProcessStatus::TimedOutStopped => {
-                        error.push_str(
-                            " The foreground process was stopped before the request limit to leave time for cleanup and the timeout result.",
-                        );
-                    }
-                    LaunchProcessStatus::StopFailed => {
-                        error.push_str(
-                            " Remote Control MCP could not confirm that the foreground process stopped before the request limit.",
-                        );
-                    }
-                    _ => {}
+                    self.update_request(
+                        id,
+                        RequestUpdate::RequestTimedOut {
+                            timeout_seconds: maximum_request_timeout_seconds,
+                            error: error.clone(),
+                        },
+                    );
+                    return Self::structured_result(error, &result, true);
                 }
-                if let Some(detail) = &result.error {
-                    error.push(' ');
-                    error.push_str(detail);
-                }
-                self.update_request(
-                    id,
-                    RequestUpdate::RequestTimedOut {
-                        timeout_seconds: maximum_request_timeout_seconds,
-                        error: error.clone(),
-                    },
-                );
-                return Ok(argument_error_result(error));
-            }
 
-            let update = RequestUpdate::LaunchProcessResponded {
-                status: result.status,
-                error: result.error.clone(),
-                pid: result.pid,
-                exit_code: result.exit_code,
-                stdout: result.stdout.clone(),
-                stderr: result.stderr.clone(),
-                stdout_file: result.stdout_file.clone(),
-                stderr_file: result.stderr_file.clone(),
-            };
+                let update = RequestUpdate::LaunchProcessResponded {
+                    status: result.status,
+                    error: result.error.clone(),
+                    pid: result.pid,
+                    exit_code: result.exit_code,
+                    stdout: result.stdout.clone(),
+                    stderr: result.stderr.clone(),
+                    stdout_file: result.stdout_file.clone(),
+                    stderr_file: result.stderr_file.clone(),
+                };
 
-            let is_error = launch_status_is_error(result.status);
-            let summary = if is_error {
-                launch_process_failure_summary(&result, requested_timeout_ms)
-            } else {
-                launch_process_summary(&result)
-            };
-            self.finish_structured_request(id, summary, &result, is_error, update)
-        })
+                let is_error = launch_status_is_error(result.status);
+                let summary = if is_error {
+                    launch_process_failure_summary(&result, requested_timeout_ms)
+                } else {
+                    launch_process_summary(&result)
+                };
+                self.finish_structured_request(id, summary, &result, is_error, update)
+            },
+        )
         .await
     }
 

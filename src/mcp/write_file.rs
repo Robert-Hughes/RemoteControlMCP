@@ -1,7 +1,7 @@
 use crate::mcp::file_path::validate_line_file_path;
 use crate::mcp::{
-    McpServer, RequestData, RequestUpdate, WriteFileRequest, WriteFileResult, WriteFileStatus,
-    argument_error_result, missing_argument_message,
+    McpServer, RequestData, RequestTimeoutOutcome, RequestUpdate, WriteFileRequest,
+    WriteFileResult, WriteFileStatus, argument_error_result, missing_argument_message,
 };
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -666,29 +666,35 @@ impl McpServer {
                 return Ok(argument_error_result(error));
             }
         };
-        self.run_request_with_timeout(id, async {
-            let fallback_req = req.clone();
-            let fallback_path = path.clone();
-            let result =
-                match tokio::task::spawn_blocking(move || write_file_blocking(req, path)).await {
-                    Ok(result) => result,
-                    Err(error) => failure_result(
-                        &fallback_req,
-                        &fallback_path,
-                        WriteFileStatus::WriteFailed,
-                        format!("Blocking file-write task failed: {error}"),
-                    ),
-                };
+        self.run_request_with_timeout(
+            id,
+            "write_file",
+            RequestTimeoutOutcome::WriteFileMayContinue,
+            async {
+                let fallback_req = req.clone();
+                let fallback_path = path.clone();
+                let result =
+                    match tokio::task::spawn_blocking(move || write_file_blocking(req, path)).await
+                    {
+                        Ok(result) => result,
+                        Err(error) => failure_result(
+                            &fallback_req,
+                            &fallback_path,
+                            WriteFileStatus::WriteFailed,
+                            format!("Blocking file-write task failed: {error}"),
+                        ),
+                    };
 
-            let update = RequestUpdate::WriteFileResponded {
-                status: result.status,
-                error: result.error.clone(),
-                replaced_line_count: result.replaced_line_count,
-                inserted_bytes: result.inserted_bytes,
-            };
-            let summary = write_file_summary(&result);
-            self.finish_structured_request(id, summary, &result, false, update)
-        })
+                let update = RequestUpdate::WriteFileResponded {
+                    status: result.status,
+                    error: result.error.clone(),
+                    replaced_line_count: result.replaced_line_count,
+                    inserted_bytes: result.inserted_bytes,
+                };
+                let summary = write_file_summary(&result);
+                self.finish_structured_request(id, summary, &result, false, update)
+            },
+        )
         .await
     }
 }
