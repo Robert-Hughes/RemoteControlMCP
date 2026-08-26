@@ -5,6 +5,7 @@ mod disk_log;
 mod mcp;
 mod settings;
 mod tunnel;
+mod usage_log;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -14,6 +15,7 @@ use std::time::Instant;
 
 fn main() -> eframe::Result {
     let start_time = Instant::now();
+    let usage_log = usage_log::UsageLog::open();
     let (tx, rx) = mpsc::channel();
     let (maximum_request_timeout_seconds, maximum_request_timeout_setting_error) =
         match settings::load_maximum_request_timeout_seconds() {
@@ -34,7 +36,12 @@ fn main() -> eframe::Result {
     thread::Builder::new()
         .name("mcp_worker".to_string())
         .spawn(move || {
-            mcp::run_mcp_server(tx, start_time, mcp_maximum_request_timeout_seconds);
+            mcp::run_mcp_server(
+                tx,
+                start_time,
+                mcp_maximum_request_timeout_seconds,
+                usage_log,
+            );
         })
         .expect("Failed to spawn background MCP worker thread");
 

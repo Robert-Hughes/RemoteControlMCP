@@ -13,6 +13,8 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::usage_log::UsageLog;
+
 mod file_path;
 mod insert_file;
 mod launch_process;
@@ -598,6 +600,7 @@ pub struct McpServer {
     instructions: Arc<str>,
     maximum_request_timeout_seconds: Arc<AtomicU64>,
     connection_guard: Option<Arc<ConnectionGuard>>,
+    usage_log: UsageLog,
 }
 
 struct ConnectionGuard {
@@ -825,11 +828,22 @@ impl McpServer {
         start_time: Instant,
         instructions: Arc<str>,
     ) -> Self {
+        Self::new_with_instructions_and_usage(tx, start_time, instructions, UsageLog::disabled())
+    }
+
+    #[cfg(test)]
+    fn new_with_instructions_and_usage(
+        tx: Sender<UiEvent>,
+        start_time: Instant,
+        instructions: Arc<str>,
+        usage_log: UsageLog,
+    ) -> Self {
         Self::new_with_instructions_and_timeout(
             tx,
             start_time,
             instructions,
             Arc::new(AtomicU64::new(0)),
+            usage_log,
         )
     }
 
@@ -838,6 +852,7 @@ impl McpServer {
         start_time: Instant,
         instructions: Arc<str>,
         maximum_request_timeout_seconds: Arc<AtomicU64>,
+        usage_log: UsageLog,
     ) -> Self {
         Self {
             tx,
@@ -847,6 +862,7 @@ impl McpServer {
             instructions,
             maximum_request_timeout_seconds,
             connection_guard: None,
+            usage_log,
         }
     }
 
@@ -1181,6 +1197,16 @@ impl McpServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        self.usage_log.record(request.name.as_ref());
+        let context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(context).await
+    }
+
     fn initialize(
         &self,
         request: rmcp::model::InitializeRequestParams,
@@ -1231,6 +1257,7 @@ fn build_http_mcp_service(
     start_time: Instant,
     instructions: Arc<str>,
     maximum_request_timeout_seconds: Arc<AtomicU64>,
+    usage_log: UsageLog,
 ) -> HttpMcpService {
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService,
@@ -1241,6 +1268,7 @@ fn build_http_mcp_service(
         start_time,
         instructions,
         maximum_request_timeout_seconds,
+        usage_log,
     );
     let service_factory = move || Ok(service.for_http_session());
 
@@ -1255,6 +1283,7 @@ pub fn run_mcp_server(
     tx: Sender<UiEvent>,
     start_time: Instant,
     maximum_request_timeout_seconds: Arc<AtomicU64>,
+    usage_log: UsageLog,
 ) {
     let rt = match build_mcp_runtime() {
         Ok(rt) => rt,
@@ -1275,7 +1304,7 @@ pub fn run_mcp_server(
     });
 
     rt.block_on(async move {
-        run_http_mcp_server(tx, start_time, maximum_request_timeout_seconds).await;
+        run_http_mcp_server(tx, start_time, maximum_request_timeout_seconds, usage_log).await;
     });
 }
 
@@ -1283,6 +1312,7 @@ async fn run_http_mcp_server(
     tx: Sender<UiEvent>,
     start_time: Instant,
     maximum_request_timeout_seconds: Arc<AtomicU64>,
+    usage_log: UsageLog,
 ) {
     let send_event = |kind| {
         let _ = tx.send(UiEvent {
@@ -1321,6 +1351,7 @@ async fn run_http_mcp_server(
         start_time,
         instructions,
         maximum_request_timeout_seconds,
+        usage_log,
     );
     let router = axum::Router::new().nest_service("/mcp", http_service);
 

@@ -46,6 +46,16 @@ The GUI retains at most 500 requests under normal conditions, pruning the oldest
 
 MCP protocol traffic no longer uses standard input or output. Application lifecycle diagnostics are sent to the GUI event channel or written to standard error (`stderr`).
 
+## Tool usage log
+
+Every attempted `tools/call` request is appended to `tool-usage.jsonl` in the platform-local `RemoteControlMCP` application data directory: `%LOCALAPPDATA%\RemoteControlMCP` on Windows, `~/Library/Application Support/RemoteControlMCP` on macOS, and `$XDG_DATA_HOME/RemoteControlMCP` (or `~/.local/share/RemoteControlMCP` when unset) on Linux. Each JSON line contains the local timestamp and the requested tool name:
+
+```json
+{"timestamp":"2026-08-26T14:31:04.125+01:00","tool":"read_file"}
+```
+
+Tool names are recorded exactly as received, including unknown or misspelled names, while arguments and results are not recorded. Calls are logged before tool lookup and argument validation, so rejected attempts are included in later usage tallies.
+
 ## Maximum request timeout
 
 The GUI exposes a persistent **Maximum request timeout** setting, expressed in whole seconds. Its default is `0`, which disables the local request deadline. The value is stored as `maximum-request-timeout.txt` in the `RemoteControlMCP` user-config directory and changes apply to subsequent MCP tool requests without restarting the server.

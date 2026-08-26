@@ -29,6 +29,7 @@ use crate::mcp::{
     load_server_instructions_from_path, read_local_instructions, run_mcp_server_loop, test_hooks,
     timeout_message,
 };
+use crate::usage_log::UsageLog;
 use rmcp::ServerHandler;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,6 +46,64 @@ fn tracked_http_io_reports_connection_lifecycle() {
     assert_eq!(rx.recv().unwrap().kind, UiEventKind::HttpConnectionOpened);
     drop(tracked);
     assert_eq!(rx.recv().unwrap().kind, UiEventKind::HttpConnectionClosed);
+}
+
+#[test]
+fn tool_call_boundary_logs_requested_names_verbatim() {
+    use rmcp::ServiceExt;
+
+    let path = generate_temp_test_path("tool_usage.jsonl");
+    let usage_log = UsageLog::open_at(&path);
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    let server = McpServer::new_with_instructions_and_usage(
+        tx,
+        Instant::now(),
+        Arc::from("test instructions"),
+        usage_log,
+    );
+    let unusual_name = "read_flie\t\"unexpected\"\nnext";
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let server_task = tokio::spawn(async move {
+            server
+                .serve(server_transport)
+                .await
+                .expect("serve test MCP server")
+                .waiting()
+                .await
+                .expect("wait for test MCP server");
+        });
+        let mut client = ().serve(client_transport).await.expect("serve test client");
+
+        client
+            .call_tool(rmcp::model::CallToolRequestParams::new("ping"))
+            .await
+            .expect("call known tool");
+        assert!(
+            client
+                .call_tool(rmcp::model::CallToolRequestParams::new(unusual_name))
+                .await
+                .is_err()
+        );
+
+        client.close().await.expect("close test client");
+        server_task.await.expect("test server task panicked");
+    });
+
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["tool"], "ping");
+    assert_eq!(records[1]["tool"], unusual_name);
+    std::fs::remove_file(path).unwrap();
 }
 
 struct InstructionsToolExchange {
@@ -2023,6 +2082,7 @@ fn ping_works_over_streamable_http_transport() {
             start_time,
             Arc::from("HTTP transport test instructions"),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            UsageLog::disabled(),
         );
         let router = axum::Router::new().nest_service("/mcp", service);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
