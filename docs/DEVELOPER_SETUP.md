@@ -25,6 +25,7 @@ The application and the `tunnel-client` daemon both store configuration in the p
 | Launcher path file | `%APPDATA%\RemoteControlMCP\tunnel-client-path.txt` | `~/.config/RemoteControlMCP/tunnel-client-path.txt` | `~/.config/RemoteControlMCP/tunnel-client-path.txt` |
 | Automatic-start setting | `%APPDATA%\RemoteControlMCP\start-tunnel-automatically.txt` | `~/.config/RemoteControlMCP/start-tunnel-automatically.txt` | `~/.config/RemoteControlMCP/start-tunnel-automatically.txt` |
 | Maximum request timeout | `%APPDATA%\RemoteControlMCP\maximum-request-timeout.txt` | `~/.config/RemoteControlMCP/maximum-request-timeout.txt` | `~/.config/RemoteControlMCP/maximum-request-timeout.txt` |
+| Application working directory | `%TEMP%\RemoteControlMCP` | `$TMPDIR/RemoteControlMCP` (normally beneath `/var/folders`) | `/tmp/RemoteControlMCP` |
 | Runtime key file | `%APPDATA%\tunnel-client\remote-control-mcp.key` | `~/.config/tunnel-client/remote-control-mcp.key` | `~/.config/tunnel-client/remote-control-mcp.key` |
 | Tunnel profile | `%APPDATA%\tunnel-client\remote-control-mcp.yaml` | `~/.config/tunnel-client/remote-control-mcp.yaml` | `~/.config/tunnel-client/remote-control-mcp.yaml` |
 | Tunnel logs | `%TEMP%\RemoteControlMCP` | `$TMPDIR/RemoteControlMCP` (normally beneath `/var/folders`) | `/tmp/RemoteControlMCP` |

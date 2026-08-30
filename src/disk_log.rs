@@ -13,7 +13,7 @@ pub struct DiskLog {
 
 impl DiskLog {
     pub fn open() -> Self {
-        let directory = std::env::temp_dir().join("RemoteControlMCP");
+        let directory = crate::runtime_environment::application_temp_directory();
         let timestamp = Local::now().format("%Y%m%d-%H%M%S%.3f");
         let path = directory.join(format!(
             "remote-control-mcp-{}-{}.log",

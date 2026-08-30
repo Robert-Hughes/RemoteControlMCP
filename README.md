@@ -34,6 +34,12 @@ The local file is resolved relative to `CARGO_MANIFEST_DIR`, so it does not depe
 
 Changes to `GENERAL.md` require a rebuild. Changes to `LOCAL.md` require a server restart and a new MCP initialisation handshake, but no rebuild.
 
+## Runtime identity and working directory
+
+At startup, the application creates `RemoteControlMCP` beneath the platform temporary directory and changes its process working directory to that location before opening logs, loading settings, or starting the MCP worker. If the directory cannot be created or selected, the application exits without starting the server.
+
+The top of the GUI always shows the effective user, permission level, and verified current working directory. On Unix, effective UID 0 is reported as root. On Windows, the permission level reflects whether the process token is elevated rather than whether the account merely belongs to the Administrators group. Root or elevated-token execution adds a permanent warning banner because MCP clients receive the same filesystem and process permissions as the server.
+
 ## GUI request list
 
 The server lifecycle remains in the status area at the top of the window. A fatal server error is shown separately and is never represented as a tool request.

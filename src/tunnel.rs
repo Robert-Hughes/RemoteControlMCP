@@ -59,7 +59,7 @@ pub fn start_tunnel(mcp_endpoint: &str) -> Result<TunnelLaunch, String> {
     validate_key_file(&key_path)?;
 
     let tunnel_client = resolve_tunnel_client(&config_dir)?;
-    let runtime_directory = std::env::temp_dir().join("RemoteControlMCP");
+    let runtime_directory = crate::runtime_environment::application_temp_directory();
     fs::create_dir_all(&runtime_directory).map_err(|error| {
         format!(
             "Could not create tunnel runtime directory {}: {error}",

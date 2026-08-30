@@ -3,6 +3,7 @@
 mod app;
 mod disk_log;
 mod mcp;
+mod runtime_environment;
 mod settings;
 mod tunnel;
 mod usage_log;
@@ -13,7 +14,11 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
-fn main() -> eframe::Result {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime_environment = runtime_environment::initialize()?;
+    if let Some(warning) = &runtime_environment.privilege_detection_warning {
+        eprintln!("{warning}");
+    }
     let start_time = Instant::now();
     let usage_log = usage_log::UsageLog::open();
     let (tx, rx) = mpsc::channel();
@@ -50,6 +55,7 @@ fn main() -> eframe::Result {
         start_time,
         maximum_request_timeout_seconds,
         maximum_request_timeout_setting_error,
+        runtime_environment,
     );
 
     #[cfg(windows)]
@@ -75,5 +81,6 @@ fn main() -> eframe::Result {
         "Remote Control MCP",
         options,
         Box::new(move |_cc| Ok(Box::new(app))),
-    )
+    )?;
+    Ok(())
 }

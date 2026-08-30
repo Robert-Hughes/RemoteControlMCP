@@ -4,6 +4,7 @@ use crate::mcp::{
     ReadBinaryFileStatus, ReadFileStatus, RequestData, RequestId, RequestUpdate, UiEvent,
     UiEventKind, WriteFileStatus,
 };
+use crate::runtime_environment::RuntimeEnvironment;
 use crate::settings;
 use crate::tunnel::{self, TunnelLaunch, TunnelLaunchEvent};
 use chrono::{DateTime, Local, TimeZone};
@@ -887,6 +888,7 @@ pub struct RemoteControlApp {
     active_mcp_sessions: usize,
     fatal_error: Option<String>,
     local_instructions_diagnostic: Option<LocalInstructionsDiagnostic>,
+    runtime_environment: RuntimeEnvironment,
     start_time: Instant,
     disk_log: DiskLog,
 }
@@ -897,6 +899,7 @@ impl RemoteControlApp {
         start_time: Instant,
         maximum_request_timeout_shared: Arc<AtomicU64>,
         maximum_request_timeout_setting_error: Option<String>,
+        runtime_environment: RuntimeEnvironment,
     ) -> Self {
         let (tunnel_start_automatically, tunnel_setting_error) =
             match tunnel::load_start_automatically() {
@@ -914,6 +917,7 @@ impl RemoteControlApp {
             tunnel_setting_error,
             maximum_request_timeout_shared,
             maximum_request_timeout_setting_error,
+            runtime_environment,
         )
     }
 
@@ -924,6 +928,7 @@ impl RemoteControlApp {
         tunnel_setting_error: Option<String>,
         maximum_request_timeout_shared: Arc<AtomicU64>,
         maximum_request_timeout_setting_error: Option<String>,
+        runtime_environment: RuntimeEnvironment,
     ) -> Self {
         let maximum_request_timeout_seconds =
             maximum_request_timeout_shared.load(Ordering::Relaxed);
@@ -947,6 +952,7 @@ impl RemoteControlApp {
             active_mcp_sessions: 0,
             fatal_error: None,
             local_instructions_diagnostic: None,
+            runtime_environment,
             start_time,
             disk_log: DiskLog::open(),
         }
@@ -1296,7 +1302,61 @@ impl RemoteControlApp {
         }
     }
 
+    fn render_runtime_environment(&self, ui: &mut egui::Ui) {
+        if self.runtime_environment.privilege.is_elevated {
+            let warning_colour = ui.visuals().error_fg_color;
+            egui::Frame::group(ui.style())
+                .fill(warning_colour.gamma_multiply(0.12))
+                .stroke(egui::Stroke::new(1.5, warning_colour))
+                .show(ui, |ui| {
+                    ui.colored_label(
+                        warning_colour,
+                        egui::RichText::new("ELEVATED PERMISSIONS WARNING").strong(),
+                    );
+                    ui.label(
+                        "Remote Control MCP is running with elevated permissions. MCP clients can execute processes and modify files with those permissions.",
+                    );
+                });
+            ui.add_space(5.0);
+        } else if let Some(warning) = &self.runtime_environment.privilege_detection_warning {
+            let warning_colour = ui.visuals().warn_fg_color;
+            egui::Frame::group(ui.style())
+                .fill(warning_colour.gamma_multiply(0.12))
+                .stroke(egui::Stroke::new(1.0, warning_colour))
+                .show(ui, |ui| {
+                    ui.colored_label(
+                        warning_colour,
+                        egui::RichText::new("PERMISSION DETECTION WARNING").strong(),
+                    );
+                    ui.label(warning);
+                });
+            ui.add_space(5.0);
+        }
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("User:");
+                ui.label(&self.runtime_environment.user);
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Permissions:");
+                ui.label(&self.runtime_environment.privilege.description);
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Working directory:");
+                ui.label(
+                    self.runtime_environment
+                        .working_directory
+                        .display()
+                        .to_string(),
+                );
+            });
+        });
+    }
+
     fn render_hosted(&mut self, ui: &mut egui::Ui, current_elapsed: Duration) {
+        self.render_runtime_environment(ui);
+        ui.add_space(6.0);
         self.render_connection_panel(ui);
 
         if let Some(error) = &self.fatal_error {
@@ -1353,6 +1413,15 @@ mod tests {
             None,
             Arc::new(AtomicU64::new(0)),
             None,
+            RuntimeEnvironment {
+                user: "test-user".to_string(),
+                privilege: crate::runtime_environment::PrivilegeInfo {
+                    description: "Standard token".to_string(),
+                    is_elevated: false,
+                },
+                privilege_detection_warning: None,
+                working_directory: std::path::PathBuf::from("test-temp"),
+            },
         )
     }
 

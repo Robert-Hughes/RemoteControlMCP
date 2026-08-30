@@ -234,7 +234,7 @@ pub(crate) fn output_progress_snapshot_for_test(
 
 fn generate_output_files() -> Result<(std::fs::File, std::fs::File, String, String), std::io::Error>
 {
-    let dir = std::env::temp_dir().join("RemoteControlMCP");
+    let dir = crate::runtime_environment::application_temp_directory();
     std::fs::create_dir_all(&dir)?;
 
     let pid = std::process::id();
