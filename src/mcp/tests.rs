@@ -3,8 +3,9 @@ use crate::mcp::insert_file::{insert_file_summary, validate_insert_file_request}
 use crate::mcp::launch_process::{
     ChildOps, CleanupOutcome, DEFAULT_MAX_OUTPUT_BYTES, cooperative_launch_timeout_ms,
     handle_background_wait_result_with_notifier, launch_process_failure_summary,
-    launch_process_summary, launch_process_timeout_summary, output_progress_snapshot_for_test,
-    perform_cleanup, read_and_truncate_file, report_background_error, validate_request,
+    launch_process_summary, launch_process_timeout_summary, normalize_request,
+    output_progress_snapshot_for_test, perform_cleanup, read_and_truncate_file,
+    report_background_error, validate_request,
 };
 use crate::mcp::ping::PingResult;
 use crate::mcp::read_binary_file::{
@@ -2224,12 +2225,18 @@ fn test_validation() {
     req.timeout_action = Some(TimeoutAction::Detach);
     assert!(validate_request(&req).is_err());
 
-    // 13. Detached launch with timeout action detach
-    let mut req = base_req.clone();
-    req.detached = true;
-    req.timeout_ms = Some(100);
-    req.timeout_action = Some(TimeoutAction::Detach);
-    assert!(validate_request(&req).is_err());
+    // 13. Detached launch ignores a redundant detach timeout action.
+    for timeout_ms in [None, Some(0), Some(100)] {
+        let mut req = base_req.clone();
+        req.detached = true;
+        req.timeout_ms = timeout_ms;
+        req.timeout_action = Some(TimeoutAction::Detach);
+        assert!(validate_request(&req).is_ok());
+
+        normalize_request(&mut req);
+        assert_eq!(req.timeout_ms, None);
+        assert_eq!(req.timeout_action, None);
+    }
 
     // 14. max_output_bytes = 0
     let mut req = base_req.clone();
@@ -4231,6 +4238,38 @@ fn launch_process_mcp_summaries_cover_nonzero_detach_timeouts_and_failure() {
             launch_process_summary(&detached)
         );
 
+        for timeout_ms in [None, Some(50_u64)] {
+            let mut redundant_detach_params =
+                rmcp::model::CallToolRequestParams::new("launch_process");
+            redundant_detach_params.arguments = Some(
+                rmcp::serde_json::json!({
+                    "process_name": &helper,
+                    "environment": {
+                        "inherit": true,
+                        "variables": {
+                            "RMCP_TEST_HELPER_ACTION": "sleep",
+                            "RMCP_TEST_HELPER_SLEEP_MS": "300"
+                        }
+                    },
+                    "detached": true,
+                    "timeout_ms": timeout_ms,
+                    "timeout_action": "detach"
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            );
+            let redundant_detach_call = client
+                .call_tool(redundant_detach_params)
+                .await
+                .expect("redundant detached launch");
+            let redundant_detach: LaunchProcessResult = rmcp::serde_json::from_value(
+                redundant_detach_call.structured_content.clone().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(redundant_detach.status, LaunchProcessStatus::Detached);
+            assert_eq!(redundant_detach_call.is_error, Some(false));
+        }
         let mut timeout_detach_params = rmcp::model::CallToolRequestParams::new("launch_process");
         timeout_detach_params.arguments = Some(
             rmcp::serde_json::json!({

@@ -114,9 +114,8 @@ Launch a local process on the host machine. There is no implicit shell execution
 * **`detached`** (boolean, required): If `true`, the MCP server spawns the process and returns immediately without waiting for it to complete.
 * **`timeout_ms`** (integer, optional): Bounded child-process execution timeout. Requires `timeout_action`. When **Maximum request timeout** is enabled, a foreground value that would run too close to or beyond the request deadline is cooperatively reduced as described above; shorter caller-supplied timeouts retain their normal semantics. When calls are routed through an OpenAI Secure MCP Tunnel, see [Long-running `launch_process` calls fail near the tunnel response deadline](docs/DEVELOPER_SETUP.md#long-running-launch_process-calls-fail-near-the-tunnel-response-deadline).
 * **`timeout_action`** (string, optional): Can be either `"detach"` or `"stop"`.
-  * `"detach"`: If the process exceeds the timeout, the MCP server returns immediately and lets the process continue in the background.
-  * `"stop"`: If the process exceeds the timeout, the MCP server terminates the process.
-  * *Note:* Setting `detached = true` together with `timeout_action = "detach"` is invalid and will fail validation.
+  * `"detach"`: For foreground execution, if the process exceeds the timeout, the MCP server returns immediately and lets the process continue in the background. If `detached = true` is already set, this action is redundant; the server ignores both timeout fields and launches detached normally.
+  * `"stop"`: If the process exceeds the timeout, the MCP server terminates the process. With `detached = true`, this provides a meaningful background lifetime limit and is preserved.
 
 #### Process Inputs and Outputs
 

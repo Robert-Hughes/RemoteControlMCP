@@ -331,6 +331,12 @@ fn read_final_output(stdout_path: &str, stderr_path: &str, max_output_bytes: usi
     }
 }
 
+pub(crate) fn normalize_request(req: &mut LaunchProcessRequest) {
+    if req.detached && req.timeout_action == Some(TimeoutAction::Detach) {
+        req.timeout_ms = None;
+        req.timeout_action = None;
+    }
+}
 pub(crate) fn validate_request(req: &LaunchProcessRequest) -> Result<(), String> {
     if req.process_name.is_empty() {
         return Err("process_name cannot be empty".to_string());
@@ -368,23 +374,21 @@ pub(crate) fn validate_request(req: &LaunchProcessRequest) -> Result<(), String>
         }
     }
 
-    if let Some(ms) = req.timeout_ms {
-        if ms == 0 {
-            return Err("timeout_ms must be greater than zero".to_string());
-        }
-        if req.timeout_action.is_none() {
-            return Err("timeout_ms requires timeout_action".to_string());
-        }
-    }
+    let redundant_detach_timeout =
+        req.detached && req.timeout_action == Some(TimeoutAction::Detach);
 
-    if let Some(ref action) = req.timeout_action {
-        if req.timeout_ms.is_none() {
-            return Err("timeout_action requires timeout_ms".to_string());
+    if !redundant_detach_timeout {
+        if let Some(ms) = req.timeout_ms {
+            if ms == 0 {
+                return Err("timeout_ms must be greater than zero".to_string());
+            }
+            if req.timeout_action.is_none() {
+                return Err("timeout_ms requires timeout_action".to_string());
+            }
         }
-        if req.detached && *action == TimeoutAction::Detach {
-            return Err(
-                "detached = true together with timeout_action = 'detach' is invalid".to_string(),
-            );
+
+        if req.timeout_action.is_some() && req.timeout_ms.is_none() {
+            return Err("timeout_action requires timeout_ms".to_string());
         }
     }
 
@@ -876,6 +880,7 @@ impl McpServer {
                     )));
                 }
             };
+        normalize_request(&mut req);
         let requested_timeout_ms = req.timeout_ms;
         let id = self.start_request(RequestData::LaunchProcess {
             command_line: command_line_for_display(&req),
@@ -965,9 +970,10 @@ impl McpServer {
 
     async fn execute_launch_process_for_request(
         &self,
-        req: LaunchProcessRequest,
+        mut req: LaunchProcessRequest,
         request_id: RequestId,
     ) -> LaunchProcessResult {
+        normalize_request(&mut req);
         let tx = self.tx.clone();
         let start_time = self.start_time;
         let join_handle = tokio::task::spawn_blocking(move || {
