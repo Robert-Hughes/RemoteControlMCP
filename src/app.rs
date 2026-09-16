@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 const MAX_RECENT_REQUESTS: usize = 100;
 const MAX_COMMAND_LINE_CHARACTERS: usize = 80;
 const BUSY_ICON_COOLDOWN: Duration = Duration::from_secs(30);
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 pub fn normal_icon() -> Arc<egui::IconData> {
     static ICON: OnceLock<Arc<egui::IconData>> = OnceLock::new();
@@ -821,6 +822,34 @@ fn paint_status_dot(ui: &mut egui::Ui, colour: egui::Color32) {
     painter.circle_filled(response.rect.center(), 4.0, colour);
 }
 
+fn animated_spinner(ui: &mut egui::Ui, size: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::ProgressIndicator));
+
+    if ui.is_rect_visible(rect) {
+        ui.ctx().request_repaint_after(ANIMATION_FRAME_INTERVAL);
+        let radius = (rect.height().min(rect.width()) / 2.0) - 2.0;
+        let point_count = (radius.round() as usize).clamp(8, 128);
+        let time = ui.input(|input| input.time);
+        let start_angle = time * std::f64::consts::TAU;
+        let end_angle = start_angle + 240_f64.to_radians() * time.sin();
+        let points = (0..point_count)
+            .map(|index| {
+                let t = index as f64 / point_count as f64;
+                let angle = start_angle + (end_angle - start_angle) * t;
+                let (sin, cos) = angle.sin_cos();
+                rect.center() + radius * egui::vec2(cos as f32, sin as f32)
+            })
+            .collect::<Vec<_>>();
+        ui.painter().add(egui::Shape::line(
+            points,
+            egui::Stroke::new(3.0_f32, ui.visuals().strong_text_color()),
+        ));
+    }
+
+    response
+}
+
 fn render_request_row(ui: &mut egui::Ui, request: &RequestEntry, current_elapsed: Duration) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -830,7 +859,7 @@ fn render_request_row(ui: &mut egui::Ui, request: &RequestEntry, current_elapsed
                 egui::Layout::top_down(egui::Align::Center),
                 |ui| match request.state {
                     RequestState::InProgress => {
-                        ui.add(egui::Spinner::new().size(14.0));
+                        animated_spinner(ui, 14.0);
                     }
                     RequestState::Completed => {
                         paint_state_icon(ui, request.state, state_colour(ui, request.state));
@@ -1017,6 +1046,16 @@ impl RemoteControlApp {
         _frame: &eframe::Frame,
         current_elapsed: Duration,
     ) {
+        let has_in_progress = self
+            .requests
+            .iter()
+            .any(|request| request.state == RequestState::InProgress);
+        if !has_in_progress && let Some(last_activity) = self.last_request_activity {
+            let since_last_activity = current_elapsed.saturating_sub(last_activity);
+            if since_last_activity < BUSY_ICON_COOLDOWN {
+                context.request_repaint_after(BUSY_ICON_COOLDOWN - since_last_activity);
+            }
+        }
         let should_be_busy =
             should_show_busy_icon(&self.requests, self.last_request_activity, current_elapsed);
         if should_be_busy == self.busy_icon_active {
@@ -1188,7 +1227,7 @@ impl RemoteControlApp {
 
             ui.horizontal(|ui| {
                 if tunnel_starting {
-                    ui.spinner();
+                    animated_spinner(ui, ui.style().spacing.interact_size.y);
                 }
                 ui.strong("Tunnel client running:");
                 let tunnel_status = ui.label(if tunnel_process_active { "yes" } else { "no" });
@@ -1396,7 +1435,7 @@ impl eframe::App for RemoteControlApp {
             self.render_hosted(ui, current_elapsed);
         });
 
-        ui.ctx().request_repaint_after(Duration::from_millis(100));
+        // Idle repainting is event-driven.
     }
 }
 

@@ -8,6 +8,7 @@ This application uses a multi-threaded architecture to separate the user interfa
 * **Main Thread:** Runs an `egui`/`eframe` native Windows GUI that displays server state and a scrolling list of tool requests.
 * **Background Thread:** Spawns a dedicated Tokio runtime and serves the `rmcp` MCP endpoint at `http://127.0.0.1:61337/mcp`.
 * **Communication:** The background worker sends structured events to the UI thread using a standard library channel (`std::sync::mpsc::channel`).
+* **Repainting:** Worker events explicitly wake egui; animations and timed state own their own deadlines, so the idle GUI sleeps instead of polling. See `docs/REPAINT_SCHEDULING.md`.
 
 ```text
 MCP client

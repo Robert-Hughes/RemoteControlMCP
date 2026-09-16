@@ -8,9 +8,9 @@ mod settings;
 mod tunnel;
 mod usage_log;
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -21,7 +21,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let start_time = Instant::now();
     let usage_log = usage_log::UsageLog::open();
-    let (tx, rx) = mpsc::channel();
+    let (worker_tx, worker_rx) = mpsc::channel();
+    let (ui_tx, ui_rx) = mpsc::channel();
+    let repaint_context = Arc::new(Mutex::new(None::<eframe::egui::Context>));
+    let forwarder_repaint_context = Arc::clone(&repaint_context);
+    thread::Builder::new()
+        .name("ui_event_forwarder".to_string())
+        .spawn(move || {
+            while let Ok(event) = worker_rx.recv() {
+                if ui_tx.send(event).is_err() {
+                    break;
+                }
+                if let Ok(context) = forwarder_repaint_context.lock()
+                    && let Some(context) = context.as_ref()
+                {
+                    context.request_repaint();
+                }
+            }
+        })
+        .expect("Failed to spawn UI event forwarder thread");
     let (maximum_request_timeout_seconds, maximum_request_timeout_setting_error) =
         match settings::load_maximum_request_timeout_seconds() {
             Ok(seconds) => (seconds, None),
@@ -42,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .name("mcp_worker".to_string())
         .spawn(move || {
             mcp::run_mcp_server(
-                tx,
+                worker_tx,
                 start_time,
                 mcp_maximum_request_timeout_seconds,
                 usage_log,
@@ -51,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("Failed to spawn background MCP worker thread");
 
     let app = app::RemoteControlApp::new(
-        rx,
+        ui_rx,
         start_time,
         maximum_request_timeout_seconds,
         maximum_request_timeout_setting_error,
@@ -80,7 +98,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eframe::run_native(
         "Remote Control MCP",
         options,
-        Box::new(move |_cc| Ok(Box::new(app))),
+        Box::new(move |cc| {
+            if let Ok(mut context) = repaint_context.lock() {
+                *context = Some(cc.egui_ctx.clone());
+            }
+            Ok(Box::new(app))
+        }),
     )?;
     Ok(())
 }
