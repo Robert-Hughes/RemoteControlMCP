@@ -476,7 +476,16 @@ fn test_successful_background_wait_notifies_without_error_event() {
     assert_eq!(completion_rx.try_recv(), Ok(43));
     assert!(matches!(
         event_rx.try_recv(),
-        Err(std::sync::mpsc::TryRecvError::Empty)
+        Ok(super::UiEvent {
+            kind: UiEventKind::RequestUpdated {
+                id: RequestId(8),
+                update: RequestUpdate::LaunchProcessBackgroundExited {
+                    pid: 43,
+                    exit_code: Some(0)
+                }
+            },
+            ..
+        })
     ));
 }
 
@@ -3154,7 +3163,7 @@ fn test_explicit_detachment() {
         Ok(g) => g,
         Err(e) => e.into_inner(),
     };
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel();
     let server = McpServer::new(tx, Instant::now());
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -3203,6 +3212,12 @@ fn test_explicit_detachment() {
         .unwrap();
     assert_eq!(completed_pid, pid);
 
+    let events: Vec<_> = rx.try_iter().collect();
+    assert!(events.iter().any(|event| matches!(event.kind,
+        UiEventKind::RequestUpdated { update: RequestUpdate::LaunchProcessBackgroundStarted { pid: event_pid }, .. } if event_pid == pid)));
+    assert!(events.iter().any(|event| matches!(event.kind,
+        UiEventKind::RequestUpdated { update: RequestUpdate::LaunchProcessBackgroundExited { pid: event_pid, exit_code: Some(0) }, .. } if event_pid == pid)));
+
     assert!(marker_path.exists());
     let _ = std::fs::remove_file(&marker_path);
 }
@@ -3213,7 +3228,7 @@ fn test_timeout_with_detach() {
         Ok(g) => g,
         Err(e) => e.into_inner(),
     };
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel();
     let server = McpServer::new(tx, Instant::now());
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -3263,6 +3278,8 @@ fn test_timeout_with_detach() {
         .recv_timeout(Duration::from_millis(5000))
         .unwrap();
     assert_eq!(completed_pid, pid);
+    assert!(rx.try_iter().any(|event| matches!(event.kind,
+        UiEventKind::RequestUpdated { update: RequestUpdate::LaunchProcessBackgroundExited { pid: event_pid, exit_code: Some(0) }, .. } if event_pid == pid)));
     assert!(marker_path.exists());
     let _ = std::fs::remove_file(&marker_path);
 
@@ -3504,7 +3521,7 @@ fn test_detached_with_stop_timeout() {
         Ok(g) => g,
         Err(e) => e.into_inner(),
     };
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel();
     let server = McpServer::new(tx, Instant::now());
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -3557,6 +3574,8 @@ fn test_detached_with_stop_timeout() {
         .recv_timeout(Duration::from_millis(5000))
         .unwrap();
     assert_eq!(completed_pid, pid);
+    assert!(rx.try_iter().any(|event| matches!(event.kind,
+        UiEventKind::RequestUpdated { update: RequestUpdate::LaunchProcessBackgroundExited { pid: event_pid, .. }, .. } if event_pid == pid)));
 
     assert!(!marker_path.exists());
 

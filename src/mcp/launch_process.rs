@@ -511,7 +511,18 @@ pub(crate) fn handle_background_wait_result_with_notifier<F>(
 {
     match wait_result {
         // Completion means the child was successfully waited on and reaped.
-        Ok(_) => notify_success(pid),
+        Ok(status) => {
+            report_background_update(
+                tx,
+                start_time,
+                request_id,
+                RequestUpdate::LaunchProcessBackgroundExited {
+                    pid,
+                    exit_code: status.code(),
+                },
+            );
+            notify_success(pid);
+        }
         Err(error) => report_background_error(
             tx,
             start_time,
@@ -530,6 +541,21 @@ struct BackgroundReaperOptions {
     output_completion: Option<OutputProgressCompletion>,
 }
 
+fn report_background_update(
+    tx: &Sender<UiEvent>,
+    start_time: Instant,
+    request_id: RequestId,
+    update: RequestUpdate,
+) {
+    let _ = tx.send(UiEvent {
+        elapsed: start_time.elapsed(),
+        kind: UiEventKind::RequestUpdated {
+            id: request_id,
+            update,
+        },
+    });
+}
+
 fn spawn_background_reaper(
     child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
     pid: u32,
@@ -538,6 +564,7 @@ fn spawn_background_reaper(
     request_id: RequestId,
     options: BackgroundReaperOptions,
 ) -> std::io::Result<()> {
+    let started_tx = tx.clone();
     std::thread::Builder::new()
         .name(options.thread_name)
         .spawn(move || {
@@ -560,10 +587,18 @@ fn spawn_background_reaper(
                 completion.finish();
             }
         })
-        .map(|_| ())
+        .map(|_| {
+            report_background_update(
+                &started_tx,
+                start_time,
+                request_id,
+                RequestUpdate::LaunchProcessBackgroundStarted { pid },
+            )
+        })
 }
 #[derive(Clone, Copy)]
 struct BackgroundContext<'a> {
+    report_exit: bool,
     tx: &'a Sender<UiEvent>,
     start_time: Instant,
     request_id: RequestId,
@@ -830,9 +865,10 @@ fn cleanup_child(
     Option<String>,
 ) {
     let tx = background.tx.clone();
+    let completion_tx = tx.clone();
     let start_time = background.start_time;
     let request_id = background.request_id;
-    let (status, err, exit_code, stdout, stderr, _outcome) = perform_cleanup_with_limit(
+    let (status, err, exit_code, stdout, stderr, outcome) = perform_cleanup_with_limit(
         child,
         pid,
         original_error,
@@ -855,11 +891,19 @@ fn cleanup_child(
             )
         },
     );
-    #[cfg(test)]
     if matches!(
-        _outcome,
+        outcome,
         CleanupOutcome::KillSucceeded | CleanupOutcome::KillFailedChildExited
     ) {
+        if background.report_exit {
+            report_background_update(
+                &completion_tx,
+                start_time,
+                request_id,
+                RequestUpdate::LaunchProcessBackgroundExited { pid, exit_code },
+            );
+        }
+        #[cfg(test)]
         test_hooks::notify_completion(pid);
     }
     (status, err, exit_code, stdout, stderr)
@@ -1256,6 +1300,7 @@ fn execute_launch_process_blocking(
                             &stderr_path,
                             max_output_bytes,
                             BackgroundContext {
+                                report_exit: false,
                                 tx: &tx,
                                 start_time,
                                 request_id,
@@ -1325,7 +1370,16 @@ fn execute_launch_process_blocking(
                         .take();
                     if let Some(child) = child_opt {
                         match outcome {
-                            MonitorOutcome::Exited(_status) => {
+                            MonitorOutcome::Exited(status) => {
+                                report_background_update(
+                                    &tx_clone,
+                                    start_time,
+                                    request_id,
+                                    RequestUpdate::LaunchProcessBackgroundExited {
+                                        pid,
+                                        exit_code: status.code(),
+                                    },
+                                );
                                 #[cfg(test)]
                                 test_hooks::notify_completion(pid);
                             }
@@ -1339,11 +1393,13 @@ fn execute_launch_process_blocking(
                                     &monitor_stderr,
                                     max_output_bytes,
                                     BackgroundContext {
+                                        report_exit: true,
                                         tx: &tx_clone,
                                         start_time,
                                         request_id,
                                     },
                                 );
+
                                 if !matches!(
                                     status,
                                     LaunchProcessStatus::TimedOutStopped
@@ -1372,6 +1428,7 @@ fn execute_launch_process_blocking(
                                     &monitor_stderr,
                                     max_output_bytes,
                                     BackgroundContext {
+                                        report_exit: true,
                                         tx: &tx_clone,
                                         start_time,
                                         request_id,
@@ -1390,6 +1447,12 @@ fn execute_launch_process_blocking(
                 });
 
             if monitor_spawn.is_ok() {
+                report_background_update(
+                    &tx,
+                    start_time,
+                    request_id,
+                    RequestUpdate::LaunchProcessBackgroundStarted { pid },
+                );
                 output_monitor.disarm();
             }
             match monitor_spawn {
@@ -1417,6 +1480,7 @@ fn execute_launch_process_blocking(
                             &stderr_path,
                             max_output_bytes,
                             BackgroundContext {
+                                report_exit: false,
                                 tx: &tx,
                                 start_time,
                                 request_id,
@@ -1480,6 +1544,7 @@ fn execute_launch_process_blocking(
                                         &stderr_path,
                                         max_output_bytes,
                                         BackgroundContext {
+                                            report_exit: false,
                                             tx: &tx,
                                             start_time,
                                             request_id,
@@ -1571,6 +1636,7 @@ fn execute_launch_process_blocking(
                                 &stderr_path,
                                 max_output_bytes,
                                 BackgroundContext {
+                                    report_exit: false,
                                     tx: &tx,
                                     start_time,
                                     request_id,
@@ -1635,6 +1701,7 @@ fn execute_launch_process_blocking(
                                         &stderr_path,
                                         max_output_bytes,
                                         BackgroundContext {
+                                            report_exit: false,
                                             tx: &tx,
                                             start_time,
                                             request_id,
@@ -1695,6 +1762,7 @@ fn execute_launch_process_blocking(
                         &stderr_path,
                         max_output_bytes,
                         BackgroundContext {
+                            report_exit: false,
                             tx: &tx,
                             start_time,
                             request_id,
@@ -1757,6 +1825,7 @@ fn execute_launch_process_blocking(
                             &stderr_path,
                             max_output_bytes,
                             BackgroundContext {
+                                report_exit: false,
                                 tx: &tx,
                                 start_time,
                                 request_id,

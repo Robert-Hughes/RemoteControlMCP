@@ -553,6 +553,13 @@ pub enum RequestUpdate {
         pid: u32,
         error: String,
     },
+    LaunchProcessBackgroundStarted {
+        pid: u32,
+    },
+    LaunchProcessBackgroundExited {
+        pid: u32,
+        exit_code: Option<i32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

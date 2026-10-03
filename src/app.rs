@@ -121,6 +121,16 @@ enum RequestState {
 }
 
 #[derive(Debug, Clone)]
+enum BackgroundProcessState {
+    Running,
+    Unknown,
+    Exited {
+        exit_code: Option<i32>,
+        duration: Duration,
+    },
+}
+
+#[derive(Debug, Clone)]
 struct RequestEntry {
     id: RequestId,
     request: RequestData,
@@ -138,9 +148,24 @@ struct RequestEntry {
     stdout_truncated: bool,
     stderr_truncated: bool,
     background_failure: bool,
+    background_process: Option<BackgroundProcessState>,
 }
 
 impl RequestEntry {
+    fn active_call(&self) -> bool {
+        self.finished_duration.is_none()
+    }
+
+    fn background_visible(&self) -> bool {
+        matches!(
+            self.background_process,
+            Some(BackgroundProcessState::Running | BackgroundProcessState::Unknown)
+        )
+    }
+
+    fn in_history(&self) -> bool {
+        !self.active_call() && !self.background_visible()
+    }
     fn duration(&self, current_elapsed: Duration) -> Duration {
         self.finished_duration
             .unwrap_or_else(|| current_elapsed.saturating_sub(self.started_elapsed))
@@ -380,6 +405,10 @@ fn insert_file_presentation(
 }
 fn presentation_for_update(update: RequestUpdate) -> RequestPresentation {
     match update {
+        RequestUpdate::LaunchProcessBackgroundStarted { .. }
+        | RequestUpdate::LaunchProcessBackgroundExited { .. } => {
+            unreachable!("background lifecycle updates are handled separately")
+        }
         RequestUpdate::PingCompleted => RequestPresentation {
             state: RequestState::Completed,
             status_text: "Completed".to_string(),
@@ -472,7 +501,7 @@ fn presentation_for_update(update: RequestUpdate) -> RequestPresentation {
 fn prune_requests(requests: &mut Vec<RequestEntry>) {
     let mut excess = requests
         .iter()
-        .filter(|request| request.state != RequestState::InProgress)
+        .filter(|request| request.in_history())
         .count()
         .saturating_sub(MAX_RECENT_REQUESTS);
     if excess == 0 {
@@ -480,7 +509,7 @@ fn prune_requests(requests: &mut Vec<RequestEntry>) {
     }
 
     requests.retain(|request| {
-        let remove = excess != 0 && request.state != RequestState::InProgress;
+        let remove = excess != 0 && request.in_history();
         excess -= usize::from(remove);
         !remove
     });
@@ -522,8 +551,43 @@ fn apply_request_event(requests: &mut Vec<RequestEntry>, event: UiEvent) {
             stdout_truncated: false,
             stderr_truncated: false,
             background_failure: false,
+            background_process: None,
         }),
         UiEventKind::RequestUpdated { id, update } => {
+            if let Some(request) = requests.iter_mut().find(|request| request.id == id) {
+                match &update {
+                    RequestUpdate::LaunchProcessBackgroundStarted { pid } => {
+                        request.pid = Some(*pid);
+                        if request.background_process.is_none() {
+                            request.background_process = Some(BackgroundProcessState::Running);
+                        }
+                    }
+                    RequestUpdate::LaunchProcessBackgroundExited { pid, exit_code } => {
+                        request.pid = Some(*pid);
+                        request.background_process = Some(BackgroundProcessState::Exited {
+                            exit_code: *exit_code,
+                            duration: event.elapsed.saturating_sub(request.started_elapsed),
+                        });
+                    }
+                    RequestUpdate::LaunchProcessBackgroundError { .. }
+                        if !matches!(
+                            request.background_process,
+                            Some(BackgroundProcessState::Exited { .. })
+                        ) =>
+                    {
+                        request.background_process = Some(BackgroundProcessState::Unknown);
+                    }
+                    _ => {}
+                }
+            }
+            if matches!(
+                update,
+                RequestUpdate::LaunchProcessBackgroundStarted { .. }
+                    | RequestUpdate::LaunchProcessBackgroundExited { .. }
+            ) {
+                prune_requests(requests);
+                return;
+            }
             if let Some(request) = requests.iter_mut().rev().find(|request| request.id == id) {
                 if let RequestUpdate::LaunchProcessOutputProgress {
                     pid,
@@ -890,6 +954,32 @@ fn render_request_row(ui: &mut egui::Ui, request: &RequestEntry, current_elapsed
                     timing.push_str(&output);
                 }
                 ui.weak(timing);
+                if let Some(background) = &request.background_process {
+                    let text = match background {
+                        BackgroundProcessState::Running => {
+                            ui.ctx().request_repaint_after(Duration::from_secs(1));
+                            format!(
+                                "Detached process running · Duration {}",
+                                format_duration(
+                                    current_elapsed.saturating_sub(request.started_elapsed)
+                                )
+                            )
+                        }
+                        BackgroundProcessState::Unknown => {
+                            "Detached process status unknown".to_string()
+                        }
+                        BackgroundProcessState::Exited {
+                            exit_code,
+                            duration,
+                        } => format!(
+                            "Background process exited{} · Duration {}",
+                            exit_code
+                                .map_or_else(String::new, |code| format!(" · exit code {code}")),
+                            format_duration(*duration)
+                        ),
+                    };
+                    ui.label(text);
+                }
                 if let Some(detail) = &request.detail_text {
                     ui.label(detail);
                 }
@@ -1407,19 +1497,68 @@ impl RemoteControlApp {
         }
 
         ui.add_space(6.0);
-        if self.requests.is_empty() {
-            ui.centered_and_justified(|ui| {
-                ui.weak("MCP requests will show here");
-            });
+        let active_count = self
+            .requests
+            .iter()
+            .filter(|request| request.active_call())
+            .count();
+        let detached_count = self
+            .requests
+            .iter()
+            .filter(|request| !request.active_call() && request.background_visible())
+            .count();
+        ui.heading(format!(
+            "Currently running ({})",
+            active_count + detached_count
+        ));
+        if active_count + detached_count == 0 {
+            ui.weak("No running requests or detached processes");
         } else {
             egui::ScrollArea::vertical()
+                .id_salt("running_requests")
+                .max_height(ui.available_height() * 0.5)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.strong(format!("Active calls ({active_count})"));
+                    for request in self
+                        .requests
+                        .iter()
+                        .rev()
+                        .filter(|request| request.active_call())
+                    {
+                        render_request_row(ui, request, current_elapsed);
+                        ui.add_space(4.0);
+                    }
+                    if detached_count > 0 {
+                        ui.strong(format!("Detached processes ({detached_count})"));
+                        for request in self.requests.iter().rev().filter(|request| {
+                            !request.active_call() && request.background_visible()
+                        }) {
+                            render_request_row(ui, request, current_elapsed);
+                            ui.add_space(4.0);
+                        }
+                    }
+                });
+        }
+        ui.separator();
+        ui.heading("History");
+        if self.requests.iter().any(RequestEntry::in_history) {
+            egui::ScrollArea::vertical()
+                .id_salt("request_history")
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
-                    for request in self.requests.iter().rev() {
+                    for request in self
+                        .requests
+                        .iter()
+                        .rev()
+                        .filter(|request| request.in_history())
+                    {
                         render_request_row(ui, request, current_elapsed);
                         ui.add_space(4.0);
                     }
                 });
+        } else {
+            ui.weak("Finished requests will show here");
         }
     }
 }
@@ -1740,6 +1879,129 @@ mod tests {
     }
 
     #[test]
+    fn detached_lifecycle_survives_response_ordering_and_history_pruning() {
+        for exits_first in [false, true] {
+            let mut requests = Vec::new();
+            apply_request_event(&mut requests, started_event(1, Duration::from_secs(1)));
+            let exited = updated_event(
+                1,
+                Duration::from_secs(8),
+                RequestUpdate::LaunchProcessBackgroundExited {
+                    pid: 42,
+                    exit_code: Some(7),
+                },
+            );
+            if exits_first {
+                apply_request_event(&mut requests, exited.clone());
+            }
+            apply_request_event(
+                &mut requests,
+                updated_event(
+                    1,
+                    Duration::from_secs(2),
+                    RequestUpdate::LaunchProcessBackgroundStarted { pid: 42 },
+                ),
+            );
+            apply_request_event(
+                &mut requests,
+                updated_event(
+                    1,
+                    Duration::from_secs(3),
+                    RequestUpdate::LaunchProcessResponded {
+                        status: LaunchProcessStatus::Detached,
+                        error: None,
+                        pid: Some(42),
+                        exit_code: None,
+                        stdout: None,
+                        stderr: None,
+                        stdout_file: None,
+                        stderr_file: None,
+                    },
+                ),
+            );
+            assert!(!requests[0].active_call());
+            assert_eq!(requests[0].background_visible(), !exits_first);
+            assert_eq!(requests[0].finished_duration, Some(Duration::from_secs(2)));
+            if !exits_first {
+                for id in 2..=MAX_RECENT_REQUESTS as u64 + 2 {
+                    apply_request_event(&mut requests, started_event(id, Duration::from_secs(id)));
+                    apply_request_event(
+                        &mut requests,
+                        updated_event(
+                            id,
+                            Duration::from_secs(id + 1),
+                            RequestUpdate::PingCompleted,
+                        ),
+                    );
+                }
+                assert_eq!(requests.len(), MAX_RECENT_REQUESTS + 1);
+                assert_eq!(requests[0].id, RequestId(1));
+                apply_request_event(&mut requests, exited);
+                assert_eq!(requests.len(), MAX_RECENT_REQUESTS);
+            } else {
+                assert!(requests[0].in_history());
+                assert!(
+                    matches!(requests[0].background_process, Some(BackgroundProcessState::Exited { exit_code: Some(7), duration }) if duration == Duration::from_secs(7))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn background_monitor_failure_retains_unknown_process_until_confirmed_exit() {
+        let mut requests = Vec::new();
+        apply_request_event(&mut requests, started_event(1, Duration::ZERO));
+        apply_request_event(
+            &mut requests,
+            updated_event(
+                1,
+                Duration::from_secs(1),
+                RequestUpdate::LaunchProcessBackgroundError {
+                    pid: 42,
+                    error: "wait failed".into(),
+                },
+            ),
+        );
+        apply_request_event(
+            &mut requests,
+            updated_event(
+                1,
+                Duration::from_secs(2),
+                RequestUpdate::LaunchProcessBackgroundStarted { pid: 42 },
+            ),
+        );
+        apply_request_event(
+            &mut requests,
+            updated_event(
+                1,
+                Duration::from_secs(3),
+                RequestUpdate::RequestTimedOut {
+                    timeout_seconds: 3,
+                    error: "timeout".into(),
+                },
+            ),
+        );
+        assert!(matches!(
+            requests[0].background_process,
+            Some(BackgroundProcessState::Unknown)
+        ));
+        assert!(requests[0].background_visible());
+        apply_request_event(
+            &mut requests,
+            updated_event(
+                1,
+                Duration::from_secs(4),
+                RequestUpdate::LaunchProcessBackgroundExited {
+                    pid: 42,
+                    exit_code: None,
+                },
+            ),
+        );
+        assert!(requests[0].in_history());
+        assert!(requests[0].background_failure);
+    }
+
+    #[test]
     fn background_failure_before_launch_response_is_sticky() {
         let mut requests = Vec::new();
         apply_request_event(
@@ -1994,6 +2256,7 @@ mod tests {
             stdout_truncated: false,
             stderr_truncated: false,
             background_failure: false,
+            background_process: None,
         };
         assert_eq!(
             request_summary(&launch),
