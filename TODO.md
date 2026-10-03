@@ -1,1 +1,0 @@
-- Easy view of currently running commands (with multiple sessions in parallel, these aren't always at the top!)
