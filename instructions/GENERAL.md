@@ -37,3 +37,7 @@ Use this server to launch local processes and to read or modify regular files on
 - After a successful mutation, inspect `post_edit_text`. It is the only post-edit content representation and uses the same `<line_number>: ` presentation prefixes as `read_file`; check it for misplaced or duplicate lines before making another positional edit.
 - Missing files are created only when `create_if_missing = true` and the requested range is `1-1`. Parent directories are never created automatically.
 - File access and process execution are not sandboxed. Confirm paths and targets before performing destructive operations.
+
+## Task-specific instructions
+
+- For software development tasks, read and follow `SOFTWARE_DEV.md`.
