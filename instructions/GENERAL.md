@@ -40,4 +40,5 @@ Use this server to launch local processes and to read or modify regular files on
 
 ## Task-specific instructions
 
-- For software development tasks, read and follow `SOFTWARE_DEV.md`.
+- Further instructions can be found in `${INSTRUCTIONS_DIR}` on the host machine. Use `read_file` with an absolute path to read the relevant file.
+- For software development tasks, read and follow `SOFTWARE_DEV.md` in that directory.

@@ -355,19 +355,29 @@ fn maximum_request_timeout_returns_a_tool_error_before_upstream_timeout() {
 
 #[test]
 fn composed_instructions_use_embedded_general_guidance_without_local_text() {
-    let expected = GENERAL_INSTRUCTIONS.trim();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("instructions");
+    let expected = GENERAL_INSTRUCTIONS
+        .trim()
+        .replace("${INSTRUCTIONS_DIR}", &dir.to_string_lossy());
 
-    assert_eq!(compose_instructions(None).as_ref(), expected);
-    assert_eq!(compose_instructions(Some(" \r\n\t ")).as_ref(), expected);
+    assert_eq!(compose_instructions(None, &dir).as_ref(), expected);
+    assert_eq!(
+        compose_instructions(Some(" \r\n\t "), &dir).as_ref(),
+        expected
+    );
+    assert!(!expected.contains("${INSTRUCTIONS_DIR}"));
 }
 
 #[test]
 fn composed_instructions_append_trimmed_machine_specific_guidance() {
     let local = "\n  ## Installed software\n\n- Example tool is available.  \n";
-    let instructions = compose_instructions(Some(local));
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("instructions with spaces");
+    let instructions = compose_instructions(Some(local), &dir);
     let expected = format!(
         "{}\n\n---\n\n{}\n\n{}",
-        GENERAL_INSTRUCTIONS.trim(),
+        GENERAL_INSTRUCTIONS
+            .trim()
+            .replace("${INSTRUCTIONS_DIR}", &dir.to_string_lossy()),
         MACHINE_INSTRUCTIONS_HEADING,
         local.trim()
     );
@@ -394,6 +404,12 @@ fn server_instruction_loading_reports_success_and_missing_file_warnings() {
         write_temp_test_file("loaded_local_instructions", b"# Local test instructions\n");
     let loaded = load_server_instructions_from_path(&present_path);
     assert!(loaded.instructions.contains("# Local test instructions"));
+    assert!(
+        loaded
+            .instructions
+            .contains(&format!("`{}`", present_path.parent().unwrap().display()))
+    );
+    assert!(!loaded.instructions.contains("${INSTRUCTIONS_DIR}"));
     assert_eq!(
         loaded.diagnostic,
         LocalInstructionsDiagnostic::Loaded {
@@ -404,7 +420,10 @@ fn server_instruction_loading_reports_success_and_missing_file_warnings() {
 
     let missing_path = generate_temp_test_path("missing_local_instructions_diagnostic");
     let missing = load_server_instructions_from_path(&missing_path);
-    assert_eq!(missing.instructions.as_ref(), GENERAL_INSTRUCTIONS.trim());
+    assert_eq!(
+        missing.instructions.as_ref(),
+        compose_instructions(None, missing_path.parent().unwrap()).as_ref()
+    );
     assert_eq!(
         missing.diagnostic,
         LocalInstructionsDiagnostic::Warning {
@@ -415,7 +434,10 @@ fn server_instruction_loading_reports_success_and_missing_file_warnings() {
 
     let empty_path = write_temp_test_file("empty_local_instructions", b" \r\n\t");
     let empty = load_server_instructions_from_path(&empty_path);
-    assert_eq!(empty.instructions.as_ref(), GENERAL_INSTRUCTIONS.trim());
+    assert_eq!(
+        empty.instructions.as_ref(),
+        compose_instructions(None, empty_path.parent().unwrap()).as_ref()
+    );
     assert_eq!(
         empty.diagnostic,
         LocalInstructionsDiagnostic::Warning {
@@ -5823,24 +5845,27 @@ fn get_instructions_returns_the_stored_startup_snapshot_over_mcp_transport() {
 
 #[test]
 fn get_instructions_returns_generic_instructions_without_local_text() {
-    let expected = compose_instructions(None);
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("instructions");
+    let expected = compose_instructions(None, &dir);
     let rt = build_mcp_runtime().expect("MCP runtime should build");
 
     let exchange = rt.block_on(call_get_instructions_over_duplex(expected.clone()));
 
-    assert_eq!(expected.as_ref(), GENERAL_INSTRUCTIONS.trim());
-    assert_get_instructions_result(&exchange.call_result, GENERAL_INSTRUCTIONS.trim());
+    assert!(expected.contains(&format!("`{}`", dir.display())));
+    assert!(!expected.contains("${INSTRUCTIONS_DIR}"));
+    assert_get_instructions_result(&exchange.call_result, expected.as_ref());
 }
 
 #[test]
 fn get_instructions_returns_composed_generic_and_local_instructions() {
     let local = "## Test-only local fixture\n\n- frobnicator path: Z:/sentinel";
-    let expected = compose_instructions(Some(local));
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("instructions");
+    let expected = compose_instructions(Some(local), &dir);
     let rt = build_mcp_runtime().expect("MCP runtime should build");
 
     let exchange = rt.block_on(call_get_instructions_over_duplex(expected.clone()));
 
-    assert!(expected.starts_with(GENERAL_INSTRUCTIONS.trim()));
+    assert!(expected.starts_with(compose_instructions(None, &dir).as_ref()));
     let suffix = format!("\n\n---\n\n{MACHINE_INSTRUCTIONS_HEADING}\n\n{local}");
     assert!(expected.ends_with(&suffix));
     assert_get_instructions_result(&exchange.call_result, expected.as_ref());

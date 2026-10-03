@@ -54,8 +54,10 @@ fn read_local_instructions(path: &Path) -> io::Result<Option<String>> {
     }
 }
 
-fn compose_instructions(local_instructions: Option<&str>) -> Arc<str> {
-    let general = GENERAL_INSTRUCTIONS.trim();
+fn compose_instructions(local_instructions: Option<&str>, instructions_dir: &Path) -> Arc<str> {
+    let general = GENERAL_INSTRUCTIONS
+        .trim()
+        .replace("${INSTRUCTIONS_DIR}", &instructions_dir.to_string_lossy());
     let Some(local) = local_instructions
         .map(str::trim)
         .filter(|contents| !contents.is_empty())
@@ -68,13 +70,17 @@ fn compose_instructions(local_instructions: Option<&str>) -> Arc<str> {
     ))
 }
 
-fn warning_instructions(path: &Path, message: String) -> LoadedServerInstructions {
+fn warning_instructions(
+    path: &Path,
+    instructions_dir: &Path,
+    message: String,
+) -> LoadedServerInstructions {
     eprintln!(
         "Warning: failed to load machine-specific MCP instructions from {}: {message}",
         path.display()
     );
     LoadedServerInstructions {
-        instructions: compose_instructions(None),
+        instructions: compose_instructions(None, instructions_dir),
         diagnostic: LocalInstructionsDiagnostic::Warning {
             path: path.to_path_buf(),
             message,
@@ -83,6 +89,9 @@ fn warning_instructions(path: &Path, message: String) -> LoadedServerInstruction
 }
 
 fn load_server_instructions_from_path(path: &Path) -> LoadedServerInstructions {
+    let instructions_dir = path
+        .parent()
+        .unwrap_or(Path::new(env!("CARGO_MANIFEST_DIR")));
     match read_local_instructions(path) {
         Ok(Some(contents)) if !contents.trim().is_empty() => {
             eprintln!(
@@ -90,15 +99,15 @@ fn load_server_instructions_from_path(path: &Path) -> LoadedServerInstructions {
                 path.display()
             );
             LoadedServerInstructions {
-                instructions: compose_instructions(Some(&contents)),
+                instructions: compose_instructions(Some(&contents), instructions_dir),
                 diagnostic: LocalInstructionsDiagnostic::Loaded {
                     path: path.to_path_buf(),
                 },
             }
         }
-        Ok(Some(_)) => warning_instructions(path, "file is empty".to_string()),
-        Ok(None) => warning_instructions(path, "file not found".to_string()),
-        Err(error) => warning_instructions(path, error.to_string()),
+        Ok(Some(_)) => warning_instructions(path, instructions_dir, "file is empty".to_string()),
+        Ok(None) => warning_instructions(path, instructions_dir, "file not found".to_string()),
+        Err(error) => warning_instructions(path, instructions_dir, error.to_string()),
     }
 }
 

@@ -78,11 +78,3 @@ npx -y @modelcontextprotocol/inspector
 ```
 
 In the Inspector, select Streamable HTTP and connect to `http://127.0.0.1:61337/mcp`.
-
-## Change discipline
-
-* Do not add functionality beyond the requested scope.
-* Do not add dependencies without a clear need.
-* Do not commit changes unless explicitly asked.
-* Review `git diff` and `git status --short` before reporting completion.
-* Never claim an interactive test succeeded unless it was actually performed.

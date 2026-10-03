@@ -24,7 +24,7 @@ egui main thread
 
 ## MCP instructions
 
-The server sends operating guidance to MCP clients in the `instructions` field of its initialisation response.
+The server sends a short bootstrap instruction in its initialisation response directing MCP clients to call `get_instructions` for the full operating guidance.
 
 The effective instructions have two sources:
 
@@ -33,7 +33,9 @@ The effective instructions have two sources:
 
 The local file is resolved relative to `CARGO_MANIFEST_DIR`, so it does not depend on the process working directory. A successful non-empty load is reported in the GUI and on standard error with the resolved path. A missing, empty, or unreadable local file falls back to general-only instructions and produces a non-fatal GUI warning as well as a standard-error warning.
 
-Changes to `GENERAL.md` require a rebuild. Changes to `LOCAL.md` require a server restart and a new MCP initialisation handshake, but no rebuild.
+Within `GENERAL.md`, `${INSTRUCTIONS_DIR}` is replaced at startup with the absolute path of the directory containing `LOCAL.md`, even when the local file is missing or empty. This lets clients locate task-specific files such as `SOFTWARE_DEV.md` using `read_file`. Those files are read on demand rather than included in `get_instructions`.
+
+Changes to `GENERAL.md` require a rebuild. Changes to `LOCAL.md` require a server restart and a fresh `get_instructions` call, but no rebuild. Changes to task-specific files take effect the next time a client reads them.
 
 ## Runtime identity and working directory
 
